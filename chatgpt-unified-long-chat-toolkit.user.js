@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 长对话统一工具箱（性能·导航·提示词·导出·排版）
 // @namespace    local.codex.chatgpt.unified
-// @version      1.6.33
-// @description  ChatGPT 长对话性能、导航、提示词、导出与排版工具箱；v1.6.33 移除输入区的全宽黑色遮罩，保留立即发送按钮。
+// @version      1.6.59
+// @description  ChatGPT 长对话工具箱；v1.6.59 统一问答/章节与提示词滚动条，保留节能折射、独立玻璃开关、无边框烟色材质与原有功能。
 // @author       Codex；含 Alex S Hamilton 的 ChatGPT Lazy Chat++（GPL-3.0-or-later）
 // @homepageURL  https://github.com/zjc1772665101-source/chatgpt-unified-long-chat-toolkit
 // @supportURL   https://github.com/zjc1772665101-source/chatgpt-unified-long-chat-toolkit/issues
@@ -18,12 +18,48 @@
 // @grant        unsafeWindow
 // @require      https://cdn.jsdelivr.net/npm/katex@0.16.44/dist/katex.min.js
 // @resource     ophelKatexCss https://cdn.jsdelivr.net/npm/katex@0.16.44/dist/katex.min.css
-// @noframes
 // @license      GPL-3.0-or-later
 // ==/UserScript==
 
 
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+
+(function unifiedSurfaceScope() {
+  'use strict';
+
+  // Query parameters need not survive navigation. Identify the official host
+  // as well, without accessing its cross-origin document or allowing arbitrary
+  // embedded ChatGPT previews. This cannot make Tampermonkey inject a script.
+  const officialSideChatOrigin = 'chrome-extension://hehggadaopoacecdllhhajmbjkdcmajg';
+  const isFrame = window.self !== window.top;
+  const hasSideChatSurface = new URLSearchParams(location.search).get('surface') === 'browser_side_chat';
+  let isOfficialSideChatHost = false;
+  if (isFrame) {
+    try {
+      isOfficialSideChatHost = location.ancestorOrigins?.[0] === officialSideChatOrigin;
+    } catch (_) { /* Some browsers do not expose ancestorOrigins. */ }
+    if (!isOfficialSideChatHost) {
+      try {
+        const referrer = new URL(document.referrer);
+        isOfficialSideChatHost = referrer.protocol === 'chrome-extension:'
+          && referrer.host === 'hehggadaopoacecdllhhajmbjkdcmajg';
+      } catch (_) { /* An empty/referrer-policy-filtered referrer is normal. */ }
+    }
+  }
+  const allowedSurface = !isFrame || hasSideChatSurface || isOfficialSideChatHost;
+  let bootstrapState = allowedSurface ? 'starting' : 'skipped-frame';
+  const stampBootstrap = () => {
+    const root = document.documentElement;
+    if (!root) return;
+    root.setAttribute('data-cgpt-unified-version', '1.6.59');
+    root.setAttribute('data-cgpt-unified-surface', isFrame ? (allowedSurface ? 'side-chat' : 'other-frame') : 'tab');
+    root.setAttribute('data-cgpt-unified-bootstrap', bootstrapState);
+  };
+  stampBootstrap();
+  if (!document.documentElement) document.addEventListener('DOMContentLoaded', stampBootstrap, { once: true });
+  if (!allowedSurface) return;
+
+  try {
 
 (function coordinatorBundle() {
   'use strict';
@@ -33,7 +69,7 @@
   const PROMPT_STORAGE_KEY = 'cgpt-unified-prompt-library-v1';
   const runtime = globalThis[RUNTIME_KEY] || (globalThis[RUNTIME_KEY] = {});
 
-  runtime.version = '1.6.33';
+  runtime.version = '1.6.51';
   // Prefer semantic attributes over generated CSS class names. New ChatGPT
   // renders a user/assistant pair under data-turn-key without legacy role nodes.
   const dom = runtime.dom = Object.freeze({
@@ -71,7 +107,14 @@
         && child.matches('[data-cgpt-token-chip], .cgpt-unified-copy-message-md')
         ? '' : child.textContent || '').join('');
     },
-    messages(root = document.querySelector('main')) {
+    main() {
+      const surfaces = [...document.querySelectorAll('main, [role="main"]')];
+      const visible = surfaces.filter((node) => !node.closest('[hidden], [inert], [aria-hidden="true"]')
+        && node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden');
+      return visible.find((node) => node.querySelector('#prompt-textarea, [data-chatgpt-composer]'))
+        || visible.find((node) => node.querySelector(this.message)) || visible[0] || null;
+    },
+    messages(root = this.main()) {
       if (!root) return [];
       const nodes = [...(root.matches?.(this.message) ? [root] : []), ...root.querySelectorAll(this.message)];
       return nodes.filter((node) => ['user', 'assistant'].includes(this.role(node))
@@ -90,8 +133,8 @@
   runtime.lazy = runtime.lazy || null;
   // A disappearing stop button is only a pause, not proof that the final answer
   // finished. Thinking summaries can have their own copy button and markdown.
-  runtime.readQueueResponseState = () => {
-    const main = document.querySelector('main');
+  runtime.readQueueResponseState = (options = {}) => {
+    const main = dom.main();
     const visible = (node) => {
       if (!(node instanceof HTMLElement) || !node.isConnected) return false;
       const style = getComputedStyle(node);
@@ -100,12 +143,14 @@
         && rect.width > 0 && rect.height > 0;
     };
     const stopSelector = '[data-testid="stop-button"], [data-testid="composer-stop-button"], [data-testid*="stop-generating"]';
-    const composer = document.querySelector('#prompt-textarea, textarea[name="prompt-textarea"]');
+    const composer = main?.querySelector('#prompt-textarea, textarea[name="prompt-textarea"]')
+      || document.querySelector('#prompt-textarea, textarea[name="prompt-textarea"]');
     const composerShell = composer?.closest('form, [data-chatgpt-composer], [data-testid*="composer"]');
     const stopLabel = /^(?:stop(?: (?:generating|streaming|response))?|停止(?:生成|回答)?|中止生成)$/i;
     let busy = Array.from(document.querySelectorAll(stopSelector)).some(visible)
       || Array.from(composerShell?.querySelectorAll('button, [role="button"]') || []).some((button) =>
         visible(button) && stopLabel.test((button.getAttribute('aria-label') || button.getAttribute('title') || button.textContent || '').trim()));
+    if (options.busyOnly && busy) return { busy: true };
     if (!main) return { busy, complete: false, signature: 'no-main', hasUser: false };
     const users = Array.from(main.querySelectorAll(dom.user));
     const user = users[users.length - 1];
@@ -131,7 +176,6 @@
       && !(node.querySelector(overviewSelector) && !node.matches('[data-markdown-text-style="assistant-message"]')
         && !node.querySelector('.markdown:not([data-markdown-text-tone="tertiary"]), [data-markdown-text-style="assistant-message"]:not([data-markdown-text-tone="tertiary"])')));
     const body = bodies[bodies.length - 1];
-    const text = dom.messageText(body).trim();
     const activeLabel = /^(?:正在思考|思考中|正在搜索|搜索中|正在研究|正在处理|正在生成|正在回答|Thinking|Reasoning|Searching|Working|Generating)(?:\s*[.…]*)$/i;
     const activeNodes = scope.querySelectorAll('[aria-busy="true"], [data-is-streaming="true"], [data-is-generating="true"], [role="status"], [aria-live], button, [data-testid*="thinking"], [data-testid*="reasoning"]');
     busy ||= (scope.matches('[aria-busy="true"], [data-is-streaming="true"], [data-is-generating="true"]') && visible(scope))
@@ -141,6 +185,8 @@
         || (!node.matches('button, [role="button"], summary, [data-state="closed"], [data-state="open"]')
           && activeLabel.test((node.getAttribute('aria-label') || node.textContent || '').trim()))
       ));
+    if (options.busyOnly) return { busy };
+    const text = dom.messageText(body).trim();
     // Completion actions belong to the current final body. They may be hidden
     // until hover or outside a nested message wrapper; layout is not required.
     // Copy alone is still insufficient: reasoning/interim content can have it.
@@ -610,7 +656,7 @@
         const tree = await response.json();
         if (!tree?.mapping || !tree?.current_node) throw new Error('完整会话接口返回的数据结构不完整');
 
-        if (this.getConversationId() === conversationId) {
+        if (this.getConversationId() === conversationId && this.apiTreeCache.promise === request) {
           this.apiTreeCache = { conversationId, tree, fetchedAt: Date.now(), promise: null };
           this.apiOutlineCache = { conversationId, currentNode: '', items: [] };
         }
@@ -637,7 +683,7 @@
       if (!payload) return null;
       const { conversationId, tree } = payload;
       const items = this.buildConversationOutline(tree);
-      if (this.getConversationId() === conversationId) {
+      if (this.getConversationId() === conversationId && this.apiTreeCache.tree === tree) {
         this.apiOutlineCache = {
           conversationId,
           currentNode: String(tree.current_node || ''),
@@ -661,8 +707,18 @@
         conversationId,
         currentNode: String(cache.tree.current_node || ''),
         fetchedAt: cache.fetchedAt,
-        messages: this.messagesFromApiTree(cache.tree),
+        messages: this.getSnapshotMessages(cache.tree),
       };
+    }
+
+    getSnapshotMessages(tree) {
+      // API trees are immutable fetch snapshots. Retain only the current derived
+      // list, so streaming DOM refreshes do not parse every historical answer.
+      if (this.activeMessagesTree !== tree) {
+        this.activeMessagesTree = tree;
+        this.activeMessagesSnapshot = this.messagesFromApiTree(tree);
+      }
+      return this.activeMessagesSnapshot;
     }
 
     async getActiveMessages(options = {}) {
@@ -673,11 +729,13 @@
         conversationId,
         currentNode: String(tree.current_node || ''),
         fetchedAt: this.apiTreeCache.fetchedAt,
-        messages: this.messagesFromApiTree(tree),
+        messages: this.getSnapshotMessages(tree),
       };
     }
 
     async collectApi() {
+      const originUrl = location.href;
+      const originTitle = this.getDomTitle();
       // 用户主动导出时优先保证“此刻完整”，不能因为目录缓存而漏掉刚发送的消息。
       const payload = await this.fetchConversationTree({ force: true, maxAgeMs: 0 });
       if (!payload) return null;
@@ -689,8 +747,8 @@
         schema: 'cgpt-unified-session-export/v1',
         source: 'api',
         conversationId,
-        title: this.normalizeMessageBody(tree.title) || this.getDomTitle(),
-        url: location.href,
+        title: this.normalizeMessageBody(tree.title) || originTitle,
+        url: originUrl,
         exportedAt: new Date().toISOString(),
         messages,
       };
@@ -698,6 +756,7 @@
 
     async collect() {
       const conversationId = this.getConversationId();
+      const fallback = this.collectDom();
       if (conversationId) {
         try {
           const apiSession = await this.collectApi();
@@ -710,7 +769,7 @@
           }
         }
       }
-      return this.collectDom();
+      return this.getConversationId() === conversationId ? this.collectDom() : fallback;
     }
 
     toMarkdown(session) {
@@ -972,7 +1031,7 @@
 
     bindObserver() {
       if (!this.active) return;
-      const target = document.querySelector('main') || document.body;
+      const target = dom.main() || document.body;
       if (!target || target === this.observationRoot) return;
       this.observer?.disconnect();
       this.observationRoot = target;
@@ -1065,6 +1124,9 @@
     }
 
     withTokenCounts(messages) {
+      if (this.countedMessagesSource === messages && this.countedMessagesCache === this.apiTokenCache) {
+        return this.countedMessagesSnapshot;
+      }
       const nextCache = new Map();
       const counted = (Array.isArray(messages) ? messages : []).map((message) => {
         const key = message.id || message;
@@ -1077,6 +1139,9 @@
       });
       // Drop messages from abandoned branches instead of retaining every visited turn.
       this.apiTokenCache = nextCache;
+      this.countedMessagesSource = messages;
+      this.countedMessagesCache = nextCache;
+      this.countedMessagesSnapshot = counted;
       return counted;
     }
 
@@ -1138,7 +1203,21 @@
         if (domMessages[index].role === 'user') { domUser = index; break; }
       }
       if (apiUser < 0 || domUser < 0) return apiMessages;
-      return [...apiMessages.slice(0, apiUser), ...domMessages.slice(domUser)];
+      const liveUser = domMessages[domUser];
+      const sameUser = (message) => message.role === 'user' && (
+        message.id && liveUser.id ? message.id === liveUser.id : message.content === liveUser.content
+      );
+      const match = apiMessages.findLastIndex(sameUser);
+      if (match >= 0) {
+        if (match !== apiUser) return apiMessages;
+        return [...apiMessages.slice(0, match), ...domMessages.slice(domUser)];
+      }
+      // Only append an unknown live round when DOM confirms the previous API tail.
+      const confirmed = domMessages.slice(0, domUser).some(message => message.role === 'user' && (
+        message.id && apiMessages[apiUser].id
+          ? message.id === apiMessages[apiUser].id : message.content === apiMessages[apiUser].content
+      ));
+      return confirmed ? [...apiMessages, ...domMessages.slice(domUser)] : apiMessages;
     }
 
     ensureStyles() {
@@ -1188,6 +1267,7 @@
       root.id = this.rootId;
       root.innerHTML = '<div class="cgpt-token-pill"><span class="cgpt-token-full"><span data-slot="input">输入 ≈0 tok</span><span class="cgpt-token-sep"> · </span><span data-slot="output">输出 ≈0 tok</span><span class="cgpt-token-sep"> · </span><span class="cgpt-token-muted" data-slot="context">可见上下文 ≈0 tok</span></span><span class="cgpt-token-compact" data-slot="compact">0/0/0</span></div>';
       document.body.appendChild(root);
+      globalThis.__cgptUnifiedRuntimeV1?.surfaceLiquidGlass?.schedule();
       return root;
     }
 
@@ -1375,7 +1455,10 @@
     }
 
     isGenerating() {
-      return Boolean(document.querySelector('[data-testid="stop-button"], button[aria-label*="Stop" i], button[aria-label*="停止"]'));
+      const runtime = globalThis.__cgptUnifiedRuntimeV1;
+      if (runtime?.readQueueResponseState) return runtime.readQueueResponseState({ busyOnly: true }).busy === true;
+      return Array.from((dom.main() || document).querySelectorAll('[data-testid="stop-button"], button[aria-label*="Stop" i], button[aria-label*="停止"]'))
+        .some(element => !element.closest('[hidden], [aria-hidden="true"]') && element.getClientRects().length > 0);
     }
 
     async refresh({ forceApi = false } = {}) {
@@ -1404,12 +1487,23 @@
         this.removeSummary();
         return;
       }
-      const domMessages = this.collectAttachedMessages(roleNodes);
+      let domMessages = this.collectAttachedMessages(roleNodes);
+      const cached = this.exporter.getCachedActiveMessagesSync?.() || null;
+      const initialApi = this.withTokenCounts(cached?.messages || []);
+      this.lastGenerating = this.isGenerating();
+      this.renderSummary(this.lastGenerating ? this.mergeStreamingTail(initialApi, domMessages)
+        : (initialApi.length ? initialApi : domMessages));
+      if (cached && !forceApi) return;
       let apiMessages = [];
       try {
-        let result = this.exporter.getCachedActiveMessagesSync?.() || null;
+        let result = cached;
         if (forceApi || !result) {
-          result = await this.exporter.getActiveMessages({ force: forceApi, maxAgeMs: this.apiMaxAgeMs });
+          const pending = this.apiStatsRequest;
+          if (pending?.conversationId === conversationId && pending.epoch === epoch) return;
+          const request = { conversationId, epoch, promise: this.exporter.getActiveMessages({ force: forceApi, maxAgeMs: this.apiMaxAgeMs }) };
+          this.apiStatsRequest = request;
+          try { result = await request.promise; }
+          finally { if (this.apiStatsRequest === request) this.apiStatsRequest = null; }
         }
         if (!this.active || !this.isEnabled() || epoch !== this.refreshEpoch
           || this.exporter.getConversationId() !== conversationId) return;
@@ -1425,6 +1519,7 @@
       if (!this.active || !this.isEnabled() || epoch !== this.refreshEpoch
         || this.exporter.getConversationId() !== conversationId) return;
       const generating = this.isGenerating();
+      domMessages = this.collectAttachedMessages(this.getAttachedRoleNodes());
       this.lastGenerating = generating;
       const messages = generating
         ? this.mergeStreamingTail(apiMessages, domMessages)
@@ -1436,7 +1531,7 @@
       if (!this.active) return;
       this.refreshPending = true;
       this.forceApiPending ||= forceApi;
-      if (this.mutationTimer || this.refreshing) return;
+      if (this.mutationTimer) return;
       // Coalesce streaming bursts without postponing the refresh indefinitely.
       this.mutationTimer = window.setTimeout(async () => {
         this.mutationTimer = 0;
@@ -2146,6 +2241,9 @@
       const InputCtor = ownerWindow.HTMLInputElement;
       const isTextControl = (TextareaCtor && composer instanceof TextareaCtor)
         || (InputCtor && composer instanceof InputCtor);
+      const previousSelection = ownerWindow.getSelection();
+      const hadComposerSelection = previousSelection?.rangeCount
+        && composer.contains(previousSelection.anchorNode) && composer.contains(previousSelection.focusNode);
       composer.focus({ preventScroll: true });
       if (isTextControl) {
         const start = composer.selectionStart ?? composer.value.length;
@@ -2174,30 +2272,54 @@
           selection.removeAllRanges();
           selection.addRange(endRange);
         };
-        if (!selection.rangeCount || !composer.contains(selection.anchorNode)) placeCaretAtEnd();
+        if (!hadComposerSelection || !selection.rangeCount || !composer.contains(selection.anchorNode)
+          || !composer.contains(selection.focusNode)) placeCaretAtEnd();
 
         const beforeText = composer.textContent || '';
+        let inserted = false;
+        if (composer.matches('.ProseMirror') && (text.length >= 4096 || /[\r\n]/.test(text))) {
+          try {
+            // One native editor paste transaction instead of the browser's
+            // multiline editing command. Generated HTML contains plain text
+            // only; paragraph boundaries preserve blank lines and whitespace.
+            const clipboardData = new ownerWindow.DataTransfer();
+            const escape = line => line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            const html = text.split(/\r\n?|\n/).map((line, index) =>
+              `<p${index === 0 ? ' data-pm-slice="1 1 []"' : ''} style="white-space: pre-wrap">${line ? escape(line) : '<br>'}</p>`).join('');
+            clipboardData.setData('text/plain', text);
+            clipboardData.setData('text/html', html);
+            const paste = new ownerWindow.ClipboardEvent('paste', {
+              clipboardData, cancelable: true, bubbles: false,
+            });
+            // Target the editor's handler, without bubbling into application
+            // handlers that may turn a large clipboard payload into a file.
+            composer.dispatchEvent(paste);
+            inserted = paste.defaultPrevented || (composer.textContent || '') !== beforeText;
+          } catch { inserted = (composer.textContent || '') !== beforeText; }
+        }
         // Long prompts bypass the synthetic beforeinput attempt. Otherwise the
         // editor may parse the same large payload again through execCommand.
-        if (text.length < 4096) try {
+        if (!inserted && text.length < 4096) try {
           // ChatGPT 的 ProseMirror 会处理 beforeinput；先走它自己的编辑事务，
           // 可避免“DOM 看似写入后又被 React 状态还原”。
-          composer.dispatchEvent(new ownerWindow.InputEvent('beforeinput', {
+          const beforeInput = new ownerWindow.InputEvent('beforeinput', {
             bubbles: true,
             cancelable: true,
             composed: true,
             inputType: 'insertText',
             data: text,
-          }));
+          });
+          composer.dispatchEvent(beforeInput);
+          inserted = beforeInput.defaultPrevented || (composer.textContent || '') !== beforeText;
         } catch {}
 
-        let inserted = (composer.textContent || '') !== beforeText;
+        inserted ||= (composer.textContent || '') !== beforeText;
         if (!inserted) {
           if (!selection.rangeCount || !composer.contains(selection.anchorNode)) placeCaretAtEnd();
           try {
-            ownerDocument.execCommand('insertText', false, text);
+            inserted = Boolean(ownerDocument.execCommand('insertText', false, text));
           } catch {}
-          inserted = (composer.textContent || '') !== beforeText;
+          inserted ||= (composer.textContent || '') !== beforeText;
         }
 
         if (!inserted) {
@@ -3934,7 +4056,7 @@
         if (this.observedShell && (target === this.observedShell || this.observedShell.contains(target))) return true;
         const changed = [...record.addedNodes, ...record.removedNodes];
         return changed.some((node) => node instanceof Element && (
-          node.matches(composerSelector) || node.querySelector(composerSelector)
+          node.matches(`${composerSelector}, ${GLASS_SCROLL_SELECTOR}`) || node.querySelector(`${composerSelector}, ${GLASS_SCROLL_SELECTOR}`)
         ));
       });
       if (!composerChanged || this.mutationPositionTimer) return;
@@ -3967,11 +4089,15 @@
       if (!this.ensureRoot()) return;
       const composer = this.runtime.promptLibrary?.findComposer?.();
       if (!composer) {
+        this.runtime.composerLiquidGlass?.attach(null);
+        this.runtime.surfaceLiquidGlass?.refresh(null);
         this.root.hidden = true;
         return;
       }
       const shell = this.resolveComposerShell(composer);
       if (!(shell instanceof Element) || !shell.isConnected) {
+        this.runtime.composerLiquidGlass?.attach(null);
+        this.runtime.surfaceLiquidGlass?.refresh(null);
         this.root.hidden = true;
         return;
       }
@@ -3984,6 +4110,8 @@
       if (shell.getAttribute('data-cgfc-neumorphic-composer') !== 'true') {
         shell.setAttribute('data-cgfc-neumorphic-composer', 'true');
       }
+      this.runtime.composerLiquidGlass?.attach(shell);
+      this.runtime.surfaceLiquidGlass?.refresh(shell);
       const rect = shell.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0 || rect.bottom < 0 || rect.top > window.innerHeight) {
         this.root.hidden = true;
@@ -4031,6 +4159,573 @@
   }
 
 
+  // Native DOM backdrop refraction. Canvas generates only a small displacement
+  // texture on resize/settings changes; it never snapshots the conversation.
+  // Keep this controller on the existing composer discovery lifecycle, so there
+  // is no extra document observer or permanent animation/render loop.
+  /* Material layering and bezel optics adapted from:
+   * https://github.com/sohumsuthar/liquid-glass (lib/glass-optics.mjs, core CSS)
+   * MIT License — Copyright (c) 2026 Sohum Suthar
+   * Layered backdrop/content approach also reviewed against:
+   * https://github.com/nkzw-tech/liquid-glass (fork of rdev/liquid-glass-react).
+   * No React runtime is injected into the host editor.
+   *
+   * Permission is hereby granted, free of charge, to any person obtaining a copy
+   * of this software and associated documentation files (the "Software"), to deal
+   * in the Software without restriction, including without limitation the rights
+   * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+   * copies of the Software, and to permit persons to whom the Software is
+   * furnished to do so, subject to the following conditions:
+   * The above copyright notice and this permission notice shall be included in all
+   * copies or substantial portions of the Software.
+   * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   * SOFTWARE.
+   */
+  const GLASS_STYLE = `
+    html {
+      --cgfc-glass-tint: 26,29,33;
+      --cgfc-glass-fill: calc(.04 + var(--cgfc-glass-opacity, .12) * .25);
+      --cgfc-glass-luminance: 1;
+      --cgfc-glass-saturation: 1.12;
+      --cgfc-glass-shadow: .12;
+    }
+    html[data-cgfc-glass-style="clear"] {
+      --cgfc-glass-fill: calc(.02 + var(--cgfc-glass-opacity, .12) * .18);
+      --cgfc-glass-saturation: 1.08;
+    }
+    html.dark:not([data-cgfc-theme="light"]), html[data-cgfc-theme="dark"] {
+      --cgfc-glass-tint: 16,18,22;
+      --cgfc-glass-fill: calc(.12 + var(--cgfc-glass-opacity, .12) * .45);
+      --cgfc-glass-luminance: .96;
+      --cgfc-glass-saturation: 1.12;
+      --cgfc-glass-shadow: .26;
+    }
+    html.dark[data-cgfc-glass-style="clear"]:not([data-cgfc-theme="light"]),
+    html[data-cgfc-theme="dark"][data-cgfc-glass-style="clear"] {
+      --cgfc-glass-fill: calc(.10 + var(--cgfc-glass-opacity, .12) * .4);
+      --cgfc-glass-luminance: .98;
+      --cgfc-glass-saturation: 1.08;
+    }
+    :is([data-cgfc-liquid-composer], [data-cgfc-liquid-surface]) {
+      background: transparent !important;
+      border-color: transparent !important;
+      outline: none !important;
+      -webkit-backdrop-filter: none !important;
+      backdrop-filter: none !important;
+      box-shadow: 0 10px 26px -14px rgba(0,0,0,var(--cgfc-glass-shadow)) !important;
+      transition: box-shadow 260ms cubic-bezier(.32,.72,0,1) !important;
+    }
+    :is([data-cgfc-liquid-composer], [data-cgfc-liquid-surface]):focus-within {
+      box-shadow: 0 10px 26px -14px rgba(0,0,0,var(--cgfc-glass-shadow)) !important;
+    }
+    [data-cgfc-liquid-composer] { z-index: 0; }
+    [data-cgfc-liquid-surface] {
+      background: rgba(var(--cgfc-glass-tint), var(--cgfc-glass-fill)) !important;
+      -webkit-backdrop-filter: blur(var(--cgfc-glass-blur-px, 6px)) saturate(var(--cgfc-glass-saturation)) brightness(var(--cgfc-glass-luminance)) var(--cgfc-glass-filter, blur(0px)) !important;
+      backdrop-filter: blur(var(--cgfc-glass-blur-px, 6px)) saturate(var(--cgfc-glass-saturation)) brightness(var(--cgfc-glass-luminance)) var(--cgfc-glass-filter, blur(0px)) !important;
+    }
+    [data-cgfc-liquid-surface="send"] {
+      background: radial-gradient(ellipse at 30% 12%, color-mix(in srgb, var(--cgfc-glass-send-color, rgb(32,36,40)) 30%, transparent), transparent 72%),
+        color-mix(in srgb, var(--cgfc-glass-send-color, rgb(32,36,40)) 42%, rgba(16,18,22,.22)) !important;
+      color: #f5f6f7 !important;
+      box-shadow: 0 4px 12px -6px rgba(0,0,0,.2) !important;
+    }
+    [data-cgfc-liquid-surface="send"]:disabled,
+    [data-cgfc-liquid-surface="send"][aria-disabled="true"] { opacity: .45; }
+    [data-cgfc-liquid-surface="scroll"] {
+      background: transparent !important; box-shadow: none !important;
+    }
+    [data-cgfc-liquid-surface="stats"], [data-cgfc-liquid-surface="toggle"] {
+      --cgfc-glass-fill: calc(.02 + var(--cgfc-glass-opacity, .12) * .15);
+      box-shadow: none !important;
+    }
+    [data-cgfc-liquid-mode="paused"],
+    [data-cgfc-liquid-composer="paused"] > [data-cgfc-glass-effect] {
+      -webkit-backdrop-filter: none !important; backdrop-filter: none !important;
+    }
+    #cgfc-panel[data-cgfc-liquid-surface="settings"] .cgfc-settings-group {
+      background: rgba(var(--cgfc-glass-tint), .12) !important;
+      border-color: transparent !important;
+    }
+    #cgfc-panel[data-cgfc-liquid-surface="settings"] > .cgfc-actions {
+      background: rgba(var(--cgfc-glass-tint), .55) !important;
+      border-top-color: transparent !important;
+      backdrop-filter: blur(10px);
+    }
+    html[data-cgfc-liquid-glass] [data-cgfc-liquid-composer] :is([data-composer-body], [data-composer-input], [data-rich-text-layout]) {
+      background-color: transparent !important;
+    }
+    [data-cgfc-glass-effect], [data-cgfc-glass-tint], [data-cgfc-glass-sheen] {
+      position: absolute !important; inset: 0 !important; display: block !important;
+      border-radius: inherit !important; pointer-events: none !important;
+      user-select: none !important; box-sizing: border-box !important;
+    }
+    /* Do not add isolation, opacity, masking or paint containment to the shell:
+       those can cut off the live backdrop sampled by this separate effect. */
+    [data-cgfc-glass-effect] {
+      z-index: -2 !important; overflow: hidden !important;
+      -webkit-backdrop-filter: blur(var(--cgfc-glass-blur-px, 8px)) saturate(var(--cgfc-glass-saturation)) brightness(var(--cgfc-glass-luminance)) var(--cgfc-glass-filter, blur(0px)) !important;
+      backdrop-filter: blur(var(--cgfc-glass-blur-px, 8px)) saturate(var(--cgfc-glass-saturation)) brightness(var(--cgfc-glass-luminance)) var(--cgfc-glass-filter, blur(0px)) !important;
+      filter: none !important;
+    }
+    [data-cgfc-glass-tint] {
+      z-index: -1 !important;
+      background: rgba(var(--cgfc-glass-tint), var(--cgfc-glass-fill)) !important;
+    }
+    [data-cgfc-glass-sheen] {
+      z-index: 2 !important;
+      background: radial-gradient(ellipse 180px 95px at var(--cgfc-glass-light-x, 26%) var(--cgfc-glass-light-y, -20%),
+        rgba(255,255,255,.07), rgba(255,255,255,.015) 38%, transparent 75%) !important;
+      opacity: var(--cgfc-glass-sheen-opacity, 0);
+      transition: opacity 300ms cubic-bezier(.32,.72,0,1);
+    }
+    [data-cgfc-liquid-composer][data-cgfc-glass-hover] > [data-cgfc-glass-sheen] { opacity: var(--cgfc-glass-hover-opacity, .65); }
+    [data-cgfc-liquid-composer]:active > [data-cgfc-glass-sheen] { opacity: var(--cgfc-glass-press-opacity, .9); }
+    @media (prefers-reduced-motion: reduce) {
+      [data-cgfc-liquid-composer], [data-cgfc-glass-sheen] { transition: none !important; }
+    }
+    @media (forced-colors: active) {
+      :is([data-cgfc-liquid-composer], [data-cgfc-liquid-surface]) {
+        background: Canvas !important; border-color: CanvasText !important;
+        -webkit-backdrop-filter: none !important; backdrop-filter: none !important;
+        box-shadow: inset 0 0 0 1px CanvasText !important;
+      }
+      [data-cgfc-glass-effect], [data-cgfc-glass-tint], [data-cgfc-glass-rim], [data-cgfc-glass-sheen] { display: none !important; }
+    }
+  `;
+
+  const glassProfileCache = new Map();
+  function composerGlassProfile(curvature, bend) {
+    const key = `${curvature}:${bend}`;
+    if (glassProfileCache.has(key)) return glassProfileCache.get(key);
+    const samples = 256, table = new Float32Array(samples + 1);
+    const exponent = 2 + curvature * 4, n = 1.5168;
+    const surface = x => Math.pow(1 - Math.pow(1 - x, exponent), 1 / exponent);
+    let peak = 0;
+    for (let i = 0; i <= samples; i += 1) {
+      const x = i / samples, a = Math.max(0, x - .0001), b = Math.min(1, x + .0001);
+      const theta = Math.atan((surface(b) - surface(a)) / (b - a));
+      const refracted = Math.asin(Math.sin(theta) / n);
+      const ci = Math.cos(theta), ct = Math.cos(refracted);
+      const rs = (ci - n * ct) / (ci + n * ct), rp = (n * ci - ct) / (n * ci + ct);
+      const transmitted = 1 - .5 * (rs * rs + rp * rp);
+      table[i] = (.2 + bend * .3 + surface(x)) * Math.tan(theta - refracted) * transmitted;
+      peak = Math.max(peak, table[i]);
+    }
+    const profile = { table, peak };
+    if (glassProfileCache.size >= 12) glassProfileCache.delete(glassProfileCache.keys().next().value);
+    glassProfileCache.set(key, profile);
+    return profile;
+  }
+
+  let glassOpticsFrameTime = -1;
+  let glassOpticsFrameValue = null;
+  class ComposerLiquidGlass {
+    constructor(runtime, options = {}) {
+      this.runtime = runtime;
+      this.options = options;
+      this.modeAttribute = options.kind ? 'data-cgfc-liquid-mode' : 'data-cgfc-liquid-composer';
+      this.id = `cgpt-composer-glass-${Math.random().toString(36).slice(2, 10)}`;
+      this.candidate = null; this.shell = null; this.raf = 0; this.lightRaf = 0;
+      this.signature = ''; this.revision = 0; this.pointer = null;
+      this.onSettings = () => { glassOpticsFrameValue = null; this.attach(this.candidate || (!this.options.kind ? this.runtime?.composerQueueDock?.neumorphicShell : null)); };
+      this.onPointer = event => {
+        if (this.reducedMotion?.matches || !this.shell) return;
+        this.pointer = { x: event.clientX, y: event.clientY };
+        if (!this.lightRaf) this.lightRaf = requestAnimationFrame(() => { this.lightRaf = 0; this.paintLight(); });
+      };
+      this.onLeave = () => {
+        this.pointer = null;
+        if (this.lightRaf) cancelAnimationFrame(this.lightRaf);
+        this.lightRaf = 0;
+        this.defaultLight();
+      };
+      this.reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)');
+      this.onMotionChange = () => { if (this.reducedMotion?.matches) this.onLeave(); };
+      this.reducedMotion?.addEventListener?.('change', this.onMotionChange);
+      if (!options.managed) document.addEventListener('cgpt-unified-ui-settings-change', this.onSettings);
+      if (!options.sharedStyle) {
+        this.style = document.createElement('style');
+        this.style.id = 'cgpt-unified-composer-liquid-glass-style'; this.style.textContent = GLASS_STYLE;
+        (document.head || document.documentElement)?.appendChild(this.style);
+      }
+    }
+
+    attach(candidate) {
+      if (this.style && !this.style.isConnected) (document.head || document.documentElement)?.appendChild(this.style);
+      this.candidate = candidate instanceof Element && candidate.isConnected
+        && !candidate.matches('input, textarea, [contenteditable="true"]') && !candidate.isContentEditable ? candidate : null;
+      const next = document.documentElement.hasAttribute(this.options.enabledAttribute || 'data-cgfc-liquid-glass') ? this.candidate : null;
+      if (next !== this.shell) {
+        this.releaseSurface(); this.shell = next;
+        if (next) {
+          if (getComputedStyle(next).position === 'static') {
+            this.originalPosition = [next.style.getPropertyValue('position'), next.style.getPropertyPriority('position')];
+            next.style.setProperty('position', 'relative');
+          }
+          next.setAttribute(this.modeAttribute, 'blur');
+          if (this.options.kind) next.setAttribute('data-cgfc-liquid-surface', this.options.kind);
+          if (!this.options.direct) {
+            next.addEventListener('pointermove', this.onPointer, { passive: true });
+            next.addEventListener('pointerleave', this.onLeave, { passive: true });
+          }
+          if (typeof ResizeObserver === 'function') {
+            this.resizeObserver = new ResizeObserver(() => this.schedule()); this.resizeObserver.observe(next);
+          }
+          if (typeof IntersectionObserver === 'function') {
+            this.intersectionObserver = new IntersectionObserver(entries => {
+              if (this.shell !== next) return;
+              this.offscreen = !entries[0]?.isIntersecting;
+              if (this.offscreen) this.pause(); else this.schedule();
+            }, { rootMargin: '40px' });
+            this.intersectionObserver.observe(next);
+          }
+        }
+      }
+      if (!this.shell) return;
+      // Remove legacy rim nodes, including framework clones of older material.
+      for (const child of Array.from(this.shell.children)) if (child.hasAttribute('data-cgfc-glass-rim')) child.remove();
+      for (const key of this.options.direct ? [] : ['effect', 'tint', 'sheen']) {
+        const attr = `data-cgfc-glass-${key}`;
+        for (const child of Array.from(this.shell.children)) if (child.hasAttribute(attr) && child !== this[key]) child.remove();
+        if (!this[key] || this[key].parentElement !== this.shell) {
+          this[key]?.remove(); this[key] = document.createElement('span');
+          this[key].setAttribute(attr, ''); this[key].setAttribute('aria-hidden', 'true');
+          this.shell.appendChild(this[key]);
+        }
+      }
+      if (!this.pointer) this.defaultLight();
+      this.schedule();
+    }
+
+    defaultLight() {
+      if (!this.shell) return;
+      this.shell.removeAttribute('data-cgfc-glass-hover');
+      this.shell.style.removeProperty('--cgfc-glass-light-x'); this.shell.style.removeProperty('--cgfc-glass-light-y');
+    }
+
+    paintLight() {
+      if (!this.shell || !this.pointer) return;
+      const rect = this.shell.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2) return;
+      const x = Math.max(0, Math.min(1, (this.pointer.x - rect.left) / rect.width));
+      const y = Math.max(0, Math.min(1, (this.pointer.y - rect.top) / rect.height));
+      this.shell.setAttribute('data-cgfc-glass-hover', '');
+      this.shell.style.setProperty('--cgfc-glass-light-x', `${(x * 100).toFixed(1)}%`);
+      this.shell.style.setProperty('--cgfc-glass-light-y', `${(y * 100).toFixed(1)}%`);
+    }
+
+    schedule() {
+      if (this.raf || !this.shell) return;
+      if (document.hidden) { this.pause(); return; }
+      this.raf = requestAnimationFrame(frameTime => {
+        this.raf = 0;
+        try { this.render(frameTime); } catch (error) { this.fallback(); this.lastError = String(error?.message || error); }
+      });
+    }
+
+    pause() {
+      if (this.raf) cancelAnimationFrame(this.raf); this.raf = 0;
+      if (!this.shell || this.suspended) return;
+      this.suspended = true;
+      this.shell.setAttribute(this.modeAttribute, 'paused');
+      this.shell.style.removeProperty('--cgfc-glass-filter');
+    }
+
+    fallback() {
+      this.shell?.setAttribute(this.modeAttribute, 'blur');
+      this.shell?.style.removeProperty('--cgfc-glass-filter');
+      this.svg?.remove(); this.svg = null; this.filter = null; this.displacements = null;
+      this.signature = ''; this.opticsSignature = '';
+    }
+
+    readOptics(frameTime) {
+      if (Number.isFinite(frameTime) && glassOpticsFrameTime === frameTime && glassOpticsFrameValue) return { ...glassOpticsFrameValue };
+      const style = getComputedStyle(document.documentElement);
+      const number = (key, fallback, min, max) => {
+        const value = parseFloat(style.getPropertyValue(`--cgfc-glass-${key}`));
+        return Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : fallback;
+      };
+      const optics = { strength: number('strength', 36, 0, 60), blur: number('blur', 6, 0, 20),
+        thickness: number('thickness', 14, 4, 48), glare: number('glare', .45, 0, 1.6),
+        curvature: number('curvature', .5, 0, 1), bend: number('bend', .5, 0, 1), chroma: number('chroma', .04, 0, .6),
+        soft: document.documentElement.getAttribute('data-cgfc-glass-style') !== 'clear',
+        renderMode: document.documentElement.getAttribute('data-cgfc-glass-render-mode') || 'balanced' };
+      if (Number.isFinite(frameTime)) { glassOpticsFrameTime = frameTime; glassOpticsFrameValue = optics; }
+      return { ...optics };
+    }
+
+    render(frameTime) {
+      const shell = this.shell;
+      if (!shell?.isConnected) { this.attach(null); return; }
+      if (document.hidden || this.offscreen) { this.pause(); return; }
+      const rect = shell.getBoundingClientRect(); if (rect.width < 2 || rect.height < 2) { this.pause(); return; }
+      const resume = this.suspended; this.suspended = false;
+      const optics = this.readOptics(frameTime), width = Math.round(rect.width), height = Math.round(rect.height);
+      if (this.options.direct && !['send', 'scroll', 'stats', 'toggle'].includes(this.options.kind)) optics.blur = Math.max(8, optics.blur);
+      const radiusText = getComputedStyle(shell).borderTopLeftRadius, rawRadius = parseFloat(radiusText) || 26;
+      const radius = Math.min(width / 2, height / 2, radiusText.includes('%') ? Math.min(width, height) * rawRadius / 100 : rawRadius);
+      this.blurPx = optics.soft ? Math.max(optics.blur, 6) : optics.blur;
+      shell.style.setProperty('--cgfc-glass-blur-px', `${this.blurPx}px`);
+      shell.style.setProperty('--cgfc-glass-sheen-opacity', '0');
+      shell.style.setProperty('--cgfc-glass-hover-opacity', String(Math.min(.4, optics.glare * .55)));
+      shell.style.setProperty('--cgfc-glass-press-opacity', String(Math.min(.55, optics.glare * .7)));
+      const chromium = /\b(?:HeadlessChrome|Chrome|Chromium|Edg)\//.test(navigator.userAgent) && !/\b(?:CriOS|EdgiOS)\//.test(navigator.userAgent);
+      if (!chromium || optics.strength === 0 || optics.renderMode === 'frosted') { this.fallback(); return; }
+      // Constant-width optical bezel; never turn a long textbox into a fisheye.
+      const bezel = Math.min(optics.thickness, height * .24, width * .2);
+      const chromatic = optics.renderMode === 'full' && optics.chroma > 0;
+      const signature = [width, height, radius, bezel, optics.curvature, optics.bend, optics.renderMode, chromatic].join(':');
+      if (signature !== this.signature) { this.buildMap(width, height, radius, bezel, optics); this.signature = signature; }
+      this.applyOptics(optics);
+      if (resume && this.filter) this.rekey();
+      shell.setAttribute(this.modeAttribute, 'refraction');
+      this.lastError = '';
+    }
+
+    buildMap(width, height, radius, bezel, optics) {
+      const started = performance.now(), profile = composerGlassProfile(optics.curvature, optics.bend);
+      const full = optics.renderMode === 'full';
+      const resolution = Math.min(window.devicePixelRatio || 1, full ? 1.5 : 1, (full ? 1400 : 1000) / width, (full ? 500 : 360) / height);
+      const canvas = document.createElement('canvas'); canvas.width = Math.max(2, Math.round(width * resolution)); canvas.height = Math.max(2, Math.round(height * resolution));
+      const ctx = canvas.getContext('2d'); if (!ctx) throw new Error('Canvas 2D unavailable');
+      const img = ctx.createImageData(canvas.width, canvas.height);
+      for (let y = 0; y < canvas.height; y += 1) for (let x = 0; x < canvas.width; x += 1) {
+        const px = (x + .5) / canvas.width * width - width / 2, py = (y + .5) / canvas.height * height - height / 2;
+        const qx = Math.abs(px) - width / 2 + radius, qy = Math.abs(py) - height / 2 + radius;
+        const ax = Math.max(qx, 0), ay = Math.max(qy, 0), length = Math.hypot(ax, ay);
+        const depth = -(length + Math.min(Math.max(qx, qy), 0) - radius);
+        const nx = length > 0 ? ax / length * Math.sign(px) : qx > qy ? Math.sign(px) : 0;
+        const ny = length > 0 ? ay / length * Math.sign(py) : qy >= qx ? Math.sign(py) : 0;
+        let mag = 0;
+        if (depth > 0 && depth < bezel) {
+          const t = depth / bezel * 256, i = Math.floor(t), f = t - i;
+          mag = (profile.table[i] * (1 - f) + profile.table[Math.min(256, i + 1)] * f) / (profile.peak || 1);
+        }
+        const offset = (y * canvas.width + x) * 4;
+        img.data[offset] = Math.round(127.5 - nx * mag * 127.5);
+        img.data[offset + 1] = Math.round(127.5 - ny * mag * 127.5);
+        img.data[offset + 2] = 128; img.data[offset + 3] = 255;
+      }
+      ctx.putImageData(img, 0, 0);
+      const url = canvas.toDataURL(), ns = 'http://www.w3.org/2000/svg';
+      const make = (tag, attrs = {}) => { const node = document.createElementNS(ns, tag); for (const [k,v] of Object.entries(attrs)) node.setAttribute(k, String(v)); return node; };
+      const svg = make('svg', { width: 0, height: 0, 'aria-hidden': 'true', focusable: 'false' });
+      svg.style.cssText = 'position:absolute;left:0;top:0;width:0;height:0;pointer-events:none;overflow:hidden';
+      const filter = make('filter', { id: `${this.id}-${++this.revision}`, x: 0, y: 0, width, height, filterUnits: 'userSpaceOnUse', primitiveUnits: 'userSpaceOnUse', 'color-interpolation-filters': 'sRGB' });
+      filter.appendChild(make('feImage', { href: url, x: 0, y: 0, width, height, preserveAspectRatio: 'none', result: 'map' }));
+      const matrices = ['1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0', '0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 1 0', '0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 1 0'];
+      this.displacements = [];
+      const chromatic = full && optics.chroma > 0;
+      for (let c = 0; c < (chromatic ? 3 : 1); c += 1) {
+        this.displacements.push(filter.appendChild(make('feDisplacementMap', { in: 'SourceGraphic', in2: 'map', scale: 0, xChannelSelector: 'R', yChannelSelector: 'G', result: `bend${c}` })));
+        if (chromatic) filter.appendChild(make('feColorMatrix', { in: `bend${c}`, type: 'matrix', values: matrices[c], result: `channel${c}` }));
+      }
+      if (chromatic) {
+        filter.appendChild(make('feBlend', { in: 'channel0', in2: 'channel1', mode: 'screen', result: 'rg' }));
+        filter.appendChild(make('feBlend', { in: 'rg', in2: 'channel2', mode: 'screen' }));
+      }
+      const tree = this.shell.getRootNode();
+      svg.appendChild(filter); (tree instanceof ShadowRoot ? tree : document.body || document.documentElement).appendChild(svg);
+      const previous = this.svg; this.svg = svg; this.filter = filter;
+      this.maxBend = profile.peak * bezel; this.opticsSignature = ''; this.mapUrl = url;
+      this.shell.setAttribute(this.modeAttribute, 'refraction'); previous?.remove();
+      this.lastBuildMs = Math.round((performance.now() - started) * 10) / 10;
+      this.mapBuildCount = (this.mapBuildCount || 0) + 1;
+      const probe = new Image(); probe.src = url;
+      probe.decode?.().then(() => { if (this.svg === svg) this.rekey(); }).catch(() => {});
+    }
+
+    applyOptics(optics) {
+      if (!this.filter || !this.shell) return;
+      const signature = `${optics.strength}:${this.displacements.length === 3 ? optics.chroma : 0}`;
+      if (signature === this.opticsSignature) return;
+      const scale = this.maxBend * 2 * optics.strength / 36;
+      const factors = this.displacements.length === 3 ? [1 - optics.chroma * .25, 1, 1 + optics.chroma * .5] : [1];
+      this.displacements.forEach((node, i) => node.setAttribute('scale', String(scale * factors[i])));
+      this.opticsSignature = signature; this.rekey();
+    }
+
+    rekey() {
+      if (!this.filter || !this.shell) return;
+      this.filter.id = `${this.id}-${++this.revision}`;
+      this.shell.style.setProperty('--cgfc-glass-filter', `url("#${this.filter.id}")`);
+    }
+
+    releaseSurface() {
+      if (this.raf) cancelAnimationFrame(this.raf); this.raf = 0; this.onLeave();
+      this.resizeObserver?.disconnect(); this.resizeObserver = null;
+      this.intersectionObserver?.disconnect(); this.intersectionObserver = null;
+      this.offscreen = false; this.suspended = false;
+      this.shell?.removeEventListener('pointermove', this.onPointer); this.shell?.removeEventListener('pointerleave', this.onLeave);
+      this.svg?.remove(); this.svg = null; this.filter = null; this.displacements = null;
+      for (const key of ['effect', 'tint', 'rim', 'sheen']) { this[key]?.remove(); this[key] = null; }
+      this.shell?.removeAttribute(this.modeAttribute);
+      if (this.options.kind) this.shell?.removeAttribute('data-cgfc-liquid-surface');
+      this.shell?.style.removeProperty('--cgfc-glass-send-color');
+      if (this.originalPosition && this.shell) {
+        const [value, priority] = this.originalPosition;
+        if (value) this.shell.style.setProperty('position', value, priority); else this.shell.style.removeProperty('position');
+      }
+      this.originalPosition = null;
+      for (const key of ['filter', 'blur-px', 'rim-opacity', 'sheen-opacity', 'hover-opacity', 'press-opacity']) this.shell?.style.removeProperty(`--cgfc-glass-${key}`);
+      this.signature = ''; this.opticsSignature = ''; this.shell = null;
+    }
+
+    destroy() {
+      this.releaseSurface(); this.candidate = null;
+      document.removeEventListener('cgpt-unified-ui-settings-change', this.onSettings);
+      this.reducedMotion?.removeEventListener?.('change', this.onMotionChange); this.style?.remove();
+    }
+  }
+
+  const GLASS_SCROLL_SELECTOR = [
+    'button[class~="group/scroll-to-bottom"]', 'button[data-testid="scroll-to-bottom"]', 'button[data-testid="scroll-to-top"]',
+    'button[aria-label="滚动到底部"]', 'button[aria-label="滚动到顶部"]',
+    'button[aria-label="Scroll to bottom" i]', 'button[aria-label="Scroll to top" i]', 'button[aria-label="Jump to bottom" i]',
+  ].join(',');
+  // Additional surfaces share the material but retain independent enable flags.
+  // Direct backdrop painting stays pinned when a settings panel scrolls and
+  // does not insert unmanaged children into React-owned native buttons.
+  class SupplementaryLiquidGlass {
+    constructor(runtime) {
+      this.runtime = runtime; this.raf = 0; this.composerShell = null;
+      this.shadowStyles = new Map(); this.controllers = new Map(); this.scrollControllers = new Map();
+      const specs = [
+        ['toolboxPanel', 'toolbox', 'data-cgfc-toolbox-liquid-glass'],
+        ['toolboxLauncher', 'toolbox', 'data-cgfc-toolbox-liquid-glass'],
+        ['settings', 'settings', 'data-cgfc-settings-liquid-glass'],
+        ['queuePanel', 'queue', 'data-cgfc-queue-liquid-glass'],
+        ['queueCapsule', 'queue', 'data-cgfc-queue-liquid-glass'],
+        ['send', 'send', 'data-cgfc-send-liquid-glass'],
+        ['stats', 'stats', 'data-cgfc-token-liquid-glass'],
+        ['toggle', 'toggle', 'data-cgfc-toggle-liquid-glass'],
+      ];
+      for (const [name, kind, enabledAttribute] of specs) {
+        this.controllers.set(name, new ComposerLiquidGlass(runtime, { kind, enabledAttribute, direct: true, sharedStyle: true, managed: true }));
+      }
+      this.onSettings = () => { glassOpticsFrameValue = null; this.schedule(); for (const controller of this.allControllers()) controller.schedule(); };
+      this.onVisibility = () => {
+        for (const controller of [this.runtime.composerLiquidGlass, ...this.allControllers()]) {
+          if (document.hidden) controller?.pause(); else controller?.schedule();
+        }
+      };
+      document.addEventListener('cgpt-unified-ui-settings-change', this.onSettings);
+      document.addEventListener('DOMContentLoaded', this.onSettings, { once: true });
+      document.addEventListener('visibilitychange', this.onVisibility);
+      this.schedule();
+    }
+
+    schedule() {
+      if (this.raf) return;
+      this.raf = requestAnimationFrame(() => { this.raf = 0; this.refresh(); });
+    }
+
+    allControllers() { return [...this.controllers.values(), ...this.scrollControllers.values()]; }
+
+    bind(name, target, suppliedController) {
+      const controller = suppliedController || this.controllers.get(name);
+      const next = target instanceof Element && target.isConnected ? target : null;
+      const enabled = document.documentElement.hasAttribute(controller.options.enabledAttribute);
+      if (controller.candidate === next && controller.shell === (enabled ? next : null)) return;
+      if (next?.hasAttribute('data-cgfc-liquid-surface') && controller.shell !== next) {
+        // A framework clone can carry our old marker and filter URL. Read its
+        // native colour only after removing those inherited decorations.
+        next.removeAttribute('data-cgfc-liquid-surface');
+        next.removeAttribute(controller.modeAttribute);
+        next.style.removeProperty('--cgfc-glass-filter');
+        next.style.removeProperty('--cgfc-glass-send-color');
+      }
+      let sendColor = null;
+      if (name === 'send' && next && enabled) {
+        const color = getComputedStyle(next).backgroundColor.match(/rgba?\(([^)]+)\)/)?.[1]?.split(/[,\s/]+/).map(Number);
+        if (color?.length >= 3 && Math.max(...color.slice(0, 3)) - Math.min(...color.slice(0, 3)) > 12) {
+          sendColor = `rgb(${color.slice(0, 3).join(',')})`;
+        }
+      }
+      controller.attach(next);
+      if (sendColor && controller.shell) next.style.setProperty('--cgfc-glass-send-color', sendColor);
+    }
+
+    refresh(shell) {
+      if (shell !== undefined) this.composerShell = shell?.isConnected ? shell : null;
+      else if (!this.composerShell?.isConnected) this.composerShell = this.runtime.composerQueueDock?.neumorphicShell || null;
+      const host = document.getElementById('cgpt-answer-toc-host');
+      const shadow = host?.shadowRoot;
+      if (shadow && !this.shadowStyles.has(shadow)) {
+        const style = document.createElement('style');
+        style.setAttribute('data-cgfc-shared-glass-style', '');
+        // Theme variables inherit from html; html selectors cannot match inside
+        // this shadow tree. Preserve the host's normal isolation when disabled.
+        const start = GLASS_STYLE.indexOf('    :is([data-cgfc-liquid-composer]');
+        style.textContent = GLASS_STYLE.slice(start) + `
+          :host([data-cgfc-toolbox-glass]) { isolation: auto !important; }
+          :host([data-cgfc-toolbox-glass]) .panel-header,
+          :host([data-cgfc-toolbox-glass]) .view-tabs { border-color: transparent; }
+        `;
+        shadow.appendChild(style); this.shadowStyles.set(shadow, style);
+      }
+      for (const [tree, style] of this.shadowStyles) if (!tree.host.isConnected) { style.remove(); this.shadowStyles.delete(tree); }
+      host?.toggleAttribute('data-cgfc-toolbox-glass', document.documentElement.hasAttribute('data-cgfc-toolbox-liquid-glass'));
+      this.bind('toolboxPanel', shadow?.getElementById('panel'));
+      this.bind('toolboxLauncher', shadow?.getElementById('launcher'));
+      this.bind('settings', document.getElementById('cgfc-panel'));
+      this.bind('queuePanel', this.runtime.composerQueueDock?.panel);
+      this.bind('queueCapsule', this.runtime.composerQueueDock?.capsule);
+      this.bind('stats', document.querySelector('#cgpt-unified-token-stats .cgpt-token-pill'));
+      this.bind('toggle', document.getElementById('cgfc-toggle'));
+      const scrollButtons = document.documentElement.hasAttribute('data-cgfc-scroll-liquid-glass')
+        ? new Set(document.querySelectorAll(GLASS_SCROLL_SELECTOR)) : new Set();
+      for (const [node, controller] of this.scrollControllers) if (!scrollButtons.has(node)) {
+        controller.destroy(); this.scrollControllers.delete(node);
+      }
+      for (const node of scrollButtons) {
+        let controller = this.scrollControllers.get(node);
+        if (!controller) {
+          controller = new ComposerLiquidGlass(this.runtime, { kind: 'scroll', enabledAttribute: 'data-cgfc-scroll-liquid-glass', direct: true, sharedStyle: true, managed: true });
+          this.scrollControllers.set(node, controller);
+        }
+        this.bind('scroll', node, controller);
+      }
+      const button = Array.from(this.composerShell?.querySelectorAll([
+        '#composer-submit-button:not([data-testid="stop-button"]):not([data-testid*="speech"]):not([aria-label*="voice" i]):not([aria-label*="语音"])',
+        'button[data-testid="send-button"]', 'button[data-testid="composer-send-button"]',
+        'button[aria-label*="send" i]:not([aria-label*="stop" i])',
+        'button[aria-label*="发送"]:not([aria-label*="停止"])',
+      ].join(',')) || []).find(node => !node.matches('[data-testid="stop-button"], [data-testid*="speech"], [aria-label*="stop" i], [aria-label*="停止"], [aria-label*="voice" i], [aria-label*="语音"]'));
+      this.bind('send', button);
+      const observe = document.documentElement.hasAttribute('data-cgfc-send-liquid-glass') ? this.composerShell : null;
+      if (observe !== this.observedShell) {
+        this.buttonObserver?.disconnect(); this.buttonObserver = null; this.observedShell = observe;
+        if (observe) {
+          this.buttonObserver = new MutationObserver(() => this.schedule());
+          this.buttonObserver.observe(observe, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-testid', 'aria-label', 'disabled', 'aria-disabled'] });
+        }
+      }
+    }
+
+    destroy() {
+      if (this.raf) cancelAnimationFrame(this.raf);
+      this.buttonObserver?.disconnect();
+      document.removeEventListener('cgpt-unified-ui-settings-change', this.onSettings);
+      document.removeEventListener('DOMContentLoaded', this.onSettings);
+      document.removeEventListener('visibilitychange', this.onVisibility);
+      for (const controller of this.allControllers()) controller.destroy();
+      for (const style of this.shadowStyles.values()) style.remove();
+      document.getElementById('cgpt-answer-toc-host')?.removeAttribute('data-cgfc-toolbox-glass');
+      this.shadowStyles.clear(); this.controllers.clear(); this.scrollControllers.clear();
+    }
+  }
+
+  runtime.composerLiquidGlass?.destroy?.();
+  runtime.composerLiquidGlass = new ComposerLiquidGlass(runtime);
+  runtime.surfaceLiquidGlass?.destroy?.();
+  runtime.surfaceLiquidGlass = new SupplementaryLiquidGlass(runtime);
   runtime.tokenStats?.destroy?.();
   runtime.sessionExporter = new SessionExporter();
   runtime.tokenStats = new TokenStatsController(runtime.sessionExporter);
@@ -4157,7 +4852,7 @@
     answerTocDerivedMaxItems: 18,
     answerTocDerivedMinTextLength: 8,
 
-    // 首屏只挂载少量轮次时，分批借用原生目录补全真实提问标题。
+    // 自动补全保留：只读 API、DOM 与原生标题，不在后台点击导航。
     conversationTocAutoHydrateLabels: true,
     conversationTocHydrateBatchSize: 3,
     conversationTocHydrateDelayMs: 360,
@@ -4246,26 +4941,7 @@
 
   const css = [];
 
-  css.push(`
-    @supports (content-visibility: auto) {
-      /*
-       * 屏幕外的历史轮次仍保留在 DOM 中，但浏览器可以跳过其子树的
-       * 大量样式计算、布局和绘制工作。
-       */
-      ${TURN_SELECTOR}:not([data-turn-key]) {
-        content-visibility: auto !important;
-        contain-intrinsic-size: auto 640px !important;
-        contain-intrinsic-size: auto none auto 640px !important;
-      }
-
-      /* data-testid 结构变化时的保守后备。 */
-      ${ASSISTANT_SELECTOR} {
-        content-visibility: auto !important;
-        contain-intrinsic-size: auto 480px !important;
-        contain-intrinsic-size: auto none auto 480px !important;
-      }
-    }
-  `);
+  // 自适应性能模块测量真实高度后再启用外层轮次优化，避免固定估算高度。
 
   if (CONFIG.optimizeBlocksInsideLongAnswers) {
     css.push(`
@@ -4411,8 +5087,16 @@
 
       this.conversationItems = [];
       this.conversationItemButtons = [];
+      this.lastRenderedConversationModel = null;
       this.activeConversationIndex = -1;
       this.lastConversationSignature = '';
+      this.lastConversationDataSignature = '';
+      this.userPromptTextCache = new WeakMap();
+      this.userPromptTextRevision = 0;
+      this.conversationRecordLookups = new WeakMap();
+      this.apiOutlineLookups = new WeakMap();
+      this.pendingApiOutline = null;
+      this.resolvedApiOutline = null;
       this.officialNavContainer = null;
       this.conversationLabelCache = new Map();
       this.conversationCacheIdentityByIndex = new Map();
@@ -4544,6 +5228,10 @@
         capture: true,
         passive: true,
       });
+      this.onNavigationGesture = (event) => this.cancelNavigationForGesture(event);
+      for (const type of ['wheel', 'touchstart', 'pointerdown', 'keydown']) {
+        document.addEventListener(type, this.onNavigationGesture, { capture: true, passive: true });
+      }
       window.addEventListener('resize', this.onResize, { passive: true });
       window.visualViewport?.addEventListener('resize', this.onResize, { passive: true });
       window.visualViewport?.addEventListener('scroll', this.onResize, { passive: true });
@@ -4562,7 +5250,9 @@
       this.healthTimer = window.setInterval(() => {
         if (document.hidden) return;
 
-        if (location.href !== this.lastUrl || !this.mainElement?.isConnected) {
+        const activeMain = dom.main();
+        if (location.href !== this.lastUrl || !this.mainElement?.isConnected
+          || (activeMain && activeMain !== this.mainElement)) {
           this.resetForNavigation();
           return;
         }
@@ -4928,7 +5618,19 @@
             overflow-y: auto;
             overscroll-behavior: contain;
             padding: 6px;
-            scrollbar-width: thin;
+          }
+
+          /* Match the prompt list: narrow grey thumb, clear track, no arrows.
+             Keep scrollbar-width auto in Chromium so it uses these pseudo
+             elements; thin would override their size and native buttons. */
+          .toc-nav::-webkit-scrollbar { width: 9px; }
+          .toc-nav::-webkit-scrollbar-track { background: transparent; border-radius: 9px; }
+          .toc-nav::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 9px; background: #424242; background-clip: padding-box; }
+          .toc-nav::-webkit-scrollbar-thumb:hover { background-color: #585858; }
+          .toc-nav::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+          .toc-nav::-webkit-scrollbar-corner { background: transparent; }
+          @supports not selector(::-webkit-scrollbar) {
+            .toc-nav { scrollbar-width: thin; scrollbar-color: #424242 transparent; }
           }
 
           .toc-list {
@@ -5335,6 +6037,7 @@
       this.applyActiveView();
       this.applyCollapsedState();
       this.updateViewMeta();
+      globalThis.__cgptUnifiedRuntimeV1.surfaceLiquidGlass?.schedule();
     }
 
     readPositionState() {
@@ -6476,15 +7179,21 @@
       this.lastUrl = nextUrl;
       this.lastConversationRouteKey = nextRouteKey;
       this.cancelConversationJump();
+      this.cancelHeadingJump();
       this.cancelConversationLabelHydration(!routeChanged);
 
       if (routeChanged) {
+        this.userPromptTextCache = new WeakMap();
+        this.pendingApiOutline = null;
+        this.resolvedApiOutline = null;
+        this.lastConversationDataSignature = '';
         this.clearConversationLabelCacheState();
         this.maxObservedOfficialLogicalIndex = -1;
         this.restoreConversationLabelSnapshot();
         this.clearConversationToc();
         this.apiConversationOutline = null;
         this.apiConversationRefreshToken += 1;
+        this.apiConversationRefreshInFlight = false;
         globalThis.__cgptUnifiedRuntimeV1?.sessionExporter?.invalidateApiTreeCache?.();
       } else {
         // React 仅替换 main 或 URL 查询参数变化时保留完整问答目录快照。
@@ -6502,11 +7211,12 @@
     }
 
     bindMainObserver() {
+      const activeMain = dom.main();
       const conversationAnchor =
         document.querySelector(dom.assistant) ||
         document.querySelector(dom.user) ||
         document.querySelector('[data-composer-surface="true"], [data-chatgpt-composer], #prompt-textarea');
-      const main = conversationAnchor?.closest('main') || document.querySelector('main');
+      const main = activeMain || conversationAnchor?.closest('main');
       if (!main) {
         window.clearTimeout(this.rebindTimer);
         this.rebindTimer = window.setTimeout(() => this.bindMainObserver(), 300);
@@ -6521,6 +7231,10 @@
       this.mainObserver.observe(main, {
         childList: true,
         subtree: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: ['data-message-id', 'data-turn-key', 'data-chatgpt-search-message-ids',
+          'data-chatgpt-selection-message-id', 'data-toc-item-index', 'aria-label', 'title'],
       });
       this.scheduleConversationRebuild(60);
     }
@@ -6536,6 +7250,19 @@
       let conversationChanged = false;
 
       for (const record of records) {
+        const target = record.target instanceof Element ? record.target : record.target.parentElement;
+        const ownSelector = '[data-cgpt-token-chip], .cgpt-unified-copy-message-md';
+        const changedNodes = [...(record.addedNodes || []), ...(record.removedNodes || [])];
+        if (target?.closest(ownSelector) || (record.type === 'childList' && changedNodes.length
+          && changedNodes.every((node) => node instanceof Element && node.matches(ownSelector)))) continue;
+        const user = target?.closest(`${dom.user}, [data-chatgpt-search-unit-key$=":user"]`);
+        if (user) {
+          this.userPromptTextCache?.delete(user);
+          conversationChanged = true;
+        }
+        if (record.type === 'attributes' && target?.matches('button[data-toc-item-index]')) {
+          conversationChanged = true;
+        }
         if (
           this.currentAnswer?.isConnected &&
           record.target instanceof Node &&
@@ -6544,7 +7271,7 @@
           continue;
         }
 
-        for (const node of [...record.addedNodes, ...record.removedNodes]) {
+        for (const node of [...(record.addedNodes || []), ...(record.removedNodes || [])]) {
           if (this.nodeMatchesOrContains(node, dom.assistant)) {
             assistantAdded = true;
           }
@@ -6564,6 +7291,7 @@
       }
 
       if (conversationChanged) {
+        this.conversationLabelHydrationAttempts?.clear();
         this.scheduleConversationRebuild();
         if (this.pendingConversationLogicalIndex < 0) {
           this.scheduleApiConversationOutlineRefresh(420, true);
@@ -6573,7 +7301,7 @@
         if (this.pendingConversationLogicalIndex < 0) {
           this.requestFrame(true);
           // 新回答节点出现时再补一次强制刷新，覆盖“发送后 API 尚未落库”的短窗口。
-          this.scheduleApiConversationOutlineRefresh(700, true);
+          this.scheduleApiConversationOutlineRefresh(700, false);
         }
       }
     }
@@ -6616,6 +7344,9 @@
     }
 
     detectCurrentAnswer() {
+      // A smooth jump passes other answers. Keep its outline until it settles.
+      if (this.pendingHeadingIndex >= 0 && performance.now() < this.pendingHeadingUntil
+        && this.currentAnswer?.isConnected) return;
       const answer = this.findAnswerAtViewport();
 
       if (answer && answer !== this.currentAnswer) {
@@ -6832,10 +7563,23 @@
       this.normalizeOutlineLevels(headings);
 
       // 正式 H1-H6 一律完整保留；answerTocDerivedMaxItems 只限制自动派生项。
+      const pendingElement = this.pendingHeadingElement;
+      const unchanged = headings.length === this.headings.length && headings.every((heading, index) => {
+        const previous = this.headings[index];
+        return previous.element === heading.element && previous.label === heading.label
+          && previous.fullLabel === heading.fullLabel && previous.displayLevel === heading.displayLevel
+          && previous.derived === heading.derived;
+      });
       this.headings = headings;
+      if (pendingElement) {
+        const nextIndex = headings.findIndex(heading => heading.element === pendingElement);
+        if (nextIndex < 0) this.cancelHeadingJump();
+        else this.pendingHeadingIndex = nextIndex;
+      }
       this.observeHeadingText();
-      this.renderTocItems();
-      const nextActiveIndex = this.findActiveIndexBinary();
+      if (!unchanged || this.itemButtons.length !== headings.length) this.renderTocItems();
+      const nextActiveIndex = this.pendingHeadingIndex >= 0
+        ? this.pendingHeadingIndex : this.findActiveIndexBinary();
       this.activeIndex = -1;
       this.applyActiveIndex(nextActiveIndex, false);
       this.updateViewMeta();
@@ -7301,6 +8045,9 @@
     }
 
     extractUserPromptText(element) {
+      this.userPromptTextCache ||= new WeakMap();
+      const cached = this.userPromptTextCache.get(element);
+      if (cached) return cached.text;
       const source =
         element.querySelector('[data-message-content]') ||
         element.querySelector('.whitespace-pre-wrap') ||
@@ -7310,15 +8057,18 @@
       const clone = source.cloneNode(true);
       if (clone instanceof Element) {
         for (const removable of clone.querySelectorAll(
-          'button, script, style, svg, [aria-hidden="true"], [role="tooltip"]',
+          'button, script, style, svg, [aria-hidden="true"], [role="tooltip"], [data-cgpt-token-chip], .cgpt-unified-copy-message-md',
         )) {
           removable.remove();
         }
       }
 
-      return this.normalizeConversationText(clone.textContent ?? '')
+      const text = this.normalizeConversationText(clone.textContent ?? '')
         .replace(/^(?:You said:|你说[:：])\s*/i, '')
         .trim();
+      this.userPromptTextRevision = (this.userPromptTextRevision || 0) + 1;
+      this.userPromptTextCache.set(element, { text, revision: this.userPromptTextRevision });
+      return text;
     }
 
     getConversationIdFromLocation() {
@@ -7378,38 +8128,153 @@
         }
       } catch (error) {
         const key = `${conversationId}:${error?.message || error}`;
+        if (token !== this.apiConversationRefreshToken || routeKey !== this.getConversationRouteKey()) return;
         if (this.apiConversationLastErrorKey !== key) {
           this.apiConversationLastErrorKey = key;
           console.warn('[ChatGPT 完整问答目录] API 目录读取失败，继续使用 DOM/官方目录回退：', error);
         }
       } finally {
-        // 路由切换会递增 token；无论请求属于新旧路由，都必须释放 in-flight 锁。
-        this.apiConversationRefreshInFlight = false;
+        if (token === this.apiConversationRefreshToken) this.apiConversationRefreshInFlight = false;
       }
+    }
+
+    getConversationRecordLookup(records) {
+      this.conversationRecordLookups ||= new WeakMap();
+      const cached = this.conversationRecordLookups.get(records);
+      if (cached) return cached;
+      const byId = new Map(), byLabel = new Map();
+      for (const record of records) {
+        const ids = [record.identity?.startsWith('message:') ? record.identity.slice(8) : '', record.turnKey];
+        for (const id of ids.filter(Boolean)) if (!byId.has(String(id))) byId.set(String(id), record);
+        const label = this.normalizeConversationText(record.fullLabel || '');
+        if (label) byLabel.set(label, byLabel.has(label) ? null : record);
+      }
+      const lookup = { byId, byLabel };
+      this.conversationRecordLookups.set(records, lookup);
+      return lookup;
+    }
+
+    getApiOutlineLookup(outline) {
+      if (!Array.isArray(outline)) return { byId: new Map(), labelCounts: new Map() };
+      this.apiOutlineLookups ||= new WeakMap();
+      const cached = this.apiOutlineLookups.get(outline);
+      if (cached) return cached;
+      const byId = new Map(), labelCounts = new Map();
+      for (const item of outline) {
+        for (const id of [item.messageId, item.nodeId].filter(Boolean)) byId.set(String(id), item);
+        const label = this.normalizeConversationText(item.fullLabel || '');
+        if (label) labelCounts.set(label, (labelCounts.get(label) || 0) + 1);
+      }
+      const lookup = { byId, labelCounts };
+      this.apiOutlineLookups.set(outline, lookup);
+      return lookup;
     }
 
     findApiRecordByIdentity(apiItem, records) {
-      const ids = [apiItem?.messageId, apiItem?.nodeId].filter(Boolean).map(String);
-      return records.find((record) => ids.some((id) =>
-        record.identity === `message:${id}` || record.turnKey === id)) || null;
-    }
-
-    findApiRecordMatch(apiItem, records, legacyMapping = null) {
-      const exact = this.findApiRecordByIdentity(apiItem, records);
-      if (exact) return exact;
-
-      const normalizedLabel = this.normalizeConversationText(apiItem?.fullLabel || '');
-      if (normalizedLabel) {
-        const labelMatches = records.filter((record) =>
-          this.normalizeConversationText(record.fullLabel || '') === normalizedLabel);
-        if (labelMatches.length === 1) return labelMatches[0];
-      }
-
-      if (legacyMapping?.confident) {
-        const mapped = legacyMapping.recordsByIndex.get(apiItem.logicalIndex);
-        if (mapped) return mapped;
+      const lookup = this.getConversationRecordLookup(records);
+      for (const id of [apiItem?.messageId, apiItem?.nodeId].filter(Boolean)) {
+        const record = lookup.byId.get(String(id));
+        if (record) return record;
       }
       return null;
+    }
+
+    findApiRecordMatch(apiItem, records, legacyMapping = null, outline = this.getApiConversationOutlineForCurrentRoute()) {
+      const exact = this.findApiRecordByIdentity(apiItem, records);
+      if (exact) return exact;
+      const apiLookup = this.getApiOutlineLookup(outline);
+      const conflictsWithIdentity = (record) => {
+        const actualIds = [record?.identity?.startsWith('message:') ? record.identity.slice(8) : '', record?.turnKey].filter(Boolean);
+        // The exporter deliberately invents api-user-N when the payload lacks
+        // IDs. Those labels must retain the original legacy fallback behavior.
+        const expectedIds = [apiItem?.messageId, apiItem?.nodeId].filter((id) => id && !/^api-user-\d+$/.test(id));
+        // A real, different ID is not a legacy text-only wrapper. Do not alias
+        // it by identical prose while the expected history node is unmounted.
+        if (actualIds.length && expectedIds.length && !actualIds.some((id) => expectedIds.includes(id))) return true;
+        return actualIds.some((id) => {
+        const known = apiLookup.byId.get(String(id));
+        return known && ![known.messageId, known.nodeId].filter(Boolean)
+          .some((value) => [apiItem?.messageId, apiItem?.nodeId].filter(Boolean).includes(value));
+        });
+      };
+      const normalizedLabel = this.normalizeConversationText(apiItem?.fullLabel || '');
+      if (normalizedLabel && (apiLookup.labelCounts.get(normalizedLabel) || 0) <= 1) {
+        const record = this.getConversationRecordLookup(records).byLabel.get(normalizedLabel);
+        if (record && !conflictsWithIdentity(record)) return record;
+      }
+      if (legacyMapping?.confident) {
+        const mapped = legacyMapping.recordsByIndex.get(apiItem.logicalIndex);
+        if (mapped && !conflictsWithIdentity(mapped)) return mapped;
+      }
+      return null;
+    }
+
+    reconcileConversationOutline(apiOutline, records, mapping = null) {
+      if (!apiOutline.length) return apiOutline;
+      const samePrompt = (a, b) => [a?.messageId, a?.nodeId].filter(Boolean)
+        .some((id) => [b?.messageId, b?.nodeId].filter(Boolean).includes(id));
+      const identity = (item) => ({ messageId: item.messageId || '', nodeId: item.nodeId || '' });
+      const tail = this.pendingApiOutline;
+      const result = apiOutline.slice();
+      // A saved optimistic tail survives native unmounting, but never a branch
+      // change: the confirmed prefix and every confirmed tail identity must match.
+      if (tail && tail.routeKey === this.lastConversationRouteKey
+        && apiOutline.length >= tail.base.length
+        && tail.base.every((item, index) => samePrompt(item, apiOutline[index]))) {
+        const confirmed = apiOutline.length - tail.base.length;
+        if (confirmed <= tail.items.length && tail.items.slice(0, confirmed)
+          .every((item, index) => samePrompt(item, apiOutline[tail.base.length + index]))) {
+          result.push(...tail.items.slice(confirmed));
+        }
+      }
+      const lastApiItem = apiOutline.at(-1);
+      const anchor = this.findApiRecordMatch(lastApiItem, records, null, apiOutline);
+      const anchorIndex = anchor ? records.indexOf(anchor) : -1;
+      let trustedPositions = false;
+      if (mapping?.confident && mapping.trustLabels) {
+        const positions = new Map([...mapping.recordsByIndex].map(([index, record]) => [record, index]));
+        let aligned = false, contradicted = false;
+        apiOutline.forEach((item, index) => {
+          const record = this.findApiRecordByIdentity(item, records);
+          if (!record || !positions.has(record)) return;
+          if (positions.get(record) === index) aligned = true;
+          else contradicted = true;
+        });
+        trustedPositions = aligned && !contradicted;
+      }
+      if (trustedPositions || (anchorIndex >= 0 && anchorIndex + 1 < records.length
+        && (!mapping || mapping.officialMaxIndex < apiOutline.length + records.length - anchorIndex - 1))) {
+        const knownPositions = new Map();
+        result.forEach((item, index) => {
+          for (const id of [item.messageId, item.nodeId].filter(Boolean)) knownPositions.set(id, index);
+        });
+        const additions = trustedPositions
+          ? [...mapping.recordsByIndex].filter(([index]) => index >= apiOutline.length).sort((a, b) => a[0] - b[0])
+          : records.slice(anchorIndex + 1).map((record) => [null, record]);
+        for (const [position, record] of additions) {
+          const messageId = record.identity?.startsWith('message:') ? record.identity.slice(8) : record.turnKey || '';
+          if (!messageId || !record.fullLabel) continue;
+          const existingIndex = knownPositions.get(messageId) ?? knownPositions.get(record.turnKey);
+          if (existingIndex !== undefined && (existingIndex < apiOutline.length || !Number.isInteger(position))) continue;
+          const index = Number.isInteger(position) ? position : result.length;
+          if (existingIndex !== undefined && existingIndex !== index) {
+            result[existingIndex] = { messageId: '', nodeId: '', fullLabel: `提问 ${existingIndex + 1}`, sourceHint: 'native-pending' };
+          }
+          while (result.length < index) {
+            result.push({ messageId: '', nodeId: '', fullLabel: `提问 ${result.length + 1}`, sourceHint: 'native-pending' });
+          }
+          result[index] = { messageId, nodeId: record.turnKey || '', fullLabel: record.fullLabel, sourceHint: 'dom-pending' };
+          knownPositions.set(messageId, index);
+          if (record.turnKey) knownPositions.set(record.turnKey, index);
+        }
+      }
+      const pending = result.slice(apiOutline.length);
+      this.pendingApiOutline = pending.length ? {
+        routeKey: this.lastConversationRouteKey,
+        base: apiOutline.map(identity),
+        items: pending.map((item) => ({ ...identity(item), fullLabel: item.fullLabel, sourceHint: 'dom-pending' })),
+      } : null;
+      return pending.length ? result : apiOutline;
     }
 
     rebuildConversationTocFromApi(apiOutline, records, officialButtons) {
@@ -7419,26 +8284,44 @@
         if (Number.isInteger(logicalIndex) && logicalIndex >= 0) buttonsByIndex.set(logicalIndex, button);
       });
       const legacyMapping = this.mapUserRecordsToLogicalIndices(records, officialButtons);
+      let mergedOutline = this.reconcileConversationOutline(apiOutline, records, legacyMapping);
+      const maxOfficialIndex = Math.max(-1, ...buttonsByIndex.keys());
+      if (maxOfficialIndex >= mergedOutline.length) {
+        mergedOutline = mergedOutline.slice();
+        for (let index = mergedOutline.length; index <= maxOfficialIndex; index++) {
+          mergedOutline.push({ messageId: '', nodeId: '', sourceHint: 'native-pending',
+            fullLabel: this.getOfficialConversationLabel(buttonsByIndex.get(index), index) || `提问 ${index + 1}` });
+        }
+      }
 
-      const items = apiOutline.map((apiItem, logicalIndex) => {
+      const items = mergedOutline.map((apiItem, logicalIndex) => {
         const canonical = { ...apiItem, logicalIndex };
-        const mappedRecord = this.findApiRecordMatch(canonical, records, legacyMapping);
+        const mappedRecord = this.findApiRecordMatch(canonical, records, legacyMapping, mergedOutline);
         const officialButton = buttonsByIndex.get(logicalIndex) ?? null;
-        const fullLabel = canonical.fullLabel || `提问 ${logicalIndex + 1}`;
-        if (fullLabel) this.conversationLabelCache.set(logicalIndex, fullLabel);
+        const nativeLabel = canonical.sourceHint === 'native-pending'
+          && this.isConversationPlaceholderLabel(canonical.fullLabel, logicalIndex)
+          ? this.getOfficialConversationLabel(officialButton, logicalIndex) : '';
+        const fullLabel = nativeLabel || canonical.fullLabel || `提问 ${logicalIndex + 1}`;
+        const identity = canonical.messageId ? `message:${canonical.messageId}` : mappedRecord?.identity || '';
+        if (identity) this.cacheConversationRecordLabel(logicalIndex, { identity, fullLabel });
+        else {
+          this.removeConversationCachedLabel(logicalIndex);
+          if (!this.isConversationPlaceholderLabel(fullLabel, logicalIndex)) this.conversationLabelCache.set(logicalIndex, fullLabel);
+        }
         return {
           logicalIndex,
           apiMessageId: canonical.messageId || '',
           apiNodeId: canonical.nodeId || '',
           userElement: mappedRecord?.userElement ?? null,
           targetElement: mappedRecord?.targetElement ?? null,
+          targetRecordIdentity: mappedRecord?.identity || '',
           officialButton,
           fullLabel,
           label: this.formatConversationLabel(fullLabel),
           mappingConfident: Boolean(mappedRecord),
           // 目录始终完整显示；这里只标记“目标当前是否挂载”，供视觉提示和跳转策略使用。
           unloaded: !mappedRecord?.targetElement?.isConnected,
-          source: 'api',
+          source: canonical.sourceHint || 'api',
         };
       });
 
@@ -7448,6 +8331,7 @@
         items.length - 1,
       );
       this.lastConversationSignature = this.getConversationSignature();
+      this.lastConversationDataSignature = this.getConversationDataSignature();
       this.renderConversationItems();
       const active = this.findActiveConversationIndex();
       this.activeConversationIndex = -1;
@@ -7455,8 +8339,11 @@
       this.updateViewMeta();
       this.syncVisibility();
       this.persistConversationLabelSnapshot();
-      // API 已提供完整标题，不再运行会主动切换官方目录项的 hydration。
+      // API 和 DOM 的已确认标题优先；尚未落库的原生条目继续只读补全。
       this.cancelConversationLabelHydration(false);
+      if (items.some((item) => this.isConversationPlaceholderLabel(item.fullLabel, item.logicalIndex))) {
+        this.scheduleConversationLabelHydration();
+      }
     }
 
     collectUserMessageRecords() {
@@ -7472,8 +8359,11 @@
     }
 
     getOfficialNavButtons() {
+      const activeMain = dom.main();
       return [...document.querySelectorAll('button[data-toc-item-index]')]
-        .filter((button) => button instanceof HTMLButtonElement && button.isConnected)
+        .filter((button) => button instanceof HTMLButtonElement && button.isConnected
+          && !button.closest('[hidden], [inert], [aria-hidden="true"]')
+          && (!button.closest('main, [role="main"]') || button.closest('main, [role="main"]') === activeMain))
         .sort((a, b) => {
           const ai = Number.parseInt(a.dataset.tocItemIndex ?? '', 10);
           const bi = Number.parseInt(b.dataset.tocItemIndex ?? '', 10);
@@ -7525,6 +8415,17 @@
       return buttons;
     }
 
+    getConversationDataSignature(users = this.getUserMessageElements(), buttons = this.getOfficialNavButtons()) {
+      const userSignature = users.map((element, index) => {
+        const text = this.extractUserPromptText(element);
+        const identity = this.getConversationRecordIdentity(element, index);
+        const revision = this.userPromptTextCache?.get(element)?.revision || 0;
+        return `${identity}:${revision}:${text.length}:${text.slice(0, 16)}:${text.slice(-16)}`;
+      }).join('|');
+      const buttonSignature = buttons.map((button) => `${button.dataset.tocItemIndex ?? '?'}:${button.title}:${button.getAttribute('aria-label') || ''}:${button.textContent || ''}`).join('|');
+      return `${userSignature}||${buttonSignature}`;
+    }
+
     getConversationSignature() {
       const users = this.getUserMessageElements();
       const buttons = this.getOfficialNavButtons();
@@ -7532,27 +8433,25 @@
       const currentAnswerIdentity = dom.messageId(this.currentAnswer)
         || currentAnswerTurn?.getAttribute('data-testid')
         || currentAnswerTurn?.getAttribute('data-turn-key') || '';
-      const userSignature = users.map((element, index) => {
-        const text = (element.textContent ?? '').trim();
-        const identity = this.getConversationRecordIdentity(element, index);
-        return `${identity}:${text.length}:${text.slice(0, 16)}:${text.slice(-16)}`;
-      }).join('|');
       const buttonSignature = buttons.map((button) => {
         const index = button.dataset.tocItemIndex ?? '?';
         const active = button.hasAttribute('data-toc-active') ? 'a' : '';
         return `${index}${active}`;
       }).join(',');
-      return `${currentAnswerIdentity}||${userSignature}||${buttonSignature}`;
+      return `${currentAnswerIdentity}||${this.getConversationDataSignature(users, buttons)}||${buttonSignature}`;
     }
 
     refreshConversationTocIfNeeded() {
       const signature = this.getConversationSignature();
+      const dataSignature = this.getConversationDataSignature();
       if (signature !== this.lastConversationSignature) {
         this.scheduleConversationRebuild(40);
-        if (this.pendingConversationLogicalIndex < 0) {
-          this.scheduleApiConversationOutlineRefresh(460, true);
-        }
-      } else if (!this.getApiConversationOutlineForCurrentRoute()) {
+      }
+      if (dataSignature !== this.lastConversationDataSignature && this.pendingConversationLogicalIndex < 0) {
+        this.conversationLabelHydrationAttempts?.clear();
+        this.scheduleApiConversationOutlineRefresh(460, true);
+      } else if (!this.getApiConversationOutlineForCurrentRoute()
+        || this.conversationItems.some((item) => item.source === 'dom-pending' || item.source === 'native-pending')) {
         // 首次打开超长会话时 DOM 可能看起来完全没变化，但 API 目录仍需要补齐。
         this.scheduleApiConversationOutlineRefresh(120, false);
       }
@@ -7753,17 +8652,8 @@
     }
 
     restoreConversationLabelHydrationContext() {
-      const context = this.conversationLabelHydrationContext;
+      // Passive hydration never changes navigation or needs a scroll restore.
       this.conversationLabelHydrationContext = null;
-      if (!context || context.routeKey !== this.lastConversationRouteKey) return;
-      if (context.activeIndex >= 0 && this.getOfficialActiveLogicalIndex() !== context.activeIndex) {
-        this.activateOfficialConversationButton(context.activeIndex);
-      }
-      window.setTimeout(() => {
-        if (context.routeKey !== this.lastConversationRouteKey) return;
-        if (context.scrollRoot instanceof HTMLElement) context.scrollRoot.scrollTop = context.scrollTop;
-        else window.scrollTo({ top: context.scrollTop, behavior: 'auto' });
-      }, 120);
     }
 
     cancelConversationLabelHydration(restore = true) {
@@ -7796,15 +8686,20 @@
       }, Math.max(80, Number(delay) || 360));
     }
 
+    getOfficialConversationLabel(button, logicalIndex) {
+      return [button?.getAttribute('title'), button?.getAttribute('aria-label'), button?.textContent]
+        .map((value) => this.normalizeConversationText(value || ''))
+        .find((value) => value && !this.isConversationPlaceholderLabel(value, logicalIndex)
+          && !/^(?:\d+|(?:jump|go|scroll)\s+to\s+(?:prompt|question|message|turn)\s*\d+|(?:跳转(?:到)?|转到)\s*(?:提问|问题|消息|问答)\s*\d+)$/i.test(value)) || '';
+    }
+
     async hydrateConversationLabelBatch() {
-      if (this.conversationLabelHydrating || this.collapsed || this.activeView !== 'conversation') return;
+      if (!this.config.conversationTocAutoHydrateLabels || this.conversationLabelHydrating
+        || this.collapsed || this.activeView !== 'conversation') return;
       const buttons = this.getOfficialNavButtons();
-      const buttonIndices = new Set(buttons.map((button) =>
-        Number.parseInt(button.dataset.tocItemIndex ?? '', 10)));
       const batchSize = Math.max(1, Math.min(6, Number(this.config.conversationTocHydrateBatchSize) || 3));
       const missing = this.conversationItems
-        .filter((item) => buttonIndices.has(item.logicalIndex)
-          && this.isConversationPlaceholderLabel(item.fullLabel, item.logicalIndex)
+        .filter((item) => this.isConversationPlaceholderLabel(item.fullLabel, item.logicalIndex)
           && (this.conversationLabelHydrationAttempts.get(item.logicalIndex) || 0) < 2)
         .slice(0, batchSize);
       if (!missing.length) return;
@@ -7812,46 +8707,40 @@
       this.conversationLabelHydrating = true;
       const token = ++this.conversationLabelHydrationToken;
       const routeKey = this.lastConversationRouteKey;
-      const originalActiveIndex = this.getOfficialActiveLogicalIndex(buttons);
-      const scrollRoot = this.currentScrollRoot instanceof HTMLElement
-        ? this.currentScrollRoot
-        : document.scrollingElement;
-      const originalScrollTop = scrollRoot?.scrollTop ?? window.scrollY;
-      this.conversationLabelHydrationContext = {
-        routeKey,
-        activeIndex: originalActiveIndex,
-        scrollRoot,
-        scrollTop: originalScrollTop,
-      };
-
+      let changed = false;
       try {
+        const records = this.collectUserMessageRecords();
+        const mapping = this.mapUserRecordsToLogicalIndices(records, buttons);
         for (const item of missing) {
           if (token !== this.conversationLabelHydrationToken || routeKey !== this.lastConversationRouteKey) break;
-          const button = this.getOfficialNavButtons().find((candidate) =>
+          const record = mapping.trustLabels ? mapping.recordsByIndex.get(item.logicalIndex) : null;
+          const button = buttons.find((candidate) =>
             Number.parseInt(candidate.dataset.tocItemIndex ?? '', 10) === item.logicalIndex);
-          if (!(button instanceof HTMLButtonElement) || button.disabled) continue;
-          button.click();
-          const record = await this.waitForDirectConversationRecord(item.logicalIndex, token);
-          if (record) {
+          if (record?.fullLabel && !this.isConversationPlaceholderLabel(record.fullLabel, item.logicalIndex)) {
             this.cacheConversationRecordLabel(item.logicalIndex, record);
-            this.conversationLabelHydrationAttempts.delete(item.logicalIndex);
+            changed = true;
           } else {
-            const attempts = this.conversationLabelHydrationAttempts.get(item.logicalIndex) || 0;
-            this.conversationLabelHydrationAttempts.set(item.logicalIndex, attempts + 1);
+            // Native buttons sometimes expose the full prompt in title or text.
+            // Read those labels without activating the native virtual list.
+            const label = this.getOfficialConversationLabel(button, item.logicalIndex);
+            if (label) {
+              this.conversationLabelCache.set(item.logicalIndex, label);
+              changed = true;
+            }
           }
+          const attempts = this.conversationLabelHydrationAttempts.get(item.logicalIndex) || 0;
+          this.conversationLabelHydrationAttempts.set(item.logicalIndex, attempts + 1);
+        }
+        // The API can fill prompts which the native UI has not mounted at all.
+        if (missing.some((item) => !this.conversationLabelCache.has(item.logicalIndex))) {
+          await this.refreshApiConversationOutline(false);
         }
       } finally {
         if (token === this.conversationLabelHydrationToken && routeKey === this.lastConversationRouteKey) {
-          if (originalActiveIndex >= 0 && this.getOfficialActiveLogicalIndex() !== originalActiveIndex) {
-            this.activateOfficialConversationButton(originalActiveIndex);
-            await new Promise((resolve) => window.setTimeout(resolve, 120));
-          }
-          if (scrollRoot instanceof HTMLElement) scrollRoot.scrollTop = originalScrollTop;
-          else window.scrollTo({ top: originalScrollTop, behavior: 'auto' });
           this.conversationLabelHydrationContext = null;
           this.persistConversationLabelSnapshot();
           this.conversationLabelHydrating = false;
-          this.rebuildConversationToc();
+          if (changed) this.rebuildConversationToc();
           this.scheduleConversationLabelHydration();
         }
       }
@@ -8157,7 +9046,7 @@
         const fullLabel =
           displayRecord?.fullLabel ||
           cachedLabel ||
-          officialButton?.getAttribute('aria-label') ||
+          this.getOfficialConversationLabel(officialButton, logicalIndex) ||
           (unloaded
             ? `提问 ${logicalIndex + 1}（尚未加载，点击加载）`
             : `提问 ${logicalIndex + 1}`);
@@ -8175,7 +9064,12 @@
       }
 
       this.conversationItems = items;
+      this.resolvedApiOutline = items.map((item) => ({
+        logicalIndex: item.logicalIndex, messageId: item.apiMessageId, nodeId: item.apiNodeId,
+        fullLabel: item.fullLabel, sourceHint: item.source,
+      }));
       this.lastConversationSignature = this.getConversationSignature();
+      this.lastConversationDataSignature = this.getConversationDataSignature();
       this.renderConversationItems();
       const active = this.findActiveConversationIndex();
       this.activeConversationIndex = -1;
@@ -8188,6 +9082,26 @@
 
     renderConversationItems() {
       if (!this.conversationList) return;
+      const previous = this.lastRenderedConversationModel;
+      const unchanged = previous?.length === this.conversationItems.length
+        && this.conversationItems.every((item, index) => {
+          const row = previous[index];
+          return row.logicalIndex === item.logicalIndex && row.fullLabel === item.fullLabel
+            && row.label === item.label && row.unloaded === Boolean(item.unloaded);
+        });
+      if (unchanged
+        && this.conversationItemButtons.length === this.conversationItems.length
+        && this.conversationItemButtons.every((button) => button.isConnected)) {
+        // Rebuilds update target nodes; unchanged rows retain focus and list scroll.
+        const active = this.conversationItemButtons[this.activeConversationIndex];
+        if (active) { active.dataset.active = 'false'; active.removeAttribute('aria-current'); }
+        return;
+      }
+      // Store string references; do not serialize potentially huge prompts on
+      // every scroll-driven rebuild merely to detect unchanged directory rows.
+      this.lastRenderedConversationModel = this.conversationItems.map((item) => ({
+        logicalIndex: item.logicalIndex, fullLabel: item.fullLabel, label: item.label, unloaded: Boolean(item.unloaded),
+      }));
 
       const fragment = document.createDocumentFragment();
       this.conversationItemButtons = [];
@@ -8227,6 +9141,8 @@
       this.conversationItems = [];
       this.conversationItemButtons = [];
       this.activeConversationIndex = -1;
+      this.lastRenderedConversationModel = null;
+      this.resolvedApiOutline = null;
       this.lastConversationSignature = '';
       this.pendingConversationLogicalIndex = -1;
       this.pendingConversationUntil = 0;
@@ -8364,9 +9280,19 @@
       );
       if (
         currentItem?.mappingConfident &&
-        currentItem.targetElement?.isConnected
+        currentItem.targetElement?.isConnected && currentItem.userElement?.isConnected
+        && currentItem.targetElement.contains(currentItem.userElement)
+        && currentItem.targetElement.closest('main, [role="main"]') === dom.main()
       ) {
-        return currentItem.targetElement;
+        const expected = [currentItem.apiMessageId, currentItem.apiNodeId].filter(Boolean);
+        const user = currentItem.userElement;
+        const role = dom.role(user);
+        const isUser = role === 'user' || (!role && user.matches('[data-chatgpt-search-unit-key$=":user"]'));
+        const owner = currentItem.targetRecordIdentity;
+        const unchangedOwner = !owner || owner.startsWith('user-node:')
+          || owner === this.getConversationRecordIdentity(user, logicalIndex);
+        const actual = [dom.messageId(user), this.getConversationTurnElement(user)?.getAttribute('data-turn-key')].filter(Boolean);
+        if (isUser && unchangedOwner && (!expected.length || !actual.length || actual.some((id) => expected.includes(id)))) return currentItem.targetElement;
       }
 
       const records = this.collectUserMessageRecords();
@@ -8378,6 +9304,7 @@
         if (exactRecord) {
           currentItem.userElement = exactRecord.userElement;
           currentItem.targetElement = exactRecord.targetElement;
+          currentItem.targetRecordIdentity = exactRecord.identity;
           currentItem.mappingConfident = true;
           currentItem.unloaded = !exactRecord.targetElement?.isConnected;
           return exactRecord.targetElement || exactRecord.userElement;
@@ -8388,7 +9315,12 @@
         records,
         this.getOfficialNavButtons(),
       );
-      const record = mapping.recordsByIndex.get(logicalIndex);
+      const record = currentItem?.apiMessageId || currentItem?.apiNodeId || currentItem?.source === 'native-pending'
+        ? this.findApiRecordMatch({
+          logicalIndex, messageId: currentItem.apiMessageId, nodeId: currentItem.apiNodeId,
+          fullLabel: currentItem.fullLabel, sourceHint: currentItem.source,
+        }, records, mapping, this.resolvedApiOutline || this.getApiConversationOutlineForCurrentRoute())
+        : mapping.recordsByIndex.get(logicalIndex);
       if (!record || !mapping.confident) return null;
 
       if (record.fullLabel && mapping.trustLabels) {
@@ -8397,6 +9329,7 @@
       if (currentItem) {
         currentItem.userElement = record.userElement;
         currentItem.targetElement = record.targetElement;
+        currentItem.targetRecordIdentity = record.identity;
         currentItem.fullLabel = record.fullLabel || currentItem.fullLabel;
         currentItem.label = this.formatConversationLabel(currentItem.fullLabel);
         currentItem.mappingConfident = true;
@@ -8530,10 +9463,24 @@
       const item = this.conversationItems[index];
       if (!item) return;
 
+      this.cancelHeadingJump();
       this.cancelConversationJump();
       globalThis.__cgptUnifiedRuntimeV1?.beginNavigationLease?.(3600);
       const token = this.conversationJumpToken;
-      const logicalIndex = item.logicalIndex;
+      const routeKey = this.getConversationRouteKey();
+      let logicalIndex = item.logicalIndex;
+      const resolveClickedItem = () => {
+        if (routeKey !== this.getConversationRouteKey()) { this.cancelConversationJump(); return null; }
+        const liveItem = this.conversationItems.find(candidate => {
+          if (item.apiMessageId) return candidate.apiMessageId === item.apiMessageId;
+          if (item.apiNodeId) return candidate.apiNodeId === item.apiNodeId;
+          return candidate === item || (candidate.logicalIndex === item.logicalIndex && candidate.fullLabel === item.fullLabel);
+        });
+        if (!liveItem) { this.cancelConversationJump(); return null; }
+        logicalIndex = liveItem.logicalIndex;
+        this.pendingConversationLogicalIndex = logicalIndex;
+        return liveItem;
+      };
       this.pendingConversationLogicalIndex = logicalIndex;
       this.pendingConversationUntil = performance.now() + 2600;
       this.applyActiveConversationIndex(index, true);
@@ -8551,6 +9498,7 @@
         const behavior = this.getConversationJumpBehavior();
         this.scrollConversationTarget(initialTarget, behavior);
         this.scheduleConversationJumpTask(() => {
+          if (!resolveClickedItem()) return;
           const liveTarget = this.resolveConversationTarget(logicalIndex) || initialTarget;
           if (this.isUsableConversationTarget(liveTarget)
             && !this.isConversationTargetAligned(liveTarget)) {
@@ -8571,6 +9519,7 @@
         const retry = (attempt) => {
           const delay = retryDelays[attempt];
           this.scheduleConversationJumpTask(() => {
+            if (!resolveClickedItem()) return;
             if (jumpSettled) return;
             if (attempt === 0 || attempt === 3) {
               this.syncOfficialConversationNav();
@@ -8742,17 +9691,42 @@
       this.headingJumpToken += 1;
       this.clearHeadingJumpSettleListener();
       this.pendingHeadingIndex = -1;
+      this.pendingHeadingElement = null;
       this.pendingHeadingUntil = 0;
       window.clearTimeout(this.pendingHeadingTimer);
       this.pendingHeadingTimer = 0;
+    }
+
+    cancelNavigationForGesture(event) {
+      if (event.isTrusted === false || event.composedPath?.().includes(this.host)) return;
+      if (event.type === 'keydown' && (!['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)
+        || event.target?.closest?.('input, textarea, select, [contenteditable="true"]'))) return;
+      const pending = this.pendingHeadingIndex >= 0 || this.pendingConversationLogicalIndex >= 0;
+      if (!pending) return;
+      // Stop the browser animation as well as all delayed correction/retry work.
+      const target = this.currentScrollRoot;
+      if (target instanceof HTMLElement && target.isConnected) {
+        target.scrollTo({ top: target.scrollTop, behavior: 'instant' });
+      } else {
+        window.scrollTo({ top: window.scrollY, behavior: 'instant' });
+      }
+      this.cancelHeadingJump();
+      this.cancelConversationJump();
+      this.cancelConversationLabelHydration(false);
+      globalThis.__cgptUnifiedRuntimeV1?.beginNavigationLease?.(500);
+      this.requestFrame(true);
     }
 
     jumpToHeading(index) {
       const heading = this.headings[index];
       if (!heading?.element?.isConnected) return;
 
+      this.cancelConversationJump();
+      this.cancelConversationLabelHydration(false);
       this.cancelHeadingJump();
       const token = this.headingJumpToken;
+      const routeKey = this.getConversationRouteKey();
+      const answer = this.currentAnswer;
       const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
       const behavior = this.config.answerTocSmoothScroll && !reduceMotion
         ? 'smooth'
@@ -8761,12 +9735,18 @@
       // 跳转完成前固定用户点击的章节，避免 smooth scroll 穿过中间标题时高亮闪烁。
       const maxHoldMs = behavior === 'smooth' ? 1800 : 260;
       this.pendingHeadingIndex = index;
+      this.pendingHeadingElement = heading.element;
       this.pendingHeadingUntil = performance.now() + maxHoldMs;
       this.applyActiveIndex(index, true);
       globalThis.__cgptUnifiedRuntimeV1?.beginNavigationLease?.(behavior === 'smooth' ? 2600 : 900);
 
       const finish = () => {
         if (token !== this.headingJumpToken) return;
+        if (routeKey !== this.getConversationRouteKey() || answer !== this.currentAnswer
+          || !this.headings.some(item => item.element === heading.element)) {
+          this.cancelHeadingJump();
+          return;
+        }
         this.clearHeadingJumpSettleListener();
         if (heading.element.isConnected) {
           const targetY = this.getJumpLineViewportY();
@@ -8774,6 +9754,7 @@
           if (Math.abs(delta) > 8) this.scrollHeadingToReadingLine(heading.element, 'auto');
         }
         this.pendingHeadingIndex = -1;
+        this.pendingHeadingElement = null;
         this.pendingHeadingUntil = 0;
         window.clearTimeout(this.pendingHeadingTimer);
         this.pendingHeadingTimer = 0;
@@ -9045,6 +10026,7 @@
 
   const startAnswerToc = () => {
     const controller = new AnswerTocController(CONFIG);
+    globalThis.__cgptUnifiedRuntimeV1.answerToc = controller;
     controller.start();
   };
 
@@ -9056,12 +10038,12 @@
 })();
 
 
-/* ===== Module 2: recoverable adaptive DOM parking (Lazy Chat++ V2) ===== */
+/* ===== Module 2: adaptive performance monitoring (React-owned feed stays intact) ===== */
 
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /*!
  * ChatGPT Lazy Chat++ — Userscript
- * Custom long-chat build: detach-only, UI-free, token-estimator-free, auto re-collapse.
+ * Custom long-chat build: UI-free, token-estimator-free, non-destructive feed handling.
  * Copyright (C) 2025 Alex S Hamilton
  */
 
@@ -9372,7 +10354,7 @@
     // ChatGPT Lazy Chat++ V2 — Adaptive Performance Engine
     //
     // Design goals:
-    // 1) Actually detach old turns from the live DOM, but keep them restorable.
+    // 1) Preserve React-owned turns; do not detach live message nodes.
     // 2) Adapt the live-window size to turn count + browser pressure.
     // 3) Do zero non-essential DOM work while streaming / typing.
     // 4) Avoid fetch/API interception and avoid token/text scanning.
@@ -9445,6 +10427,13 @@
 
     // ---------- State ----------
     let hiddenStore = []; // [{ placeholder, node }]
+    const renderTurns = new Set();
+    let renderResizeObserver = null;
+    let renderMutationObserver = null;
+    let renderMutationRoot = null;
+    let pressureMetricsCache = new WeakMap();
+    let pressureCacheHits = 0;
+    let pressureCacheMisses = 0;
     let revealExtra = 0;
     let pressureLevel = 0;
     let lastMetrics = null;
@@ -9591,10 +10580,12 @@
 
     function getTurns() {
       try {
-        const hosts = Array.from(document.querySelectorAll(TURN_HOST_SELECTOR));
+        const main = globalThis.__cgptUnifiedRuntimeV1?.dom?.main?.();
+        if (!main) return [];
+        const hosts = Array.from(main.querySelectorAll(TURN_HOST_SELECTOR));
         if (hosts.length) return normalizeTurnCandidates(hosts);
 
-        const fallback = Array.from(document.querySelectorAll(TURN_FALLBACK_SELECTOR));
+        const fallback = Array.from(main.querySelectorAll(`${TURN_FALLBACK_SELECTOR}, [data-turn-key]`));
         return normalizeTurnCandidates(fallback);
       } catch {
         return [];
@@ -9613,7 +10604,7 @@
       return (
         document.querySelector('[role="feed"]') ||
         document.querySelector('main [role="feed"]') ||
-        document.querySelector('main') ||
+        globalThis.__cgptUnifiedRuntimeV1?.dom?.main?.() ||
         document.body ||
         document.documentElement
       );
@@ -9659,6 +10650,18 @@
       const s = document.createElement('style');
       s.id = 'lcpp-v2-style';
       s.textContent = `
+        /* Measured outer turns only. Keep React nodes and real scroll extent. */
+        [data-lcpp-render-auto] {
+          content-visibility: auto !important;
+          contain-intrinsic-size: auto none auto var(--lcpp-measured-height) !important;
+        }
+        html[data-cgpt-unified-navigation-active] [data-lcpp-render-auto],
+        [data-lcpp-render-auto][data-cgpt-conversation-jump-target] {
+          content-visibility: visible !important;
+        }
+        @media print {
+          [data-lcpp-render-auto] { content-visibility: visible !important; }
+        }
         html[${ROOT_FLAG}="1"] {
           --lcpp-turn-intrinsic: 640px;
         }
@@ -9676,9 +10679,8 @@
         html[${ROOT_FLAG}="1"][${ROOT_PRESSURE}="2"] main table,
         html[${ROOT_FLAG}="1"][${ROOT_PRESSURE}="3"] main pre,
         html[${ROOT_FLAG}="1"][${ROOT_PRESSURE}="3"] main table {
-          contain: layout paint;
-          content-visibility: auto;
-          contain-intrinsic-size: 1px 700px;
+        /* Keep real heights: nested estimated layout made old code/table replies blank. */
+        content-visibility: visible;
         }
 
         /* Math is kept visible for reliability; only isolate its paint/style cost. */
@@ -9844,6 +10846,9 @@
     }
 
     function getAllTurnNodes() {
+      // Connected query results already have DOM order. Avoid sorting every time
+      // the directory, token counter or exporter asks for the same intact feed.
+      if (!hiddenStore.length) return getTurns();
       // Parked 节点本身已经脱离 DOM，但它的 placeholder 仍留在原位置。
       // 以 placeholder 作为排序锚点即可恢复“真实会话顺序”，而不是简单地
       // 把 parked + live 两组拼接。这样 DOM 回退导出和目录都不会乱序。
@@ -9911,29 +10916,106 @@
           totalTurns: getTotalTurns(),
           liveTurns: getTurns().length,
           parkedTurns: hiddenStore.length,
+          optimizedTurns: [...renderTurns].filter((node) => !node.matches('pre, table')).length,
+          optimizedBlocks: [...renderTurns].filter((node) => node.matches('pre, table')).length,
+          optimizationMode: 'measured-render-window',
           pressureLevel,
           metrics: lastMetrics,
+          pressureCache: { hits: pressureCacheHits, misses: pressureCacheMisses },
         }),
       };
     }
 
-    function detachFirstN(turns, count) {
-      const limit = Math.min(count, MAX_DETACH_PER_IDLE, turns.length);
-      let detached = 0;
+    function clearRenderTurn(node) {
+      node.removeAttribute('data-lcpp-render-auto');
+      node.style.removeProperty('--lcpp-measured-height');
+      renderResizeObserver?.unobserve(node);
+      renderTurns.delete(node);
+    }
 
-      for (let i = 0; i < limit; i += 1) {
-        const el = turns[i];
-        try {
-          if (!(el instanceof HTMLElement) || !el.parentNode) continue;
-          const placeholder = document.createComment('lcpp-v2-detached');
-          el.parentNode.insertBefore(placeholder, el);
-          el.remove();
-          hiddenStore.push({ placeholder, node: el });
-          detached += 1;
-        } catch {}
+    function syncRenderWindow(turns, desired) {
+      if (!window.CSS?.supports?.('content-visibility', 'auto')) return;
+      const main = globalThis.__cgptUnifiedRuntimeV1?.dom?.main?.();
+      if (main && main !== renderMutationRoot) {
+        renderMutationObserver?.disconnect();
+        renderMutationRoot = main;
+        renderMutationObserver = new MutationObserver((records) => {
+          let dirty = false;
+          for (const record of records) {
+            const target = record.target instanceof Element ? record.target : record.target.parentElement;
+            if (record.type === 'childList' || record.type === 'attributes') {
+              for (let parent = target; parent && parent !== main; parent = parent.parentElement) {
+                pressureMetricsCache.delete(parent);
+              }
+            }
+            const turn = target?.closest('[data-lcpp-render-auto]');
+            if (turn && renderTurns.has(turn)) {
+              // An edited/regenerated old reply must acquire its new real height.
+              clearRenderTurn(turn);
+              dirty = true;
+            }
+          }
+          if (dirty) scheduleApply({ preserveAnchor: true });
+        });
+        renderMutationObserver.observe(main, { subtree: true, childList: true, characterData: true,
+          attributes: true, attributeFilter: ['class', 'data-testid', 'data-turn-key'] });
       }
-
-      return detached;
+      if (!renderResizeObserver && typeof ResizeObserver === 'function') {
+        renderResizeObserver = new ResizeObserver((entries) => {
+          for (const entry of entries) {
+            const node = entry.target;
+            const height = entry.contentRect.height;
+            if (renderTurns.has(node) && height > 0) {
+              const before = parseFloat(node.style.getPropertyValue('--lcpp-measured-height'));
+              if (!Number.isFinite(before) || Math.abs(before - height) > .5) {
+                node.style.setProperty('--lcpp-measured-height', `${height}px`);
+              }
+            }
+          }
+        });
+      }
+      const cutoff = Math.max(0, turns.length - desired);
+      const candidates = new Set(turns.slice(0, cutoff).filter((node) =>
+        // New UI owns its virtual list and paired data-turn-key nodes. Do not
+        // apply a second render window to that layout, or to focused content.
+        !node.matches('[data-turn-key]') && !node.querySelector('[data-turn-key]')
+        && !node.contains(document.activeElement)));
+      if (pressureLevel >= 2 && main) {
+        for (const block of main.querySelectorAll('pre, table')) {
+          if (block.closest('[data-turn-key]') || block.contains(document.activeElement)) continue;
+          // Keep the original heavy-block feature without nested render windows.
+          let nested = false;
+          for (let parent = block.parentElement; parent && parent !== main; parent = parent.parentElement) {
+            if (candidates.has(parent)) { nested = true; break; }
+          }
+          if (!nested) candidates.add(block);
+        }
+      }
+      for (const node of renderTurns) {
+        if (!node.isConnected || !candidates.has(node)) clearRenderTurn(node);
+      }
+      for (const node of candidates) {
+        if (renderTurns.has(node)) continue;
+        const rect = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        const numeric = (key) => parseFloat(style[key]) || 0;
+        // Layout containment stops margin collapsing. A plain borderless block
+        // with uncontained child margins cannot preserve its old geometry.
+        const isolated = /^(?:inline-block|(?:inline-)?flex|(?:inline-)?grid|flow-root)$/.test(style.display)
+          || /^(?:auto|scroll|hidden)$/.test(style.overflowY)
+          || node.matches('table')
+          || (node.matches('pre') && (!node.firstElementChild || node.firstElementChild.matches('code')))
+          || (numeric('paddingTop') + numeric('borderTopWidth') > 0
+            && numeric('paddingBottom') + numeric('borderBottomWidth') > 0);
+        if (!isolated) continue;
+        const height = rect.height - numeric('paddingTop') - numeric('paddingBottom')
+          - numeric('borderTopWidth') - numeric('borderBottomWidth');
+        if (!(height > 0)) continue;
+        node.style.setProperty('--lcpp-measured-height', `${height}px`);
+        node.setAttribute('data-lcpp-render-auto', '');
+        renderTurns.add(node);
+        renderResizeObserver?.observe(node);
+      }
     }
 
     // ============================================================
@@ -9981,7 +11063,14 @@
 
       const turns = getTurns();
       const total = turns.length + hiddenStore.length;
-      if (!total) return;
+      if (!total) {
+        for (const node of renderTurns) clearRenderTurn(node);
+        pressureLevel = 0;
+        lastMetrics = null;
+        pressureMetricsCache = new WeakMap();
+        publishDebugAttrs(0, 0, 0);
+        return;
+      }
 
       const desired = desiredVisibleCount(total);
       const currentConnected = turns.length;
@@ -9994,28 +11083,12 @@
         withAnchorCompensation(preserveAnchor, () => restoreSome(needRestore));
       }
 
-      // Need fewer connected turns.
-      const afterRestore = getTurns();
-      const needDetach = Math.max(0, afterRestore.length - desired);
-      if (needDetach > 0) {
-        const pinnedToBottomBefore = isNearBottom(BOTTOM_PIN_THRESHOLD);
-
-        // “允许回收”与“强制贴底”是两件事。用户哪怕距离底部还有几百像素，
-        // 也可能正在读刚生成的上一段内容；此时回收旧 DOM 可以继续做，但
-        // 必须用锚点补偿保持当前阅读位置。
-        withAnchorCompensation(preserveAnchor || !pinnedToBottomBefore, () => {
-          detachFirstN(getTurns(), needDetach);
-        });
-
-        if (pinnedToBottomBefore) requestAnimationFrame(scrollToBottom);
-
-        // Chunk very large initial cleanups.
-        if (needDetach > MAX_DETACH_PER_IDLE) {
-          scheduleApply({ preserveAnchor: false, force: true });
-        }
-      }
-
-      publishDebugAttrs(total, desired);
+      // React owns these nodes. Removing them breaks reconciliation when a new
+      // prompt is submitted, and comment placeholders collapse the scroll extent.
+      // Preserve the adaptive window through measured browser rendering instead.
+      const liveTurns = currentHidden > targetHidden ? getTurns() : turns;
+      syncRenderWindow(liveTurns, desired);
+      publishDebugAttrs(total, liveTurns.length, liveTurns.length);
 
       if (force) {
         // Re-resolve because ChatGPT may replace its scroll/feed container after large changes.
@@ -10208,7 +11281,7 @@
       return level;
     }
 
-    function publishDebugAttrs(total = getTotalTurns(), desired = desiredVisibleCount(total)) {
+    function publishDebugAttrs(total = getTotalTurns(), desired = desiredVisibleCount(total), live = getTurns().length) {
       setRootAttr(ROOT_FLAG, '1');
       setRootAttr(ROOT_PRESSURE, String(pressureLevel));
       setRootAttr(ROOT_HOT, isInteractionHot() ? '1' : '0');
@@ -10216,10 +11289,30 @@
 
       // Tiny diagnostic attributes only. No visible UI.
       setRootAttr('data-lcpp-total-turns', total);
-      setRootAttr('data-lcpp-live-turns', getTurns().length);
+      setRootAttr('data-lcpp-live-turns', live);
       setRootAttr('data-lcpp-parked-turns', hiddenStore.length);
       setRootAttr('data-lcpp-target-turns', desired);
       setRootAttr('data-lcpp-version', VERSION);
+    }
+
+    function getCachedPressureCount(root, kind, budget) {
+      if (budget <= 0) return 0;
+      let cached = pressureMetricsCache.get(root);
+      if (!cached) { cached = {}; pressureMetricsCache.set(root, cached); }
+      const entry = cached[kind];
+      if (entry && (entry.exact || entry.cap >= budget)) {
+        pressureCacheHits++;
+        return Math.min(budget, entry.count);
+      }
+      pressureCacheMisses++;
+      if (kind === 'nodes') {
+        const result = countElementNodesCapped([root], budget);
+        cached[kind] = { count: result.count, cap: budget, exact: !result.capped };
+      } else {
+        const count = countSelectorCapped([root], kind === 'math' ? MATH_SELECTOR : CODE_SELECTOR, budget);
+        cached[kind] = { count, cap: budget, exact: count < budget };
+      }
+      return cached[kind].count;
     }
 
     function scanPressureNow() {
@@ -10231,15 +11324,22 @@
       const roots = getTurns();
       const totalTurns = roots.length + hiddenStore.length;
       if (!totalTurns) {
+        pressureLevel = 0;
+        lastMetrics = null;
+        publishDebugAttrs(0, 0, 0);
         schedulePressureScan(PRESSURE_SCAN_MS);
         return;
       }
 
       // Only scan currently connected turns. Parked/detached turns no longer
       // participate in layout/paint and should not inflate the live pressure score.
-      const nodeInfo = countElementNodesCapped(roots, NODE_COUNT_CAP);
-      const mathCount = countSelectorCapped(roots, MATH_SELECTOR, MATH_COUNT_CAP);
-      const codeCount = countSelectorCapped(roots, CODE_SELECTOR, CODE_COUNT_CAP);
+      let nodeCount = 0, mathCount = 0, codeCount = 0;
+      for (const root of roots) {
+        nodeCount += getCachedPressureCount(root, 'nodes', NODE_COUNT_CAP - nodeCount);
+        mathCount += getCachedPressureCount(root, 'math', MATH_COUNT_CAP - mathCount);
+        codeCount += getCachedPressureCount(root, 'code', CODE_COUNT_CAP - codeCount);
+        if (nodeCount >= NODE_COUNT_CAP && mathCount >= MATH_COUNT_CAP && codeCount >= CODE_COUNT_CAP) break;
+      }
       const lt = pruneLongTasks();
 
       const metrics = {
@@ -10247,8 +11347,8 @@
         totalTurns,
         liveTurns: roots.length,
         parkedTurns: hiddenStore.length,
-        nodeCount: nodeInfo.count,
-        nodeCountCapped: nodeInfo.capped,
+        nodeCount,
+        nodeCountCapped: nodeCount >= NODE_COUNT_CAP,
         mathCount,
         codeCount,
         longTaskCount: lt.count,
@@ -10261,7 +11361,7 @@
       pressureLevel = nextPressure;
       lastMetrics = metrics;
 
-      publishDebugAttrs();
+      publishDebugAttrs(totalTurns, desiredVisibleCount(totalTurns), roots.length);
 
       // Only collapse harder automatically when at/near the bottom.
       // If the user is reading history, preserve the expanded window.
@@ -10355,7 +11455,10 @@
 
     function refreshObserverRoot() {
       const root = pickFeedRoot();
-      if (root && root !== observerRoot) attachObserver(root);
+      if (root && root !== observerRoot) {
+        attachObserver(root);
+        scheduleApply({ preserveAnchor: true, force: true });
+      }
     }
 
     // ============================================================
@@ -10398,6 +11501,15 @@
       // The old page is being replaced by ChatGPT. Drop references to detached
       // nodes from the old route so the browser is free to collect them.
       hiddenStore.length = 0;
+      pressureMetricsCache = new WeakMap();
+      pressureCacheHits = 0;
+      pressureCacheMisses = 0;
+      for (const node of renderTurns) clearRenderTurn(node);
+      renderResizeObserver?.disconnect();
+      renderResizeObserver = null;
+      renderMutationObserver?.disconnect();
+      renderMutationObserver = null;
+      renderMutationRoot = null;
       revealExtra = 0;
       pressureLevel = 0;
       lastMetrics = null;
@@ -10431,9 +11543,7 @@
       }, ROUTE_POLL_MS);
     }
 
-    // Keep the original Lazy Chat++ safety behavior: clicking a conversation
-    // in the sidebar performs a full navigation. This prevents a SPA route swap
-    // from inheriting detached DOM state from another conversation.
+    // Preserve the original sidebar full-navigation behavior across UI versions.
     const SIDEBAR_SCOPE_SEL = 'nav[aria-label="Chat history"], #history, [class*="sidebar-width"]';
 
     function isInsideSidebar(node) {
@@ -10547,6 +11657,28 @@
   const dilTextSelector = `${chatContentSelector} :is([data-d-component="text"], [data-d-component="title"])${dilTextExclusions}`;
   const dilBodyTextSelector = `${chatContentSelector} [data-d-component="text"]${dilTextExclusions}`;
   const dilControlTextSelector = `${chatContentSelector} :is([data-d-component="caption"], [data-d-component="badge"], [data-d-component="button"], [data-d-component="popover-trigger"], [data-d-component="pressable"], [data-d-component="slider"])${dilTextExclusions}`;
+  // Interactive cards may be siblings of Markdown, and their labels can own
+  // native font declarations without a data-d-component attribute themselves.
+  const dilSurfaceSelector = `main :is(${dom.turn}, ${dom.assistant}) :is([data-d-component], [role="radiogroup"], [role="radio"], [role="checkbox"], [role="tablist"], [role="tab"], [role="listbox"], [role="option"])`;
+  const dilTypographyExclusions = `${dilTextExclusions}:not(:where(input, textarea, [contenteditable="true"], [contenteditable="true"] *, [data-cgpt-token-chip], [data-cgpt-token-chip] *))`;
+  const dilAllTextSelector = `:is(${dilSurfaceSelector}:is([data-d-component="text"], [data-d-component="title"], [data-d-component="caption"], [data-d-component="badge"], [data-d-component="button"], [data-d-component="popover-trigger"], [data-d-component="pressable"], [role="radio"], [role="checkbox"], [role="tab"], [role="option"]), ${dilSurfaceSelector} :is(span, label, button, p, a, h1, h2, h3, h4, h5, h6, summary, small, strong, b, div:not(:has(*))))${dilTypographyExclusions}`;
+  const dilChoiceSelector = `${dilSurfaceSelector}:is([data-d-component="caption"], [data-d-component="badge"], [data-d-component="button"], [data-d-component="popover-trigger"], [data-d-component="pressable"], [data-d-component="slider"], [data-d-component="radio"], [data-d-component="radio-group"], [data-d-component="checkbox"], [data-d-component="select"], [data-d-component="option"], [role="radiogroup"], [role="radio"], [role="checkbox"], [role="tablist"], [role="tab"], [role="listbox"], [role="option"])`;
+  const dilAllControlTextSelector = `:is(${dilChoiceSelector}, ${dilChoiceSelector} :is(span, label, button, p, a, small, strong, b), ${dilSurfaceSelector} :is(label, button))${dilTypographyExclusions}`;
+  const dilAllTitleTextSelector = `:is(${dilSurfaceSelector}:is([data-d-component="title"]), ${dilSurfaceSelector}:is([data-d-component="title"]) :is(span, strong, b), ${dilSurfaceSelector} :is(h1, h2, h3, h4, h5, h6))${dilTypographyExclusions}`;
+  const citationHostSelector = [
+    '[data-citation]', '[data-citation-id]', '[data-citation-type]',
+    '[data-testid*="citation" i]', '[data-d-component="citation"]',
+    '[data-d-component="file-citation"]', '.citation-pill', '.file-citation',
+  ].join(',');
+  // Current Intelligent UI source pills have no citation attribute. Match the
+  // inline popover + pill + favicon structure, not arbitrary card popovers.
+  const webCitationHostSelector = [
+    '[data-d-component="popover-trigger"][data-d-inline-text]:has([data-d-component="badge"][data-pill] [data-d-component="favicon"])',
+    '.inline-citation', '[data-testid="web-citation"]',
+    '[data-citation-type="web"]', '[data-citation-type="url"]',
+  ].join(',');
+  const citationCandidateSelector = `${citationHostSelector}, ${webCitationHostSelector}, button, [role="button"], [role="link"], a, span[data-state], span[class*="cursor-pointer"]`;
+  const citationExcludedSelector = `${dom.user}, pre, code, svg, math, .katex, .MathJax, mjx-container, [role="dialog"], form, [contenteditable="true"]`;
   const dilProseColorSelector = `${dilTextSelector}:not(:where(button, button *, [role="button"], [role="button"] *, [data-d-component="badge"] *, [data-d-component="button"] *, [data-d-component="pressable"] *, [data-d-component="slider"] *))`;
   const boldTextSelector = `${chatContentSelector} :is(strong, b, [data-d-component="text"][data-d-default-strong], [data-d-component="text"][data-d-weight="bold"], [data-d-component="text"][data-d-weight="semibold"])${dilTextExclusions}`;
   const STYLE_ID = 'cgfc-ophel-optimized-style';
@@ -10588,6 +11720,13 @@
     codeFont: '"JetBrains Mono"',
     fontSize: 26,
     thinkingOverviewFontSize: 18,
+    citationFontSize: 18,
+    webCitationFontSize: 14,
+    intelligentFont: '"Times New Roman", "Noto Serif SC", "Source Han Serif SC", serif',
+    intelligentFontSize: 26,
+    intelligentTitleFontSize: 30,
+    intelligentControlFontSize: 26,
+    intelligentLineHeight: 1.6,
     formulaFontSize: 26,
     lineHeight: 1.9,
     codeFontSize: 18,
@@ -10627,6 +11766,24 @@
     queueAccentColor: '#6d5dfc',
     queueOpacity: 0.94,
     enableNeumorphicAppearance: true,
+    enableComposerLiquidGlass: true,
+    enableToolboxLiquidGlass: true,
+    enableSettingsLiquidGlass: true,
+    enableQueueLiquidGlass: true,
+    enableSendLiquidGlass: true,
+    enableScrollLiquidGlass: true,
+    enableTokenLiquidGlass: true,
+    enableToggleLiquidGlass: true,
+    glassRenderMode: 'balanced',
+    composerGlassStyle: 'clear',
+    composerGlassStrength: 36,
+    composerGlassBlur: 6,
+    composerGlassOpacity: 0.12,
+    composerGlassThickness: 14,
+    composerGlassGlare: 0.45,
+    composerGlassChroma: 0.04,
+    composerGlassCurvature: 0.5,
+    composerGlassBend: 0.5,
     showTokenStats: true,
     showTokenMessageChips: true,
     showTokenSummary: true,
@@ -10648,7 +11805,8 @@
   const OVERRIDEABLE_SETTING_KEYS = new Set([
     'latinFont', 'chineseFont', 'boldLatinFont', 'boldChineseFont',
     'mathFont', 'mathFontMode', 'codeFont',
-    'fontSize', 'thinkingOverviewFontSize', 'formulaFontSize', 'lineHeight', 'codeFontSize', 'codeLineHeight',
+    'fontSize', 'thinkingOverviewFontSize', 'citationFontSize', 'webCitationFontSize', 'formulaFontSize', 'lineHeight', 'codeFontSize', 'codeLineHeight',
+    'intelligentFont', 'intelligentFontSize', 'intelligentTitleFontSize', 'intelligentControlFontSize', 'intelligentLineHeight',
     'normalColor', 'boldColor', 'boldWeight',
     'fontSmoothingMode', 'textRenderingMode', 'formulaCopyBorderColor', 'messageCopyIconColor',
     'toolboxFont', 'toolboxFontSize', 'toolboxLineHeight', 'toolboxPanelWidth',
@@ -10659,6 +11817,7 @@
     'tokenSummaryTextColor', 'tokenSummaryBackgroundColor', 'tokenSummaryBorderColor',
   ]);
   const DEFAULT_DISABLED_OVERRIDE_KEYS = new Set([
+    'intelligentFont', 'intelligentFontSize', 'intelligentTitleFontSize', 'intelligentControlFontSize', 'intelligentLineHeight',
     'normalColor', 'boldColor', 'formulaFontSize', 'messageCopyIconColor',
     'toolboxTextColor', 'toolboxBackgroundColor', 'toolboxAccentColor', 'toolboxOpacity',
     'queueTextColor', 'queueBackgroundColor', 'queueAccentColor', 'queueOpacity',
@@ -10679,6 +11838,13 @@
     codeFont: 'text',
     fontSize: 'number',
     thinkingOverviewFontSize: 'number',
+    citationFontSize: 'number',
+    webCitationFontSize: 'number',
+    intelligentFont: 'text',
+    intelligentFontSize: 'number',
+    intelligentTitleFontSize: 'number',
+    intelligentControlFontSize: 'number',
+    intelligentLineHeight: 'number',
     formulaFontSize: 'number',
     lineHeight: 'number',
     codeFontSize: 'number',
@@ -10718,6 +11884,24 @@
     queueAccentColor: 'color',
     queueOpacity: 'number',
     enableNeumorphicAppearance: 'boolean',
+    enableComposerLiquidGlass: 'boolean',
+    enableToolboxLiquidGlass: 'boolean',
+    enableSettingsLiquidGlass: 'boolean',
+    enableQueueLiquidGlass: 'boolean',
+    enableSendLiquidGlass: 'boolean',
+    enableScrollLiquidGlass: 'boolean',
+    enableTokenLiquidGlass: 'boolean',
+    enableToggleLiquidGlass: 'boolean',
+    glassRenderMode: 'select',
+    composerGlassStyle: 'select',
+    composerGlassStrength: 'number',
+    composerGlassBlur: 'number',
+    composerGlassOpacity: 'number',
+    composerGlassThickness: 'number',
+    composerGlassGlare: 'number',
+    composerGlassChroma: 'number',
+    composerGlassCurvature: 'number',
+    composerGlassBend: 'number',
     showTokenStats: 'boolean',
     showTokenMessageChips: 'boolean',
     showTokenSummary: 'boolean',
@@ -10738,6 +11922,12 @@
   const numberLimits = {
     fontSize: [10, 40],
     thinkingOverviewFontSize: [10, 40],
+    citationFontSize: [10, 40],
+    webCitationFontSize: [10, 40],
+    intelligentFontSize: [10, 64],
+    intelligentTitleFontSize: [10, 72],
+    intelligentControlFontSize: [10, 64],
+    intelligentLineHeight: [1, 2.8],
     formulaFontSize: [10, 64],
     lineHeight: [1, 2.8],
     codeFontSize: [10, 32],
@@ -10753,11 +11943,21 @@
     queueLineHeight: [1, 2.2],
     queuePanelWidth: [280, 720],
     queueOpacity: [0.2, 1],
+    composerGlassStrength: [0, 60],
+    composerGlassBlur: [0, 20],
+    composerGlassOpacity: [0.05, 0.85],
+    composerGlassThickness: [4, 48],
+    composerGlassGlare: [0, 1.6],
+    composerGlassChroma: [0, 0.6],
+    composerGlassCurvature: [0, 1],
+    composerGlassBend: [0, 1],
     tokenSummaryOffsetX: [-600, 600],
     tokenSummaryOffsetY: [-600, 600],
   };
 
   const selectValues = {
+    composerGlassStyle: ['clear', 'soft'],
+    glassRenderMode: ['balanced', 'full', 'frosted'],
     mathFontMode: ['native', 'off'],
     fontSmoothingMode: ['auto', 'antialiased', 'subpixel-antialiased'],
     textRenderingMode: ['auto', 'optimizeLegibility', 'geometricPrecision'],
@@ -10773,7 +11973,7 @@
 
   const FONT_SETTING_KEYS = new Set([
     'latinFont', 'chineseFont', 'boldLatinFont', 'boldChineseFont', 'mathFont', 'codeFont',
-    'toolboxFont', 'queueFont',
+    'toolboxFont', 'queueFont', 'intelligentFont',
   ]);
   const LOCAL_FONT_RESCUE_GROUPS = [
     {
@@ -11048,7 +12248,7 @@
       return selectValues[key]?.includes(value) ? value : defaults[key];
     }
     if (type === 'color') return sanitizeColor(value, defaults[key]);
-    if (['latinFont', 'chineseFont', 'boldLatinFont', 'boldChineseFont', 'mathFont', 'codeFont', 'toolboxFont', 'queueFont'].includes(key)) {
+    if (FONT_SETTING_KEYS.has(key)) {
       return sanitizeFontStack(value, defaults[key]);
     }
     return String(value ?? defaults[key]);
@@ -11114,6 +12314,235 @@
     });
 
     return next;
+  }
+
+  // Only script-owned data is portable; never enumerate ChatGPT account storage.
+  const BACKUP_FORMAT = 'chatgpt-unified-toolbox-backup';
+  const BACKUP_LOCAL_KEYS = ['cgpt-answer-toc-position-v1', 'cgpt-answer-toc-size-v1',
+    'cgpt-answer-toc-view-v1', 'cgpt-answer-toc-collapsed'];
+  const BACKUP_LABEL_PREFIX = 'cgpt-unified-conversation-labels-v1:';
+  const BACKUP_MAX_BYTES = 128 * 1024 * 1024;
+  const backupRuntime = () => globalThis.__cgptUnifiedRuntimeV1;
+  const backupRecord = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+  function collectBackupStorage(store, keys) {
+    return Object.fromEntries(keys.map((key) => [key, store.getItem(key)]));
+  }
+
+  async function buildToolboxBackup() {
+    const rt = backupRuntime();
+    const savedSettings = { ...settings };
+    const savedPrompts = JSON.parse(JSON.stringify(rt.promptLibrary?.prompts || []));
+    const savedQueue = (rt.messageQueue?.items || []).map((item) => ({ ...item,
+      metadata: { ...item.metadata }, attachments: [...(item.attachments || [])] }));
+    // Flush values still waiting for a debounce, without changing queue state.
+    const labels = Array.from({ length: sessionStorage.length }, (_, i) => sessionStorage.key(i))
+      .filter((key) => key?.startsWith(BACKUP_LABEL_PREFIX));
+    const queue = [];
+    for (const item of savedQueue) {
+      const attachments = [];
+      for (const attachment of item.attachments || []) {
+        const data = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result).split(',')[1]);
+          reader.onerror = () => reject(new Error('无法读取队列附件：' + attachment.name));
+          reader.readAsDataURL(attachment.file);
+        });
+        attachments.push({ name: attachment.name, type: attachment.type,
+          lastModified: attachment.lastModified, data });
+      }
+      queue.push({ content: item.content, metadata: item.metadata, createdAt: item.createdAt, attachments });
+    }
+    return { format: BACKUP_FORMAT, schemaVersion: 1, scriptVersion: rt.version,
+      exportedAt: new Date().toISOString(), settings: savedSettings,
+      prompts: savedPrompts,
+      local: collectBackupStorage(localStorage, BACKUP_LOCAL_KEYS),
+      session: collectBackupStorage(sessionStorage, labels), queue };
+  }
+
+  function downloadToolboxBackup(backup, suffix = '') {
+    const json = JSON.stringify(backup, null, 2);
+    const blob = new Blob([json], { type: 'application/json;charset=utf-8' });
+    if (blob.size > BACKUP_MAX_BYTES) throw new Error('备份超过 128 MB，请减少队列附件后重试。');
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `chatgpt-toolbox-backup${suffix}-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  }
+
+  function validateToolboxBackup(value) {
+    if (!backupRecord(value) || value.format !== BACKUP_FORMAT || value.schemaVersion !== 1)
+      throw new Error('不是支持的工具箱备份文件（格式版本 1）。');
+    if (!backupRecord(value.settings) || !Array.isArray(value.prompts)
+      || !backupRecord(value.local) || !backupRecord(value.session) || !Array.isArray(value.queue))
+      throw new Error('备份数据不完整。');
+    if (!BACKUP_LOCAL_KEYS.every((key) => Object.hasOwn(value.local, key)))
+      throw new Error('备份缺少目录布局数据。');
+    const nextSettings = { ...defaults };
+    for (const key of Object.keys(defaults)) {
+      if (Object.hasOwn(value.settings, key)) nextSettings[key] = normalizeSetting(key, value.settings[key]);
+    }
+    for (const item of value.prompts) {
+      if (!backupRecord(item) || typeof item.content !== 'string' || !item.content.trim())
+        throw new Error('提示词数据无效。');
+    }
+    for (const [key, raw] of Object.entries(value.local)) {
+      if (!BACKUP_LOCAL_KEYS.includes(key) || (raw !== null && typeof raw !== 'string'))
+        throw new Error('包含不支持的本地存储项。');
+      if (raw === null) continue;
+      if (key.endsWith('collapsed') && !['0', '1'].includes(raw)) throw new Error('折叠状态无效。');
+      if (key.includes('-view-') && !['headings', 'conversation', 'prompts'].includes(raw))
+        throw new Error('目录视图无效。');
+      if (key.includes('-position-') || key.includes('-size-')) {
+        const geometry = JSON.parse(raw);
+        const fields = key.includes('-position-') ? ['left', 'top'] : ['width', 'height'];
+        if (!backupRecord(geometry) || !fields.every((field) => typeof geometry[field] === 'number'
+          && Number.isFinite(geometry[field]) && (field === 'left' || field === 'top' || geometry[field] > 0)))
+          throw new Error('目录位置或尺寸无效。');
+      }
+    }
+    for (const [key, raw] of Object.entries(value.session)) {
+      if (!key.startsWith(BACKUP_LABEL_PREFIX) || typeof raw !== 'string') throw new Error('目录缓存无效。');
+      const labels = JSON.parse(raw);
+      if (!Array.isArray(labels) || labels.length > 500 || !labels.every((entry) => Array.isArray(entry)
+        && Number.isInteger(entry[0]) && entry[0] >= 0 && typeof entry[1] === 'string'))
+        throw new Error('目录标签数据无效。');
+    }
+    const nextQueue = value.queue.map((item, index) => {
+      if (!backupRecord(item) || typeof item.content !== 'string' || !Array.isArray(item.attachments))
+        throw new Error('队列数据无效。');
+      const attachments = item.attachments.map((attachment) => {
+        if (!backupRecord(attachment) || typeof attachment.name !== 'string'
+          || typeof attachment.data !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(attachment.data))
+          throw new Error('队列附件数据无效。');
+        const bytes = Uint8Array.from(atob(attachment.data), (char) => char.charCodeAt(0));
+        const file = new File([bytes], attachment.name, { type: String(attachment.type || ''),
+          lastModified: Number(attachment.lastModified) || Date.now() });
+        return { file, name: file.name, type: file.type, size: file.size, lastModified: file.lastModified };
+      });
+      if (!item.content.trim() && !attachments.length) throw new Error('队列包含空消息。');
+      return { id: `import-${Date.now()}-${index}`, content: item.content, attachments,
+        metadata: backupRecord(item.metadata) ? { ...item.metadata } : {},
+        createdAt: Number(item.createdAt) || Date.now(), status: 'pending', error: '' };
+    });
+    return { settings: nextSettings, prompts: backupRuntime().promptLibrary.normalizeLibrary(value.prompts),
+      local: value.local, session: value.session, queue: nextQueue };
+  }
+
+  function commitToolboxBackup(next, panel) {
+    const rt = backupRuntime();
+    const queue = rt.messageQueue;
+    if (queue.isDispatching || queue.awaitingResponse || queue.items.some((item) => item.status === 'sending'))
+      throw new Error('队列正在发送或等待回复，请结束后再导入。');
+    const writes = [
+      { key: STORAGE_KEY, value: next.settings },
+      { key: 'cgpt-unified-prompt-library-v1', value: next.prompts },
+      { key: THEME_PALETTE_MIGRATION_KEY, value: true },
+    ];
+    const undo = [];
+    try {
+      for (const item of writes) {
+        const useGM = typeof GM_getValue === 'function' && typeof GM_setValue === 'function';
+        const previous = useGM ? GM_getValue(item.key, null) : localStorage.getItem(item.key);
+        undo.push(() => useGM ? GM_setValue(item.key, previous)
+          : previous === null ? localStorage.removeItem(item.key) : localStorage.setItem(item.key, previous));
+        if (useGM) GM_setValue(item.key, item.value);
+        else localStorage.setItem(item.key, JSON.stringify(item.value));
+      }
+      for (const [store, entries] of [[localStorage, next.local], [sessionStorage, next.session]]) {
+        for (const [key, raw] of Object.entries(entries)) {
+          const previous = store.getItem(key);
+          undo.push(() => previous === null ? store.removeItem(key) : store.setItem(key, previous));
+          if (raw === null) store.removeItem(key);
+          else store.setItem(key, raw);
+        }
+      }
+    } catch (error) {
+      for (const rollback of undo.reverse()) { try { rollback(); } catch {} }
+      throw new Error('存储写入失败，已尝试回滚：' + error.message);
+    }
+    clearTimeout(saveTimer);
+    clearTimeout(rt.promptLibrary.usagePersistTimer);
+    rt.promptLibrary.usagePersistTimer = 0;
+    settings = next.settings;
+    rt.promptLibrary.prompts = next.prompts;
+    rt.promptLibrary.onCountChange?.(next.prompts.length);
+    if (rt.promptLibrary.list) rt.promptLibrary.render();
+    queue.pause();
+    queue.items = next.queue;
+    queue.editingItemId = '';
+    queue.idleCount = 0;
+    queue.emit();
+    applySettings();
+    refreshFontSelects();
+    syncPanelInputs(panel);
+    const toc = rt.answerToc;
+    if (toc) {
+      toc.savedPosition = toc.readPositionState();
+      toc.savedSize = toc.readSizeState();
+      if (toc.savedPosition) toc.setManualPosition(toc.savedPosition.left, toc.savedPosition.top);
+      if (toc.savedSize) toc.setPanelSize(toc.savedSize.width, toc.savedSize.height);
+      toc.collapsed = toc.readCollapsedState();
+      toc.activeView = toc.readViewState();
+      toc.applyCollapsedState();
+      toc.applyActiveView();
+      toc.conversationLabelCache.clear();
+      toc.restoreConversationLabelSnapshot();
+    }
+  }
+
+  function createBackupControls(panel) {
+    const group = createSettingsGroup(panel, '全部设置 / 数据备份');
+    const hint = document.createElement('p');
+    hint.className = 'cgfc-hint';
+    hint.textContent = '备份所有功能与排版设置、提示词、目录布局/标签缓存、发送队列及附件。JSON 含提示词和附件原文，请妥善保存；聊天正文请使用会话导出。导入覆盖设置、提示词和队列，队列保持暂停；目录缓存按会话合并。';
+    const actions = document.createElement('div');
+    actions.className = 'cgfc-backup-actions';
+    const exportButton = document.createElement('button');
+    exportButton.type = 'button';
+    exportButton.textContent = '一键导出全部';
+    const importButton = document.createElement('button');
+    importButton.type = 'button';
+    importButton.textContent = '导入备份文件';
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json,application/json';
+    input.hidden = true;
+    const status = document.createElement('p');
+    status.className = 'cgfc-hint';
+    status.setAttribute('role', 'status');
+    const busy = (value) => { exportButton.disabled = value; importButton.disabled = value; };
+    exportButton.addEventListener('click', async () => {
+      busy(true);
+      status.textContent = '正在打包备份…';
+      try { downloadToolboxBackup(await buildToolboxBackup()); status.textContent = '全部备份已生成，请确认浏览器下载完成。'; }
+      catch (error) { status.textContent = '导出失败：' + error.message; }
+      finally { busy(false); }
+    });
+    importButton.addEventListener('click', () => input.click());
+    input.addEventListener('change', async () => {
+      const file = input.files?.[0];
+      input.value = '';
+      if (!file) return;
+      busy(true);
+      try {
+        if (file.size > BACKUP_MAX_BYTES) throw new Error('文件超过 128 MB。');
+        const next = validateToolboxBackup(JSON.parse(await file.text()));
+        if (!window.confirm(`导入将覆盖全部设置、提示词和当前发送队列。\n提示词：${next.prompts.length} 条；队列：${next.queue.length} 条。\n导入前会自动下载旧数据备份，恢复队列保持暂停。继续？`)) {
+          status.textContent = '已取消导入。'; return;
+        }
+        downloadToolboxBackup(await buildToolboxBackup(), '-before-import');
+        commitToolboxBackup(next, panel);
+        status.textContent = '导入成功，设置已生效；发送队列已暂停，请检查消息及所属会话后手动继续。';
+      } catch (error) { status.textContent = '导入失败：' + error.message; }
+      finally { busy(false); }
+    });
+    actions.append(exportButton, importButton);
+    group.append(hint, actions, input, status);
   }
 
   function persistSoon() {
@@ -11213,10 +12642,24 @@
     toggleOverrideAttr('data-cgfc-font-size', enabled('fontSize'));
     setOrRemove('--cgfc-thinking-overview-font-size', enabled('thinkingOverviewFontSize'), `${normalizeSetting('thinkingOverviewFontSize', settings.thinkingOverviewFontSize)}px`);
     toggleOverrideAttr('data-cgfc-thinking-overview-font-size', enabled('thinkingOverviewFontSize'));
+    setOrRemove('--cgfc-citation-font-size', enabled('citationFontSize'), `${normalizeSetting('citationFontSize', settings.citationFontSize)}px`);
+    toggleOverrideAttr('data-cgfc-citation-size', enabled('citationFontSize'));
+    setOrRemove('--cgfc-web-citation-font-size', enabled('webCitationFontSize'), `${normalizeSetting('webCitationFontSize', settings.webCitationFontSize)}px`);
+    toggleOverrideAttr('data-cgfc-web-citation-size', enabled('webCitationFontSize'));
     setOrRemove('--cgfc-formula-font-size', enabled('formulaFontSize'), `${normalizeSetting('formulaFontSize', settings.formulaFontSize)}px`);
     toggleOverrideAttr('data-cgfc-formula-font-size', enabled('formulaFontSize'));
     setOrRemove('--cgfc-line-height', enabled('lineHeight'), String(normalizeSetting('lineHeight', settings.lineHeight)));
     toggleOverrideAttr('data-cgfc-line-height', enabled('lineHeight'));
+    setOrRemove('--cgfc-intelligent-font', enabled('intelligentFont'), sanitizeFontStack(settings.intelligentFont, defaults.intelligentFont));
+    toggleOverrideAttr('data-cgfc-intelligent-font', enabled('intelligentFont'));
+    for (const [key, suffix] of [
+      ['intelligentFontSize', 'size'], ['intelligentTitleFontSize', 'title-size'],
+      ['intelligentControlFontSize', 'control-size'], ['intelligentLineHeight', 'line-height'],
+    ]) {
+      const value = normalizeSetting(key, settings[key]);
+      setOrRemove(`--cgfc-intelligent-${suffix}`, enabled(key), key === 'intelligentLineHeight' ? String(value) : `${value}px`);
+      toggleOverrideAttr(`data-cgfc-intelligent-${suffix}`, enabled(key));
+    }
     const adjustBodyColumn = enabled('bodyColumnLeftOffset') || enabled('bodyColumnRightOffset');
     setOrRemove('--cgfc-body-column-left-offset', enabled('bodyColumnLeftOffset'), `${normalizeSetting('bodyColumnLeftOffset', settings.bodyColumnLeftOffset)}px`);
     setOrRemove('--cgfc-body-column-right-offset', enabled('bodyColumnRightOffset'), `${normalizeSetting('bodyColumnRightOffset', settings.bodyColumnRightOffset)}px`);
@@ -11310,6 +12753,27 @@
     root.toggleAttribute('data-cgfc-katex-letter-font', settings.enableKatexLetterFont && enabled('mathFont'));
     root.toggleAttribute('data-cgfc-formula-copy', settings.enableFormulaCopy);
     root.toggleAttribute('data-cgfc-neumorphic-appearance', settings.enableNeumorphicAppearance);
+    root.toggleAttribute('data-cgfc-liquid-glass', settings.enableComposerLiquidGlass);
+    root.toggleAttribute('data-cgfc-toolbox-liquid-glass', settings.enableToolboxLiquidGlass);
+    root.toggleAttribute('data-cgfc-settings-liquid-glass', settings.enableSettingsLiquidGlass);
+    root.toggleAttribute('data-cgfc-queue-liquid-glass', settings.enableQueueLiquidGlass);
+    root.toggleAttribute('data-cgfc-send-liquid-glass', settings.enableSendLiquidGlass);
+    root.toggleAttribute('data-cgfc-scroll-liquid-glass', settings.enableScrollLiquidGlass);
+    root.toggleAttribute('data-cgfc-token-liquid-glass', settings.enableTokenLiquidGlass);
+    root.toggleAttribute('data-cgfc-toggle-liquid-glass', settings.enableToggleLiquidGlass);
+    const glassEnabled = settings.enableComposerLiquidGlass || settings.enableToolboxLiquidGlass || settings.enableSettingsLiquidGlass || settings.enableQueueLiquidGlass || settings.enableSendLiquidGlass || settings.enableScrollLiquidGlass || settings.enableTokenLiquidGlass || settings.enableToggleLiquidGlass;
+    if (glassEnabled) root.setAttribute('data-cgfc-glass-render-mode', normalizeSetting('glassRenderMode', settings.glassRenderMode));
+    else root.removeAttribute('data-cgfc-glass-render-mode');
+    if (glassEnabled) root.setAttribute('data-cgfc-glass-style', normalizeSetting('composerGlassStyle', settings.composerGlassStyle));
+    else root.removeAttribute('data-cgfc-glass-style');
+    setOrRemove('--cgfc-glass-strength', glassEnabled, String(normalizeSetting('composerGlassStrength', settings.composerGlassStrength)));
+    setOrRemove('--cgfc-glass-blur', glassEnabled, String(normalizeSetting('composerGlassBlur', settings.composerGlassBlur)));
+    setOrRemove('--cgfc-glass-opacity', glassEnabled, String(normalizeSetting('composerGlassOpacity', settings.composerGlassOpacity)));
+    setOrRemove('--cgfc-glass-thickness', glassEnabled, String(normalizeSetting('composerGlassThickness', settings.composerGlassThickness)));
+    setOrRemove('--cgfc-glass-glare', glassEnabled, String(normalizeSetting('composerGlassGlare', settings.composerGlassGlare)));
+    setOrRemove('--cgfc-glass-chroma', glassEnabled, String(normalizeSetting('composerGlassChroma', settings.composerGlassChroma)));
+    setOrRemove('--cgfc-glass-curvature', glassEnabled, String(normalizeSetting('composerGlassCurvature', settings.composerGlassCurvature)));
+    setOrRemove('--cgfc-glass-bend', glassEnabled, String(normalizeSetting('composerGlassBend', settings.composerGlassBend)));
     root.toggleAttribute('data-cgpt-token-stats-enabled', settings.showTokenStats);
     root.toggleAttribute('data-cgpt-token-message-chips-enabled', settings.showTokenMessageChips);
     root.toggleAttribute('data-cgpt-token-summary-enabled', settings.showTokenSummary);
@@ -11344,7 +12808,7 @@
     const HTMLElementCtor = win.HTMLElement || HTMLElement;
     const elementProto = ElementCtor.prototype;
     const SEND_GUARD_MS = 2800;
-    const POST_GENERATION_GUARD_MS = 900;
+    const POST_GENERATION_GUARD_MS = 3000;
     const NAVIGATION_END_GRACE_MS = 520;
     const SEND_BUTTON_SELECTOR = [
       '#composer-submit-button:not([data-testid="stop-button"])',
@@ -11365,11 +12829,19 @@
       sendGuardUntil: 0,
       postGenerationUntil: 0,
       lastUserScrollAt: 0,
+      scrollbarPointerId: null,
       windowY: 0,
       elements: new WeakMap(),
       settleTimer: 0,
       restoring: false,
       navigationActive: false,
+      route: win.location.pathname,
+      revision: 0,
+      conversationRoot: null,
+      conversationTop: 0,
+      readingAnchor: null,
+      generationCheckedAt: 0,
+      manualSnapshotFrame: 0,
     };
 
     function isUnifiedNavigationActive() {
@@ -11393,9 +12865,47 @@
     }
 
     function snapshotPositions() {
+      state.revision++;
       state.windowY = win.scrollY || document.documentElement.scrollTop || 0;
       collectScrollableElements().forEach((el) => {
         state.elements.set(el, el.scrollTop || 0);
+      });
+      if (state.conversationRoot) state.conversationTop = state.conversationRoot.scrollTop || 0;
+      const main = dom.main();
+      const viewportTop = state.conversationRoot?.getBoundingClientRect().top || 0;
+      const viewportBottom = state.conversationRoot
+        ? viewportTop + state.conversationRoot.clientHeight : win.innerHeight;
+      state.readingAnchor = null;
+      // Hit testing is bounded by viewport probes, independent of history size.
+      // Avoid reading thousands of offscreen paragraph rects on every wheel tick.
+      const top = Math.max(0, viewportTop);
+      const bottom = Math.min(win.innerHeight, viewportBottom);
+      const width = document.documentElement.clientWidth;
+      for (const ratio of [0.15, 0.35, 0.6, 0.85]) {
+        const y = top + Math.max(1, bottom - top) * ratio;
+        for (const xRatio of [0.5, 0.35, 0.65]) {
+          const hits = document.elementsFromPoint(width * xRatio, y);
+          for (const hit of hits) {
+            if (!main?.contains(hit)) continue;
+            const node = hit.closest('p, pre') || hit.closest(dom.message) || hit.closest(dom.turn);
+            if (!node || !main.contains(node)) continue;
+            const rect = node.getBoundingClientRect();
+            if (rect.height <= 0 || rect.bottom <= top || rect.top >= bottom) continue;
+            if (!state.readingAnchor || node.matches('p, pre')) state.readingAnchor = { node, y: rect.top };
+            if (node.matches('p, pre')) return;
+          }
+        }
+      }
+    }
+
+    function scheduleManualSnapshot() {
+      // Invalidate already queued restorations immediately, capture the actual
+      // gesture destination once per paint while the manual grace is active.
+      state.revision++;
+      if (state.manualSnapshotFrame) return;
+      state.manualSnapshotFrame = win.requestAnimationFrame(() => {
+        state.manualSnapshotFrame = 0;
+        snapshotPositions();
       });
     }
 
@@ -11426,7 +12936,7 @@
       // Capture BEFORE ChatGPT handles the submit. This closes the small gap where
       // the UI scrolls to the newly appended turn before the stop/generating button
       // appears and the old generation detector notices it.
-      snapshotPositions();
+      if (!isAutoScrollLockActive()) snapshotPositions();
       state.sendGuardUntil = Math.max(state.sendGuardUntil, Date.now() + SEND_GUARD_MS);
       state.postGenerationUntil = 0;
     }
@@ -11440,17 +12950,17 @@
     function markUserScroll(event) {
       if (event?.type === 'keydown') {
         const scrollKeys = new Set(['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' ']);
-        if (!scrollKeys.has(event.key) || (event.key === ' ' && isTypingTarget(event.target))) return;
+        if (!scrollKeys.has(event.key) || isTypingTarget(event.target)) return;
       }
 
       state.lastUserScrollAt = Date.now();
-      snapshotPositions();
+      scheduleManualSnapshot();
       win.clearTimeout(state.settleTimer);
       state.settleTimer = win.setTimeout(snapshotPositions, 360);
     }
 
     function isUserScrollWindowOpen() {
-      return Date.now() - state.lastUserScrollAt < USER_SCROLL_GRACE_MS;
+      return state.scrollbarPointerId !== null || Date.now() - state.lastUserScrollAt < USER_SCROLL_GRACE_MS;
     }
 
     function getTopArg(first, second, currentTop) {
@@ -11467,6 +12977,7 @@
     }
 
     function shouldProtectViewport() {
+      syncRouteState();
       return isLockEnabled()
         && isAutoScrollLockActive()
         && !isUserScrollWindowOpen()
@@ -11475,31 +12986,61 @@
 
     function shouldBlockWindowTop(nextTop) {
       if (!shouldProtectViewport()) return false;
-      return typeof nextTop === 'number' && nextTop > state.windowY + SCROLL_EPSILON_PX;
+      return typeof nextTop === 'number' && Math.abs(nextTop - state.windowY) > 1;
     }
 
     function shouldBlockElementTop(el, nextTop) {
       if (!shouldProtectViewport()) return false;
-      const lockedTop = state.elements.get(el);
-      const baseline = typeof lockedTop === 'number' ? lockedTop : el.scrollTop || 0;
-      return typeof nextTop === 'number' && nextTop > baseline + SCROLL_EPSILON_PX;
+      const baseline = getLockedElementTop(el);
+      return typeof baseline === 'number' && typeof nextTop === 'number' && Math.abs(nextTop - baseline) > 1;
+    }
+
+    function getLockedElementTop(el) {
+      const baseline = state.elements.get(el);
+      if (typeof baseline !== 'number') return undefined;
+      const anchor = state.readingAnchor;
+      if (el === state.conversationRoot && anchor?.node.isConnected && el.contains(anchor.node)) {
+        // Thinking panels can collapse above the viewport without a scroll API.
+        // Preserve the visible text's screen offset, rather than an obsolete top.
+        const top = el.scrollTop + anchor.node.getBoundingClientRect().top - anchor.y;
+        return globalThis.__cgptUnifiedRuntimeV1?.dom?.clampScrollTop?.(el, top) ?? Math.max(0, top);
+      }
+      return globalThis.__cgptUnifiedRuntimeV1?.dom?.clampScrollTop?.(el, baseline) ?? baseline;
     }
 
     function handleScroll(event) {
-      if (!shouldProtectViewport() || state.restoring) return;
+      if (state.restoring) return;
+      // Wheel/touch momentum and a held scrollbar can outlive the initial
+      // gesture snapshot. Adopt the actual manual destination during its grace.
+      if (isUserScrollWindowOpen() && (event.target === state.conversationRoot
+        || event.target === document || event.target === document.documentElement)) {
+        scheduleManualSnapshot();
+        return;
+      }
+      if (!shouldProtectViewport()) return;
 
       const target = event.target;
       const isWindowScroll = target === document || target === document.documentElement || target === document.body;
       const currentTop = isWindowScroll ? win.scrollY || document.documentElement.scrollTop || 0 : target?.scrollTop;
 
       if (typeof currentTop !== 'number') return;
-      const baseline = isWindowScroll ? state.windowY : state.elements.get(target);
-      if (typeof baseline !== 'number' || currentTop <= baseline + SCROLL_EPSILON_PX) return;
+      const baseline = isWindowScroll ? state.windowY : getLockedElementTop(target);
+      if (typeof baseline !== 'number' || Math.abs(currentTop - baseline) <= 1) return;
 
       state.restoring = true;
+      const revision = state.revision;
       win.requestAnimationFrame(() => {
-        if (isWindowScroll) win.scrollTo({ top: baseline, behavior: 'auto' });
-        else if (target instanceof HTMLElementCtor && target.isConnected) target.scrollTop = baseline;
+        // A user gesture, TOC jump or route change may occur before this frame.
+        // Never restore a snapshot belonging to the previous reading position.
+        syncRouteState();
+        if (revision === state.revision && shouldProtectViewport()) {
+          if (isWindowScroll) win.scrollTo({ top: baseline, behavior: 'instant' });
+          else if (target instanceof HTMLElementCtor && target.isConnected) {
+            state.elements.set(target, baseline);
+            if (target === state.conversationRoot) state.conversationTop = baseline;
+            target.scrollTop = baseline;
+          }
+        }
         win.requestAnimationFrame(() => {
           state.restoring = false;
         });
@@ -11516,14 +13057,54 @@
     function collectScrollableElements() {
       const root = document.body || document.documentElement;
       if (!root) return [];
-      const elements = [];
-      const candidates = root.querySelectorAll(
-        'main, [role="main"], [data-scroll-root], [class*="overflow-y-auto"], [class*="overflow-auto"]'
-      );
-      for (const el of candidates) {
-        if (isScrollableElement(el)) elements.push(el);
+      // Walk actual feed ancestors, including overflow containers which have no
+      // scrollbar yet. A new chat acquires overflow only after its first turn.
+      const main = dom.main();
+      const probe = main?.querySelector('[data-testid^="conversation-turn-"], [data-turn-key]') || main;
+      const elements = new Set();
+      let conversationRoot = null;
+      for (let el = probe; el instanceof HTMLElementCtor; el = el.parentElement) {
+        const style = win.getComputedStyle(el);
+        if (/(auto|scroll|overlay)/.test(`${style.overflowY} ${style.overflow}`)) {
+          elements.add(el);
+          if (!conversationRoot) conversationRoot = el;
+        }
       }
-      return elements;
+      if (conversationRoot !== state.conversationRoot) {
+        const previous = state.conversationRoot;
+        state.conversationRoot = conversationRoot;
+        if (conversationRoot) {
+          const top = previous && !previous.isConnected && shouldProtectViewport()
+            ? state.conversationTop : conversationRoot.scrollTop || 0;
+          state.elements.set(conversationRoot, top);
+          state.conversationTop = top;
+          if (Math.abs((conversationRoot.scrollTop || 0) - top) > 1) {
+            handleScroll({ target: conversationRoot });
+          }
+        }
+      }
+      return Array.from(elements);
+    }
+
+    function syncRouteState() {
+      const route = win.location.pathname;
+      if (route === state.route) return;
+      // First submit promotes / (or a GPT landing page) to /c/id. Retain its
+      // pre-submit baseline, but discard all baselines on other chat switches.
+      const promotedNewChat = !/\/c\//.test(state.route) && /\/c\//.test(route)
+        && isAutoScrollLockActive();
+      state.route = route;
+      state.revision++;
+      if (promotedNewChat) return;
+      state.generating = false;
+      state.sendGuardUntil = 0;
+      state.postGenerationUntil = 0;
+      state.elements = new WeakMap();
+      state.conversationRoot = null;
+      state.conversationTop = 0;
+      state.readingAnchor = null;
+      win.clearTimeout(state.settleTimer);
+      snapshotPositions();
     }
 
     function markScrollbarDrag(event) {
@@ -11533,7 +13114,17 @@
 
       const rect = target.getBoundingClientRect();
       const nearVerticalScrollbar = event.clientX >= rect.right - 22;
-      if (event.button === 1 || nearVerticalScrollbar) markUserScroll(event);
+      if (event.button === 1 || nearVerticalScrollbar) {
+        state.scrollbarPointerId = event.pointerId;
+        markUserScroll(event);
+      }
+    }
+
+    function releaseScrollbarDrag(event) {
+      if (state.scrollbarPointerId === null) return;
+      if (event.type !== 'blur' && event.pointerId !== state.scrollbarPointerId) return;
+      state.scrollbarPointerId = null;
+      markUserScroll(event);
     }
 
     function isVisible(el) {
@@ -11549,9 +13140,8 @@
       );
       if (directStop && isVisible(directStop)) return true;
 
-      const composer = document.querySelector('[data-chatgpt-composer], form, [data-testid*="composer"], [class*="composer"]');
-      if (!composer) return false;
-      const buttons = composer.querySelectorAll('button, [role="button"]');
+      const composer = document.querySelector(COMPOSER_EDITOR_SELECTOR)?.closest('form, [data-chatgpt-composer], [data-testid*="composer"], [class*="composer"]');
+      const buttons = composer?.querySelectorAll('button, [role="button"]') || [];
       for (const button of buttons) {
         if (!isVisible(button)) continue;
         const label = [
@@ -11566,7 +13156,9 @@
           return true;
         }
       }
-      return false;
+      // The queue's detector also recognises the latest response's thinking,
+      // tool/status and streaming markers when the composer stop button is absent.
+      return globalThis.__cgptUnifiedRuntimeV1?.readQueueResponseState?.({ busyOnly: true }).busy === true;
     }
 
     function syncNavigationState() {
@@ -11575,6 +13167,7 @@
       state.navigationActive = active;
 
       if (active) {
+        state.revision++;
         // Navigation has explicit priority. Do not fight a TOC jump with the
         // pre-send/generation baseline.
         return;
@@ -11588,6 +13181,8 @@
     }
 
     function refreshGenerationState() {
+      state.generationCheckedAt = Date.now();
+      syncRouteState();
       const nextGenerating = isGenerating();
       const wasGenerating = state.generating;
 
@@ -11673,10 +13268,10 @@
       installWrapper(elementProto, 'scrollIntoView', (original) => function (options) {
         if (!shouldProtectViewport()) return original.call(this, options);
 
-        const rect = this.getBoundingClientRect();
-        if (rect.top >= 0 && rect.bottom <= win.innerHeight) {
-          return original.call(this, options);
-        }
+        // Even a visible element can jump to the top with block: 'start'. Only
+        // intercept elements belonging to the conversation scroll chain.
+        const main = dom.main();
+        if (!main?.contains(this)) return original.call(this, options);
       });
     }
 
@@ -11701,6 +13296,10 @@
       if (isSendButton(event.target)) armSendGuard();
     }, true);
 
+    document.addEventListener('click', (event) => {
+      if (isSendButton(event.target)) armSendGuard();
+    }, true);
+
     document.addEventListener('keydown', (event) => {
       if (isSubmitKey(event)) armSendGuard();
     }, true);
@@ -11709,6 +13308,9 @@
       win.addEventListener(eventName, markUserScroll, { capture: true, passive: true });
     });
     win.addEventListener('pointerdown', markScrollbarDrag, { capture: true, passive: true });
+    for (const type of ['pointerup', 'pointercancel', 'blur']) {
+      win.addEventListener(type, releaseScrollbarDrag, { capture: true, passive: true });
+    }
     document.addEventListener('scroll', handleScroll, { capture: true, passive: true });
 
     wrapScrollApis();
@@ -11723,6 +13325,8 @@
       generationRefreshTimer = win.setTimeout(() => {
         syncNavigationState();
         refreshGenerationState();
+        collectScrollableElements();
+        if (state.conversationRoot) handleScroll({ target: state.conversationRoot });
       }, 36);
     };
     const observer = new MutationObserver(queueStateRefresh);
@@ -11740,15 +13344,86 @@
           'data-cgpt-unified-navigation-active',
         ],
       });
-      win.setInterval(refreshGenerationState, GENERATION_CHECK_MS);
+      win.setInterval(() => {
+        syncNavigationState();
+        syncRouteState();
+        if (Date.now() - state.generationCheckedAt >= GENERATION_CHECK_MS) refreshGenerationState();
+        collectScrollableElements();
+        if (state.conversationRoot) handleScroll({ target: state.conversationRoot });
+      }, 200);
       win.setInterval(wrapScrollApis, API_GUARD_MS);
     };
 
     onReady(start);
   }
 
+  function startCitationTypography() {
+    let scanTimer = 0;
+    const scan = () => {
+      // ChatGPT can keep several main surfaces mounted, with an empty/hidden
+      // surface first. Scan every surface and deduplicate nested main regions.
+      const mains = document.querySelectorAll('main, [role="main"]');
+      const candidates = new Set();
+      for (const main of mains) {
+        for (const element of main.querySelectorAll(`${citationCandidateSelector}, [data-cgfc-citation], [data-cgfc-web-citation]`)) {
+          candidates.add(element);
+        }
+      }
+      for (const element of candidates) {
+        const inResponse = Boolean(element.closest(`${dom.assistant}, ${dom.turn}`));
+        const excluded = Boolean(element.closest(citationExcludedSelector));
+        const text = (element.textContent || '').replace(/\s+/g, ' ').trim();
+        // Some file pills expose only a Radix trigger/clickable span. Restrict
+        // this fallback to short interactive filenames, never prose or code.
+        const fileTrigger = element.matches(citationCandidateSelector)
+          && !element.closest('[role="radiogroup"], [role="radio"], [role="checkbox"], [role="tablist"], [role="option"]')
+          && text.length > 0 && text.length <= 240
+          && /\.(?:pdf|md|markdown|txt|docx?|xlsx?|pptx?|csv|tsv|json|ya?ml|rtf|epub)(?:\s*[）)]?)$/i.test(text);
+        const webCitation = inResponse && !excluded && element.matches(webCitationHostSelector);
+        // Do not apply the file setting again to descendants of a web source.
+        const citation = inResponse && !excluded && !element.closest(webCitationHostSelector)
+          && (element.matches(citationHostSelector) || fileTrigger);
+        if (element.hasAttribute('data-cgfc-citation') !== citation) {
+          element.toggleAttribute('data-cgfc-citation', citation);
+        }
+        if (element.hasAttribute('data-cgfc-web-citation') !== webCitation) {
+          element.toggleAttribute('data-cgfc-web-citation', webCitation);
+        }
+      }
+    };
+    const queueScan = () => {
+      // Do not postpone forever while a response streams continuously.
+      if (scanTimer) return;
+      scanTimer = setTimeout(() => { scanTimer = 0; scan(); }, 120);
+    };
+    onReady(() => {
+      scan();
+      new MutationObserver((mutations) => {
+        if (mutations.some((mutation) => {
+          const node = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
+          return node?.closest('main, [role="main"]') || (mutation.type === 'childList'
+            && Array.from(mutation.addedNodes).some((added) => added instanceof Element
+              && (added.matches('main, [role="main"]') || added.querySelector('main, [role="main"]'))));
+        })) queueScan();
+      }).observe(document.documentElement, {
+        childList: true, characterData: true, subtree: true, attributes: true,
+        attributeFilter: ['data-testid', 'data-citation', 'data-citation-id', 'data-citation-type', 'data-d-component', 'data-d-inline-text', 'data-pill', 'data-state', 'role', 'class'],
+      });
+    });
+  }
+
   function updateSetting(key, value) {
     settings = { ...settings, [key]: normalizeSetting(key, value) };
+    if (key === 'citationFontSize' || key === 'webCitationFontSize') {
+      settings[overrideEnabledKey(key)] = true;
+      const control = document.querySelector(`.cgfc-control[data-override-key="${key}"]`);
+      if (control) syncOverrideVisual(control, key);
+    }
+    if (key.startsWith('intelligent') && OVERRIDEABLE_SETTING_KEYS.has(key)) {
+      settings[overrideEnabledKey(key)] = true;
+      const control = document.querySelector(`.cgfc-control[data-override-key="${key}"]`);
+      if (control) syncOverrideVisual(control, key);
+    }
     applySettings();
     persistSoon();
 
@@ -12329,7 +14004,8 @@
     button.setAttribute('aria-pressed', String(isEnabled));
     button.title = isEnabled ? '脚本正在覆盖此项，点击改为跟随系统' : '当前跟随 ChatGPT / 浏览器 / 设备，点击启用脚本覆盖';
     const label = control.querySelector('.cgfc-control-caption')?.textContent || key;
-    button.setAttribute('aria-label', `${label}：${isEnabled ? '脚本覆盖' : '跟随系统'}`);
+    if (key.startsWith('intelligent')) button.title = isEnabled ? '当前使用独立设置，点击恢复跟随正文' : '当前跟随正文设置，点击启用独立覆盖';
+    button.setAttribute('aria-label', `${label}：${isEnabled ? '脚本覆盖' : key.startsWith('intelligent') ? '跟随正文' : '跟随系统'}`);
   }
 
   function appendControl(parent, options) {
@@ -12556,6 +14232,25 @@
     appendControl(row, { label: '正文行高', key: 'lineHeight', type: 'number', min: 1, max: 2.8, step: 0.05 });
 
     appendControl(panel, { label: '模型的思考概览字号 px', key: 'thinkingOverviewFontSize', type: 'number', min: 10, max: 40, step: 1 });
+    appendControl(panel, { label: '文件引用标签字号 px', key: 'citationFontSize', type: 'number', min: 10, max: 40, step: 1 });
+    appendControl(panel, { label: '网络来源胶囊字号 px', key: 'webCitationFontSize', type: 'number', min: 10, max: 40, step: 1 });
+    const citationHint = document.createElement('p');
+    citationHint.className = 'cgfc-hint';
+    citationHint.textContent = '网络来源默认 14px，文件引用默认 18px；胶囊高度、内边距和图标随各自字号同步缩小，不随正文或互动卡片放大。关闭对应开关即可恢复原有大小。';
+    panel.appendChild(citationHint);
+
+    const intelligentGroup = createSettingsGroup(panel, 'Intelligent UI（互动卡片／选择题）');
+    appendControl(intelligentGroup, { label: '独立字体', key: 'intelligentFont', type: 'font-select' });
+    let intelligentRow = createRow(intelligentGroup);
+    appendControl(intelligentRow, { label: '卡片正文字号 px', key: 'intelligentFontSize', type: 'number', min: 10, max: 64, step: 1 });
+    appendControl(intelligentRow, { label: '标题字号 px', key: 'intelligentTitleFontSize', type: 'number', min: 10, max: 72, step: 1 });
+    intelligentRow = createRow(intelligentGroup);
+    appendControl(intelligentRow, { label: '选项／按钮字号 px', key: 'intelligentControlFontSize', type: 'number', min: 10, max: 64, step: 1 });
+    appendControl(intelligentRow, { label: '卡片行高', key: 'intelligentLineHeight', type: 'number', min: 1, max: 2.8, step: 0.05 });
+    const intelligentHint = document.createElement('p');
+    intelligentHint.className = 'cgfc-hint';
+    intelligentHint.textContent = '默认跟随正文设置。修改某项会自动开启该项独立覆盖；关闭右侧开关后恢复跟随。选项、按钮和标题可分别调节大小。';
+    intelligentGroup.appendChild(intelligentHint);
 
     row = createRow(panel);
     appendControl(row, { label: '正文左边界偏移 px', key: 'bodyColumnLeftOffset', type: 'number', min: -400, max: 400, step: 10 });
@@ -12615,6 +14310,53 @@
     toolboxHint.textContent = '每个外观项均可独立启停；颜色项关闭后继续跟随 ChatGPT 明暗主题。贴片可缩到 160px；修改宽度设置时会更新当前手动尺寸。';
     toolboxGroup.appendChild(toolboxHint);
 
+    const glassGroup = createSettingsGroup(panel, '液态玻璃（独立开关）');
+    appendControl(glassGroup, { label: '启用输入框液态玻璃', key: 'enableComposerLiquidGlass', type: 'checkbox' });
+    appendControl(glassGroup, { label: '导航／提示词浮窗液态玻璃', key: 'enableToolboxLiquidGlass', type: 'checkbox' });
+    appendControl(glassGroup, { label: 'Aa 设置面板液态玻璃', key: 'enableSettingsLiquidGlass', type: 'checkbox' });
+    appendControl(glassGroup, { label: '发送队列液态玻璃', key: 'enableQueueLiquidGlass', type: 'checkbox' });
+    appendControl(glassGroup, { label: '发送按钮液态玻璃', key: 'enableSendLiquidGlass', type: 'checkbox' });
+    appendControl(glassGroup, { label: '跳转箭头液态玻璃', key: 'enableScrollLiquidGlass', type: 'checkbox' });
+    appendControl(glassGroup, { label: 'Token 统计贴片液态玻璃', key: 'enableTokenLiquidGlass', type: 'checkbox' });
+    appendControl(glassGroup, { label: 'Aa 启动按钮液态玻璃', key: 'enableToggleLiquidGlass', type: 'checkbox' });
+    appendControl(glassGroup, { label: '玻璃渲染', key: 'glassRenderMode', type: 'select', choices: [
+      { value: 'balanced', label: '日常节能 · 单路折射' },
+      { value: 'full', label: '完整效果 · RGB 色散' },
+      { value: 'frosted', label: '最低负载 · 仅磨砂' },
+    ] });
+    appendControl(glassGroup, { label: '玻璃质感', key: 'composerGlassStyle', type: 'select', choices: [
+      { value: 'clear', label: '清透 · 中性无白底' },
+      { value: 'soft', label: '柔和 · 中性磨砂' },
+    ] });
+    row = createRow(glassGroup);
+    appendControl(row, { label: '折射强度', key: 'composerGlassStrength', type: 'number', min: 0, max: 60, step: 1 });
+    appendControl(row, { label: '内部模糊 px', key: 'composerGlassBlur', type: 'number', min: 0, max: 20, step: 0.2 });
+    row = createRow(glassGroup);
+    appendControl(row, { label: '边缘厚度 px', key: 'composerGlassThickness', type: 'number', min: 4, max: 48, step: 1 });
+    appendControl(row, { label: '高光亮度', key: 'composerGlassGlare', type: 'number', min: 0, max: 1.6, step: 0.05 });
+    row = createRow(glassGroup);
+    appendControl(row, { label: '玻璃底色浓度', key: 'composerGlassOpacity', type: 'number', min: 0.05, max: 0.85, step: 0.05 });
+    appendControl(row, { label: '色散强度', key: 'composerGlassChroma', type: 'number', min: 0, max: 0.6, step: 0.02 });
+    row = createRow(glassGroup);
+    appendControl(row, { label: '曲面强度', key: 'composerGlassCurvature', type: 'number', min: 0, max: 1, step: 0.02 });
+    appendControl(row, { label: '边缘包裹', key: 'composerGlassBend', type: 'number', min: 0, max: 1, step: 0.02 });
+    const glassHint = document.createElement('p');
+    glassHint.className = 'cgfc-hint';
+    glassHint.textContent = '各开关独立。日常节能保留边缘折射并减少滤镜通道；仅磨砂关闭折射，负载更低。页面切到后台、表面不可见时暂停；箭头卡片透明，无白底或描边。色散参数仅在完整效果中使用。浮窗至少保留 8px 模糊以维持文字可读。关闭相应开关即恢复原外观。';
+    glassGroup.appendChild(glassHint);
+    const glassPresetButton = document.createElement('button');
+    glassPresetButton.type = 'button';
+    glassPresetButton.textContent = '应用推荐玻璃参数';
+    glassPresetButton.className = 'cgfc-glass-preset';
+    glassPresetButton.addEventListener('click', () => {
+      const keys = ['enableComposerLiquidGlass', 'glassRenderMode', 'composerGlassStyle', 'composerGlassStrength', 'composerGlassBlur', 'composerGlassOpacity', 'composerGlassThickness', 'composerGlassGlare', 'composerGlassChroma', 'composerGlassCurvature', 'composerGlassBend'];
+      settings = { ...settings, ...Object.fromEntries(keys.map(key => [key, defaults[key]])) };
+      writeStore(STORAGE_KEY, settings);
+      applySettings();
+      syncPanelInputs(panel);
+    });
+    glassGroup.appendChild(glassPresetButton);
+
     const queueGroup = createSettingsGroup(panel, '输入框旁发送队列外观');
     appendControl(queueGroup, { label: '启用精细深色拟态 Soft UI（输入框 + 队列）', key: 'enableNeumorphicAppearance', type: 'checkbox' });
     appendControl(queueGroup, { label: '队列字体', key: 'queueFont', type: 'font-select' });
@@ -12668,6 +14410,8 @@
     appendControl(panel, { label: '防止自动滚动', key: 'stopAutoScrollWhileGenerating', type: 'checkbox' });
     appendControl(panel, { label: '代码自动换行', key: 'wrapCode', type: 'checkbox' });
 
+    createBackupControls(panel);
+
     const actions = document.createElement('div');
     actions.className = 'cgfc-actions';
 
@@ -12680,6 +14424,14 @@
       next.toolboxUseCustomColors = false;
       next.queueUseCustomColors = false;
       next.enableNeumorphicAppearance = false;
+      next.enableComposerLiquidGlass = false;
+      next.enableToolboxLiquidGlass = false;
+      next.enableSettingsLiquidGlass = false;
+      next.enableQueueLiquidGlass = false;
+      next.enableSendLiquidGlass = false;
+      next.enableScrollLiquidGlass = false;
+      next.enableTokenLiquidGlass = false;
+      next.enableToggleLiquidGlass = false;
       settings = next;
       writeStore(STORAGE_KEY, settings);
       applySettings();
@@ -12723,6 +14475,7 @@
     });
 
     document.body.append(toggle, panel);
+    window.__cgptUnifiedRuntimeV1?.surfaceLiquidGlass?.schedule();
   }
 
   function ensureShell() {
@@ -13533,7 +15286,7 @@
     }
 
     /* v1.6.2 refined dark Soft UI: restrained depth, one consistent light source. */
-    html[data-cgfc-theme="dark"][data-cgfc-neumorphic-appearance] [data-cgfc-neumorphic-composer="true"] {
+    html[data-cgfc-theme="dark"][data-cgfc-neumorphic-appearance] [data-cgfc-neumorphic-composer="true"]:not([data-cgfc-liquid-composer]) {
       background: color-mix(in srgb, var(--cgfc-theme-surface-primary, #212121) 98%, white 2%) !important;
       border-color: rgba(255, 255, 255, .018) !important;
       box-shadow:
@@ -13544,7 +15297,7 @@
       transition: box-shadow 180ms ease, background 180ms ease, border-color 180ms ease;
     }
 
-    html[data-cgfc-theme="dark"][data-cgfc-neumorphic-appearance] [data-cgfc-neumorphic-composer="true"]:has(#prompt-textarea:focus, textarea[name="prompt-textarea"]:focus, [contenteditable="true"]:focus) {
+    html[data-cgfc-theme="dark"][data-cgfc-neumorphic-appearance] [data-cgfc-neumorphic-composer="true"]:not([data-cgfc-liquid-composer]):has(#prompt-textarea:focus, textarea[name="prompt-textarea"]:focus, [contenteditable="true"]:focus) {
       background: color-mix(in srgb, var(--cgfc-theme-surface-primary, #212121) 99%, white 1%) !important;
       border-color: rgba(255, 255, 255, .028) !important;
       box-shadow:
@@ -14068,7 +15821,19 @@
       border-bottom: 1px solid var(--cgfc-theme-border, rgba(0, 0, 0, .12));
     }
 
-    #${PANEL_ID} .cgfc-actions {
+    #${PANEL_ID} .cgfc-backup-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 12px 0;
+    }
+
+    #${PANEL_ID} .cgfc-backup-actions + input + .cgfc-hint {
+      margin: 0 0 4px;
+      overflow-wrap: anywhere;
+    }
+
+    #${PANEL_ID} > .cgfc-actions {
       position: sticky;
       bottom: -14px;
       display: flex;
@@ -14175,6 +15940,73 @@
       color: var(--cgfc-theme-text-secondary, #555);
     }
 
+    /* Cover nested option labels as well as cards outside Markdown. Independent
+       overrides are opt-in; absent variables fall back to the body settings. */
+    html:is([data-cgfc-body-font], [data-cgfc-intelligent-font]) ${dilAllTextSelector} {
+      font-family: var(--cgfc-intelligent-font, var(--cgfc-latin-font, system-ui)), var(--cgfc-chinese-font, serif) !important;
+    }
+    html:is([data-cgfc-font-size], [data-cgfc-intelligent-size]) ${dilAllTextSelector} {
+      font-size: var(--cgfc-intelligent-size, var(--cgfc-font-size)) !important;
+    }
+    html:is([data-cgfc-font-size], [data-cgfc-intelligent-size], [data-cgfc-intelligent-control-size]) ${dilAllControlTextSelector} {
+      font-size: var(--cgfc-intelligent-control-size, var(--cgfc-intelligent-size, var(--cgfc-font-size))) !important;
+    }
+    html:is([data-cgfc-font-size], [data-cgfc-intelligent-size], [data-cgfc-intelligent-title-size]) ${dilAllTitleTextSelector} {
+      font-size: var(--cgfc-intelligent-title-size, calc(var(--cgfc-intelligent-size, var(--cgfc-font-size)) * 1.125)) !important;
+    }
+    html:is([data-cgfc-font-size], [data-cgfc-intelligent-size]):not([data-cgfc-intelligent-title-size]) :is(${dilSurfaceSelector}:is([data-d-component="title"][data-d-size="xl"]), ${dilSurfaceSelector}:is([data-d-component="title"][data-d-size="xl"]) :is(span, strong, b))${dilTypographyExclusions} {
+      font-size: calc(var(--cgfc-intelligent-size, var(--cgfc-font-size)) * 1.25) !important;
+    }
+    html:is([data-cgfc-font-size], [data-cgfc-intelligent-size]):not([data-cgfc-intelligent-title-size]) :is(${dilSurfaceSelector}:is([data-d-component="title"]):is([data-d-size="sm"], [data-d-size="md"]), ${dilSurfaceSelector}:is([data-d-component="title"]):is([data-d-size="sm"], [data-d-size="md"]) :is(span, strong, b))${dilTypographyExclusions} {
+      font-size: var(--cgfc-intelligent-size, var(--cgfc-font-size)) !important;
+    }
+    html:is([data-cgfc-line-height], [data-cgfc-intelligent-line-height]) ${dilAllTextSelector} {
+      line-height: var(--cgfc-intelligent-line-height, var(--cgfc-line-height)) !important;
+    }
+    html:is([data-cgfc-font-size], [data-cgfc-intelligent-size], [data-cgfc-intelligent-control-size]) ${dilChoiceSelector}:is(button, [role="button"], [role="tab"], [data-d-component="button"], [data-d-component="pressable"], [data-d-component="badge"]):not([role="radio"], [role="checkbox"]) {
+      height: auto !important;
+      min-height: 1.7em !important;
+      white-space: normal !important;
+    }
+
+    /* Layered important declarations outrank this module's unlayered card
+       typography, so citation size remains independent even in large buttons. */
+    @layer cgfc-citation-typography {
+      html[data-cgfc-citation-size] :is(main, [role="main"]) [data-cgfc-citation] {
+        --cgfc-pill-size: var(--cgfc-citation-font-size);
+      }
+      html[data-cgfc-web-citation-size] :is(main, [role="main"]) [data-cgfc-web-citation] {
+        --cgfc-pill-size: var(--cgfc-web-citation-font-size);
+      }
+      :is(html[data-cgfc-citation-size] [data-cgfc-citation], html[data-cgfc-web-citation-size] [data-cgfc-web-citation]),
+      :is(html[data-cgfc-citation-size] [data-cgfc-citation], html[data-cgfc-web-citation-size] [data-cgfc-web-citation]) :is(span, div, small, strong, b, label, a, button):not(:where(svg *, math *, .katex, .katex *, .MathJax, .MathJax *, mjx-container, mjx-container *, pre, pre *, code, code *)) {
+        font-size: var(--cgfc-pill-size) !important;
+        line-height: 1.2 !important;
+      }
+      :is(html[data-cgfc-citation-size] [data-cgfc-citation], html[data-cgfc-web-citation-size] [data-cgfc-web-citation]),
+      :is(html[data-cgfc-citation-size] [data-cgfc-citation], html[data-cgfc-web-citation-size] [data-cgfc-web-citation]) :is([data-d-component="box"], [data-d-component="row"], [data-d-component="badge"]) {
+        height: auto !important;
+        min-height: 0 !important;
+        gap: 0.2em !important;
+      }
+      :is(html[data-cgfc-citation-size] [data-cgfc-citation], html[data-cgfc-web-citation-size] [data-cgfc-web-citation]) :is([data-d-component="badge"][data-pill], .citation-pill, .file-citation),
+      html[data-cgfc-citation-size] [data-cgfc-citation]:not(:has([data-d-component="badge"][data-pill])),
+      html[data-cgfc-web-citation-size] [data-cgfc-web-citation]:not(:has([data-d-component="badge"][data-pill])) {
+        padding-block: 0.15em !important;
+        padding-inline: 0.4em !important;
+        border-radius: 999px !important;
+        vertical-align: baseline !important;
+      }
+      :is(html[data-cgfc-citation-size] [data-cgfc-citation], html[data-cgfc-web-citation-size] [data-cgfc-web-citation]) :is([data-d-component="favicon"], img, svg) {
+        width: calc(var(--cgfc-pill-size) * 0.85) !important;
+        height: calc(var(--cgfc-pill-size) * 0.85) !important;
+        min-width: 0 !important;
+        min-height: 0 !important;
+        flex-shrink: 0 !important;
+        object-fit: contain !important;
+      }
+    }
+
     @media (max-width: 520px) {
       #${TOGGLE_ID} {
         right: auto;
@@ -14200,6 +16032,7 @@
   startThemeSync();
   installAutoScrollLock();
   applySettings();
+  startCitationTypography();
   startResidualLatexObserver();
   startFormulaCopy();
   onReady(() => {
@@ -14217,3 +16050,12 @@
     }
   });
 })();
+
+    bootstrapState = 'bundles-evaluated';
+    stampBootstrap();
+  } catch (error) {
+    bootstrapState = 'synchronous-error';
+    stampBootstrap();
+    throw error;
+  }
+})(); // unifiedSurfaceScope
