@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 长对话统一工具箱（性能·导航·提示词·导出·排版）
 // @namespace    local.codex.chatgpt.unified
-// @version      1.6.59
-// @description  ChatGPT 长对话工具箱；v1.6.59 统一问答/章节与提示词滚动条，保留节能折射、独立玻璃开关、无边框烟色材质与原有功能。
+// @version      1.6.65
+// @description  ChatGPT 长对话工具箱；v1.6.65 为每项设置提供独立恢复默认按钮，回答玻璃仅作用于模型回答，保持画面与运动质量的计算优化；保留海洋和原有功能。
 // @author       Codex；含 Alex S Hamilton 的 ChatGPT Lazy Chat++（GPL-3.0-or-later）
 // @homepageURL  https://github.com/zjc1772665101-source/chatgpt-unified-long-chat-toolkit
 // @supportURL   https://github.com/zjc1772665101-source/chatgpt-unified-long-chat-toolkit/issues
@@ -51,7 +51,7 @@
   const stampBootstrap = () => {
     const root = document.documentElement;
     if (!root) return;
-    root.setAttribute('data-cgpt-unified-version', '1.6.59');
+    root.setAttribute('data-cgpt-unified-version', '1.6.65');
     root.setAttribute('data-cgpt-unified-surface', isFrame ? (allowedSurface ? 'side-chat' : 'other-frame') : 'tab');
     root.setAttribute('data-cgpt-unified-bootstrap', bootstrapState);
   };
@@ -69,7 +69,7 @@
   const PROMPT_STORAGE_KEY = 'cgpt-unified-prompt-library-v1';
   const runtime = globalThis[RUNTIME_KEY] || (globalThis[RUNTIME_KEY] = {});
 
-  runtime.version = '1.6.51';
+  runtime.version = '1.6.65';
   // Prefer semantic attributes over generated CSS class names. New ChatGPT
   // renders a user/assistant pair under data-turn-key without legacy role nodes.
   const dom = runtime.dom = Object.freeze({
@@ -3990,23 +3990,19 @@
 
     resolveComposerShell(composer) {
       if (!(composer instanceof Element)) return null;
+      // The native surface owns attachments and the expanded editor as well.
+      // A short draft may occupy only a few lines inside a viewport-sized card;
+      // never reject this explicit owner based on the draft's text height.
+      const explicitSurface = composer.closest('[data-composer-surface="true"], [data-composer-surface-variant]');
+      if (explicitSurface instanceof Element) {
+        const rect = explicitSurface.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) return explicitSurface;
+      }
+
       const sendButton = this.runtime.promptLibrary?.findSendButton?.(composer) || null;
       const composerRect = composer.getBoundingClientRect();
       const maxShellHeight = Math.max(180, composerRect.height * 4.5);
       const maxTopDrift = Math.max(120, composerRect.height * 3);
-      const isReasonableShell = (element) => {
-        if (!(element instanceof Element)) return false;
-        const rect = element.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) return false;
-        const topDrift = Math.max(0, composerRect.top - rect.top);
-        return rect.height <= maxShellHeight && topDrift <= maxTopDrift;
-      };
-
-      // ChatGPT 当前页面会给真正的输入区外壳标记 data-composer-surface。
-      // 空输入框时没有 send button，优先认这个显式锚点，避免退到偏窄的编辑器内层。
-      const explicitSurface = composer.closest('[data-composer-surface="true"], [data-composer-surface-variant]');
-      if (isReasonableShell(explicitSurface)) return explicitSurface;
-
       const candidates = [];
       let node = composer.parentElement;
 
@@ -4333,6 +4329,7 @@
       this.id = `cgpt-composer-glass-${Math.random().toString(36).slice(2, 10)}`;
       this.candidate = null; this.shell = null; this.raf = 0; this.lightRaf = 0;
       this.signature = ''; this.revision = 0; this.pointer = null;
+      this.mapGeometry = ''; this.pendingGeometry = ''; this.readyGeometry = ''; this.resizeTimer = 0;
       this.onSettings = () => { glassOpticsFrameValue = null; this.attach(this.candidate || (!this.options.kind ? this.runtime?.composerQueueDock?.neumorphicShell : null)); };
       this.onPointer = event => {
         if (this.reducedMotion?.matches || !this.shell) return;
@@ -4376,6 +4373,14 @@
           }
           if (typeof ResizeObserver === 'function') {
             this.resizeObserver = new ResizeObserver(() => this.schedule()); this.resizeObserver.observe(next);
+          }
+          if (!this.options.direct) {
+            this.surfaceObserver = new MutationObserver(() => {
+              if (this.shell !== next || !next.isConnected) return;
+              if (['effect', 'tint', 'sheen'].some(key => this[key]?.parentElement !== next)) this.attach(next);
+              else this.schedule();
+            });
+            this.surfaceObserver.observe(next, { childList: true, attributes: true, attributeFilter: ['data-composer-layout', 'data-composer-radius-variant', 'data-composer-surface-variant'] });
           }
           if (typeof IntersectionObserver === 'function') {
             this.intersectionObserver = new IntersectionObserver(entries => {
@@ -4431,6 +4436,7 @@
 
     pause() {
       if (this.raf) cancelAnimationFrame(this.raf); this.raf = 0;
+      this.clearResizeBuild();
       if (!this.shell || this.suspended) return;
       this.suspended = true;
       this.shell.setAttribute(this.modeAttribute, 'paused');
@@ -4438,25 +4444,53 @@
     }
 
     fallback() {
+      this.clearResizeBuild(); this.mapGeometry = '';
       this.shell?.setAttribute(this.modeAttribute, 'blur');
       this.shell?.style.removeProperty('--cgfc-glass-filter');
       this.svg?.remove(); this.svg = null; this.filter = null; this.displacements = null;
       this.signature = ''; this.opticsSignature = '';
     }
 
+    clearResizeBuild() {
+      if (this.resizeTimer) clearTimeout(this.resizeTimer);
+      this.resizeTimer = 0; this.pendingGeometry = ''; this.readyGeometry = '';
+    }
+
+    deferResizeBuild(geometry) {
+      if (!this.filter || !this.mapGeometry || geometry === this.mapGeometry || geometry === this.readyGeometry) {
+        this.clearResizeBuild(); return false;
+      }
+      // Keep the blur/tint layers covering the whole native card while its
+      // dimensions animate. Build one exact map after the layout settles,
+      // rather than doing pixel generation + PNG encoding on every frame.
+      if (this.pendingGeometry !== geometry) {
+        if (this.resizeTimer) clearTimeout(this.resizeTimer);
+        this.pendingGeometry = geometry;
+        this.resizeTimer = setTimeout(() => {
+          this.resizeTimer = 0; this.readyGeometry = this.pendingGeometry; this.pendingGeometry = '';
+          this.schedule();
+        }, 140);
+      }
+      this.shell.setAttribute(this.modeAttribute, 'blur');
+      this.shell.style.removeProperty('--cgfc-glass-filter');
+      return true;
+    }
+
     readOptics(frameTime) {
-      if (Number.isFinite(frameTime) && glassOpticsFrameTime === frameTime && glassOpticsFrameValue) return { ...glassOpticsFrameValue };
+      if (this.options.kind !== 'message' && Number.isFinite(frameTime) && glassOpticsFrameTime === frameTime && glassOpticsFrameValue) return { ...glassOpticsFrameValue };
       const style = getComputedStyle(document.documentElement);
+      const message = this.options.kind === 'message';
+      const prefix = message ? '--cgfc-message-glass-' : '--cgfc-glass-';
       const number = (key, fallback, min, max) => {
-        const value = parseFloat(style.getPropertyValue(`--cgfc-glass-${key}`));
+        const value = parseFloat(style.getPropertyValue(prefix + key));
         return Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : fallback;
       };
       const optics = { strength: number('strength', 36, 0, 60), blur: number('blur', 6, 0, 20),
         thickness: number('thickness', 14, 4, 48), glare: number('glare', .45, 0, 1.6),
         curvature: number('curvature', .5, 0, 1), bend: number('bend', .5, 0, 1), chroma: number('chroma', .04, 0, .6),
-        soft: document.documentElement.getAttribute('data-cgfc-glass-style') !== 'clear',
-        renderMode: document.documentElement.getAttribute('data-cgfc-glass-render-mode') || 'balanced' };
-      if (Number.isFinite(frameTime)) { glassOpticsFrameTime = frameTime; glassOpticsFrameValue = optics; }
+        soft: document.documentElement.getAttribute(message ? 'data-cgfc-message-glass-style' : 'data-cgfc-glass-style') !== 'clear',
+        renderMode: document.documentElement.getAttribute(message ? 'data-cgfc-message-glass-render-mode' : 'data-cgfc-glass-render-mode') || 'balanced' };
+      if (!message && Number.isFinite(frameTime)) { glassOpticsFrameTime = frameTime; glassOpticsFrameValue = optics; }
       return { ...optics };
     }
 
@@ -4464,12 +4498,31 @@
       const shell = this.shell;
       if (!shell?.isConnected) { this.attach(null); return; }
       if (document.hidden || this.offscreen) { this.pause(); return; }
+      // Native composer re-layout can remove unmanaged children or SVG defs
+      // without changing its final size. A geometry cache alone misses this.
+      if (!this.options.direct && ['effect', 'tint', 'sheen'].some(key => this[key]?.parentElement !== shell)) { this.attach(shell); return; }
+      if (this.filter && (!this.svg?.isConnected || !this.filter.isConnected)) this.fallback();
       const rect = shell.getBoundingClientRect(); if (rect.width < 2 || rect.height < 2) { this.pause(); return; }
-      const resume = this.suspended; this.suspended = false;
+      const nativeBody = !this.options.direct ? shell.querySelector('[data-composer-body]') : null;
+      const nativeLayout = shell.getAttribute('data-composer-layout') || '';
+      const nativeLayoutChanged = this.nativeBody !== nativeBody || this.nativeLayout !== nativeLayout;
+      this.nativeBody = nativeBody; this.nativeLayout = nativeLayout;
+      const resume = this.suspended || nativeLayoutChanged; this.suspended = false;
       const optics = this.readOptics(frameTime), width = Math.round(rect.width), height = Math.round(rect.height);
-      if (this.options.direct && !['send', 'scroll', 'stats', 'toggle'].includes(this.options.kind)) optics.blur = Math.max(8, optics.blur);
-      const radiusText = getComputedStyle(shell).borderTopLeftRadius, rawRadius = parseFloat(radiusText) || 26;
-      const radius = Math.min(width / 2, height / 2, radiusText.includes('%') ? Math.min(width, height) * rawRadius / 100 : rawRadius);
+      if (this.options.direct && !['send', 'scroll', 'stats', 'toggle', 'message'].includes(this.options.kind)) optics.blur = Math.max(8, optics.blur);
+      let radiusText = getComputedStyle(shell).borderTopLeftRadius, radiusRect = rect;
+      if (!this.options.direct && !(parseFloat(radiusText) > 0)) {
+        const nativeBody = shell.querySelector('[data-composer-body]');
+        if (nativeBody) { radiusText = getComputedStyle(nativeBody).borderTopLeftRadius; radiusRect = nativeBody.getBoundingClientRect(); }
+      }
+      const radii = radiusText.trim().split(/\s+/);
+      const resolveRadius = (text, length) => text?.includes('%') ? parseFloat(text) * length / 100 : parseFloat(text) || 0;
+      const parsedRadius = Math.min(resolveRadius(radii[0], radiusRect.width), resolveRadius(radii[1] || radii[0], radiusRect.height));
+      const rawRadius = this.options.kind === 'message' ? parsedRadius : parsedRadius || 26;
+      const radius = Math.min(width / 2, height / 2, rawRadius);
+      if (!this.options.direct) for (const key of ['effect', 'tint', 'sheen']) {
+        if (this[key]?.style.getPropertyValue('border-radius') !== radius + 'px') this[key]?.style.setProperty('border-radius', radius + 'px', 'important');
+      }
       this.blurPx = optics.soft ? Math.max(optics.blur, 6) : optics.blur;
       shell.style.setProperty('--cgfc-glass-blur-px', `${this.blurPx}px`);
       shell.style.setProperty('--cgfc-glass-sheen-opacity', '0');
@@ -4480,10 +4533,14 @@
       // Constant-width optical bezel; never turn a long textbox into a fisheye.
       const bezel = Math.min(optics.thickness, height * .24, width * .2);
       const chromatic = optics.renderMode === 'full' && optics.chroma > 0;
+      const geometry = [width, height, radius].join(':');
       const signature = [width, height, radius, bezel, optics.curvature, optics.bend, optics.renderMode, chromatic].join(':');
-      if (signature !== this.signature) { this.buildMap(width, height, radius, bezel, optics); this.signature = signature; }
+      if (this.deferResizeBuild(geometry)) return;
+      if (signature !== this.signature) {
+        this.buildMap(width, height, radius, bezel, optics); this.signature = signature; this.mapGeometry = geometry;
+      }
       this.applyOptics(optics);
-      if (resume && this.filter) this.rekey();
+      if ((resume || !shell.style.getPropertyValue('--cgfc-glass-filter')) && this.filter) this.rekey();
       shell.setAttribute(this.modeAttribute, 'refraction');
       this.lastError = '';
     }
@@ -4495,8 +4552,15 @@
       const canvas = document.createElement('canvas'); canvas.width = Math.max(2, Math.round(width * resolution)); canvas.height = Math.max(2, Math.round(height * resolution));
       const ctx = canvas.getContext('2d'); if (!ctx) throw new Error('Canvas 2D unavailable');
       const img = ctx.createImageData(canvas.width, canvas.height);
+      const neutral = new Uint32Array(new Uint8Array([128, 128, 128, 255]).buffer)[0];
+      new Uint32Array(img.data.buffer).fill(neutral);
+      const halfWidth = width / 2, halfHeight = height / 2, innerRadius = Math.max(radius, bezel);
       for (let y = 0; y < canvas.height; y += 1) for (let x = 0; x < canvas.width; x += 1) {
         const px = (x + .5) / canvas.width * width - width / 2, py = (y + .5) / canvas.height * height - height / 2;
+        // Flat interior pixels have exactly the neutral vector. Skip their
+        // distance/normal calculations without changing any optical pixels.
+        if ((Math.abs(px) <= halfWidth - innerRadius && Math.abs(py) <= halfHeight - bezel)
+          || (Math.abs(py) <= halfHeight - innerRadius && Math.abs(px) <= halfWidth - bezel)) continue;
         const qx = Math.abs(px) - width / 2 + radius, qy = Math.abs(py) - height / 2 + radius;
         const ax = Math.max(qx, 0), ay = Math.max(qy, 0), length = Math.hypot(ax, ay);
         const depth = -(length + Math.min(Math.max(qx, qy), 0) - radius);
@@ -4533,6 +4597,13 @@
       const tree = this.shell.getRootNode();
       svg.appendChild(filter); (tree instanceof ShadowRoot ? tree : document.body || document.documentElement).appendChild(svg);
       const previous = this.svg; this.svg = svg; this.filter = filter;
+      if (!this.options.direct) {
+        this.defsObserver?.disconnect();
+        this.defsObserver = new MutationObserver(() => {
+          if (this.svg && !this.svg.isConnected && this.shell?.isConnected && !this.suspended) { this.fallback(); this.schedule(); }
+        });
+        this.defsObserver.observe(svg.parentNode, { childList: true });
+      }
       this.maxBend = profile.peak * bezel; this.opticsSignature = ''; this.mapUrl = url;
       this.shell.setAttribute(this.modeAttribute, 'refraction'); previous?.remove();
       this.lastBuildMs = Math.round((performance.now() - started) * 10) / 10;
@@ -4552,14 +4623,17 @@
     }
 
     rekey() {
-      if (!this.filter || !this.shell) return;
+      if (!this.filter || !this.shell || this.suspended || this.pendingGeometry) return;
       this.filter.id = `${this.id}-${++this.revision}`;
       this.shell.style.setProperty('--cgfc-glass-filter', `url("#${this.filter.id}")`);
     }
 
     releaseSurface() {
       if (this.raf) cancelAnimationFrame(this.raf); this.raf = 0; this.onLeave();
+      this.clearResizeBuild(); this.mapGeometry = '';
       this.resizeObserver?.disconnect(); this.resizeObserver = null;
+      this.surfaceObserver?.disconnect(); this.surfaceObserver = null;
+      this.defsObserver?.disconnect(); this.defsObserver = null;
       this.intersectionObserver?.disconnect(); this.intersectionObserver = null;
       this.offscreen = false; this.suspended = false;
       this.shell?.removeEventListener('pointermove', this.onPointer); this.shell?.removeEventListener('pointerleave', this.onLeave);
@@ -11766,6 +11840,37 @@
     queueAccentColor: '#6d5dfc',
     queueOpacity: 0.94,
     enableNeumorphicAppearance: true,
+    enableAsciiOcean: true,
+    asciiOceanOpacity: 0.65,
+    asciiOceanFps: 12,
+    asciiOceanSpecies: 'classic',
+    asciiOceanCoverage: 'gutter',
+    asciiOceanHomeCoverage: 'full',
+    asciiOceanPointer: false,
+    asciiOceanDensity: 90,
+    asciiOceanQuality: 'balanced',
+    asciiOceanColorMode: 'auto',
+    asciiOceanColorSeed: 0,
+    asciiOceanBodyColor: '#7ed8f0',
+    asciiOceanAccentColor: '#c79aff',
+    asciiOceanFishColor: '#b8e7f7',
+    asciiOceanWakeColor: '#55d8ea',
+    asciiOceanPauseWhileGenerating: true,
+    messageGlassStyle: 'soft',
+    messageGlassRenderMode: 'balanced',
+    messageGlassOpacity: 0.18,
+    messageGlassBlur: 6,
+    messageGlassStrength: 28,
+    messageGlassThickness: 14,
+    messageGlassCurvature: 0.5,
+    messageGlassBend: 0.5,
+    messageGlassChroma: 0.04,
+    messageGlassGlare: 0.45,
+    messageGlassRadius: 18,
+    messageGlassSaturation: 1.12,
+    messageGlassBrightness: 1,
+    messageGlassTintMode: 'auto',
+    messageGlassTint: '#15191f',
     enableComposerLiquidGlass: true,
     enableToolboxLiquidGlass: true,
     enableSettingsLiquidGlass: true,
@@ -11828,6 +11933,174 @@
     defaults[overrideEnabledKey(key)] = !DEFAULT_DISABLED_OVERRIDE_KEYS.has(key);
   }
 
+  // Public defaults: validated preference fields only. No prompts, queue, session or local records.
+  Object.assign(defaults, {
+    "latinFont": "Lora",
+    "chineseFont": "FZNewShuSong-Z10S",
+    "boldLatinFont": "Lora",
+    "boldChineseFont": "\"Noto Serif SC\", \"Source Han Serif SC\", \"Songti SC\", serif",
+    "mathFont": "Latin Modern Math",
+    "mathFontMode": "native",
+    "codeFont": "\"JetBrains Mono\"",
+    "fontSize": 25,
+    "thinkingOverviewFontSize": 18,
+    "citationFontSize": 13,
+    "webCitationFontSize": 14,
+    "intelligentFont": "\"Times New Roman\", \"Noto Serif SC\", \"Source Han Serif SC\", serif",
+    "intelligentFontSize": 24,
+    "intelligentTitleFontSize": 26,
+    "intelligentControlFontSize": 26,
+    "intelligentLineHeight": 1.6,
+    "formulaFontSize": 25,
+    "lineHeight": 1.9,
+    "codeFontSize": 18,
+    "codeLineHeight": 1.8,
+    "normalColor": "#ffffff",
+    "boldColor": "#e8e2d8",
+    "boldWeight": 750,
+    "stopAutoScrollWhileGenerating": true,
+    "wrapCode": true,
+    "enableFontSmoothing": true,
+    "fontSmoothingMode": "antialiased",
+    "textRenderingMode": "optimizeLegibility",
+    "enableResidualLatex": true,
+    "enableKatexLetterFont": true,
+    "enableFormulaCopy": true,
+    "formulaCopyDelimiters": true,
+    "formulaCopyBorderColor": "#ffffff",
+    "messageCopyIconColor": "#6d5dfc",
+    "toolboxFont": "FZNewShuSong-Z10S",
+    "toolboxFontSize": 13,
+    "toolboxLineHeight": 1.4,
+    "toolboxPanelWidth": 300,
+    "bodyColumnLeftOffset": 0,
+    "bodyColumnRightOffset": 0,
+    "toolboxUseCustomColors": false,
+    "toolboxTextColor": "#f4f4f4",
+    "toolboxBackgroundColor": "#212121",
+    "toolboxAccentColor": "#828282",
+    "toolboxOpacity": 0.82,
+    "queueFont": "FZNewShuSong-Z10S",
+    "queueFontSize": 12,
+    "queueLineHeight": 1.4,
+    "queuePanelWidth": 420,
+    "queueUseCustomColors": false,
+    "queueTextColor": "#afafaf",
+    "queueBackgroundColor": "#000000",
+    "queueAccentColor": "#609e56",
+    "queueOpacity": 0.94,
+    "enableNeumorphicAppearance": false,
+    "enableAsciiOcean": true,
+    "asciiOceanOpacity": 0.65,
+    "asciiOceanFps": 12,
+    "asciiOceanSpecies": "classic",
+    "asciiOceanCoverage": "glass",
+    "asciiOceanHomeCoverage": "full",
+    "asciiOceanPointer": false,
+    "asciiOceanDensity": 90,
+    "asciiOceanQuality": "eco",
+    "asciiOceanColorMode": "original",
+    "asciiOceanColorSeed": 560765584,
+    "asciiOceanBodyColor": "#7ed8f0",
+    "asciiOceanAccentColor": "#c79aff",
+    "asciiOceanFishColor": "#b8e7f7",
+    "asciiOceanWakeColor": "#55d8ea",
+    "asciiOceanPauseWhileGenerating": false,
+    "messageGlassStyle": "clear",
+    "messageGlassRenderMode": "balanced",
+    "messageGlassOpacity": 0.18,
+    "messageGlassBlur": 6,
+    "messageGlassStrength": 28,
+    "messageGlassThickness": 14,
+    "messageGlassCurvature": 0.5,
+    "messageGlassBend": 0.5,
+    "messageGlassChroma": 0.04,
+    "messageGlassGlare": 0.45,
+    "messageGlassRadius": 18,
+    "messageGlassSaturation": 1.12,
+    "messageGlassBrightness": 1,
+    "messageGlassTintMode": "auto",
+    "messageGlassTint": "#15191f",
+    "enableComposerLiquidGlass": true,
+    "enableToolboxLiquidGlass": true,
+    "enableSettingsLiquidGlass": true,
+    "enableQueueLiquidGlass": true,
+    "enableSendLiquidGlass": false,
+    "enableScrollLiquidGlass": true,
+    "enableTokenLiquidGlass": true,
+    "enableToggleLiquidGlass": true,
+    "glassRenderMode": "balanced",
+    "composerGlassStyle": "clear",
+    "composerGlassStrength": 36,
+    "composerGlassBlur": 1,
+    "composerGlassOpacity": 0.12,
+    "composerGlassThickness": 14,
+    "composerGlassGlare": 0.45,
+    "composerGlassChroma": 0.04,
+    "composerGlassCurvature": 0.5,
+    "composerGlassBend": 0.5,
+    "showTokenStats": false,
+    "showTokenMessageChips": true,
+    "showTokenSummary": true,
+    "tokenSummaryPosition": "auto",
+    "tokenSummaryOffsetX": 600,
+    "tokenSummaryOffsetY": 34,
+    "tokenSummaryCompactAlways": true,
+    "tokenSummaryCompactOnNarrow": true,
+    "tokenSummaryAvoidQueue": false,
+    "tokenSummaryTextColor": "#5c5c5c",
+    "tokenSummaryBackgroundColor": "#000000",
+    "tokenSummaryBorderColor": "#000000",
+    "latinFontEnabled": true,
+    "chineseFontEnabled": true,
+    "boldLatinFontEnabled": true,
+    "boldChineseFontEnabled": true,
+    "mathFontEnabled": false,
+    "mathFontModeEnabled": true,
+    "codeFontEnabled": true,
+    "fontSizeEnabled": true,
+    "thinkingOverviewFontSizeEnabled": true,
+    "citationFontSizeEnabled": true,
+    "webCitationFontSizeEnabled": true,
+    "formulaFontSizeEnabled": true,
+    "lineHeightEnabled": true,
+    "codeFontSizeEnabled": true,
+    "codeLineHeightEnabled": true,
+    "intelligentFontEnabled": false,
+    "intelligentFontSizeEnabled": true,
+    "intelligentTitleFontSizeEnabled": true,
+    "intelligentControlFontSizeEnabled": false,
+    "intelligentLineHeightEnabled": false,
+    "normalColorEnabled": true,
+    "boldColorEnabled": true,
+    "boldWeightEnabled": true,
+    "fontSmoothingModeEnabled": true,
+    "textRenderingModeEnabled": true,
+    "formulaCopyBorderColorEnabled": true,
+    "messageCopyIconColorEnabled": false,
+    "toolboxFontEnabled": true,
+    "toolboxFontSizeEnabled": true,
+    "toolboxLineHeightEnabled": true,
+    "toolboxPanelWidthEnabled": true,
+    "bodyColumnLeftOffsetEnabled": false,
+    "bodyColumnRightOffsetEnabled": false,
+    "toolboxTextColorEnabled": false,
+    "toolboxBackgroundColorEnabled": false,
+    "toolboxAccentColorEnabled": false,
+    "toolboxOpacityEnabled": false,
+    "queueFontEnabled": true,
+    "queueFontSizeEnabled": true,
+    "queueLineHeightEnabled": true,
+    "queuePanelWidthEnabled": true,
+    "queueTextColorEnabled": true,
+    "queueBackgroundColorEnabled": true,
+    "queueAccentColorEnabled": true,
+    "queueOpacityEnabled": true,
+    "tokenSummaryTextColorEnabled": true,
+    "tokenSummaryBackgroundColorEnabled": true,
+    "tokenSummaryBorderColorEnabled": true
+});
+
   const settingTypes = {
     latinFont: 'text',
     chineseFont: 'text',
@@ -11884,6 +12157,37 @@
     queueAccentColor: 'color',
     queueOpacity: 'number',
     enableNeumorphicAppearance: 'boolean',
+    enableAsciiOcean: 'boolean',
+    asciiOceanOpacity: 'number',
+    asciiOceanFps: 'number',
+    asciiOceanSpecies: 'select',
+    asciiOceanCoverage: 'select',
+    asciiOceanHomeCoverage: 'select',
+    asciiOceanPointer: 'boolean',
+    asciiOceanDensity: 'number',
+    asciiOceanQuality: 'select',
+    asciiOceanColorMode: 'select',
+    asciiOceanColorSeed: 'number',
+    asciiOceanBodyColor: 'color',
+    asciiOceanAccentColor: 'color',
+    asciiOceanFishColor: 'color',
+    asciiOceanWakeColor: 'color',
+    asciiOceanPauseWhileGenerating: 'boolean',
+    messageGlassStyle: 'select',
+    messageGlassRenderMode: 'select',
+    messageGlassOpacity: 'number',
+    messageGlassBlur: 'number',
+    messageGlassStrength: 'number',
+    messageGlassThickness: 'number',
+    messageGlassCurvature: 'number',
+    messageGlassBend: 'number',
+    messageGlassChroma: 'number',
+    messageGlassGlare: 'number',
+    messageGlassRadius: 'number',
+    messageGlassSaturation: 'number',
+    messageGlassBrightness: 'number',
+    messageGlassTintMode: 'select',
+    messageGlassTint: 'color',
     enableComposerLiquidGlass: 'boolean',
     enableToolboxLiquidGlass: 'boolean',
     enableSettingsLiquidGlass: 'boolean',
@@ -11920,6 +12224,21 @@
   }
 
   const numberLimits = {
+    asciiOceanOpacity: [0.15, 0.9],
+    asciiOceanFps: [3, 30],
+    asciiOceanDensity: [40, 160],
+    messageGlassOpacity: [0, 0.9],
+    messageGlassBlur: [0, 20],
+    messageGlassStrength: [0, 60],
+    messageGlassThickness: [4, 48],
+    messageGlassCurvature: [0, 1],
+    messageGlassBend: [0, 1],
+    messageGlassChroma: [0, 0.6],
+    messageGlassGlare: [0, 1.6],
+    messageGlassRadius: [0, 48],
+    messageGlassSaturation: [0.5, 2],
+    messageGlassBrightness: [0.5, 1.5],
+    asciiOceanColorSeed: [0, 2147483647],
     fontSize: [10, 40],
     thinkingOverviewFontSize: [10, 40],
     citationFontSize: [10, 40],
@@ -11956,6 +12275,14 @@
   };
 
   const selectValues = {
+    asciiOceanCoverage: ['gutter', 'full', 'glass'],
+    messageGlassStyle: ['soft', 'clear'],
+    messageGlassRenderMode: ['balanced', 'full', 'frosted'],
+    messageGlassTintMode: ['auto', 'custom'],
+    asciiOceanHomeCoverage: ['full', 'off'],
+    asciiOceanQuality: ['eco', 'balanced', 'fine'],
+    asciiOceanColorMode: ['auto', 'original', 'cyan', 'aurora', 'warm', 'random', 'custom'],
+    asciiOceanSpecies: ['classic', 'mixed', 'hammerhead', 'tiger', 'zebra', 'greathammer', 'mako', 'thresher', 'nurse'],
     composerGlassStyle: ['clear', 'soft'],
     glassRenderMode: ['balanced', 'full', 'frosted'],
     mathFontMode: ['native', 'off'],
@@ -12753,6 +13080,26 @@
     root.toggleAttribute('data-cgfc-katex-letter-font', settings.enableKatexLetterFont && enabled('mathFont'));
     root.toggleAttribute('data-cgfc-formula-copy', settings.enableFormulaCopy);
     root.toggleAttribute('data-cgfc-neumorphic-appearance', settings.enableNeumorphicAppearance);
+    root.toggleAttribute('data-cgfc-ascii-ocean', settings.enableAsciiOcean);
+    root.toggleAttribute('data-cgfc-ascii-pause-busy', settings.asciiOceanPauseWhileGenerating);
+    root.setAttribute('data-cgfc-ascii-opacity', String(normalizeSetting('asciiOceanOpacity', settings.asciiOceanOpacity)));
+    root.setAttribute('data-cgfc-ascii-fps', String(normalizeSetting('asciiOceanFps', settings.asciiOceanFps)));
+    root.setAttribute('data-cgfc-ascii-species', normalizeSetting('asciiOceanSpecies', settings.asciiOceanSpecies));
+    root.setAttribute('data-cgfc-ascii-coverage', normalizeSetting('asciiOceanCoverage', settings.asciiOceanCoverage));
+    root.setAttribute('data-cgfc-ascii-home-coverage', normalizeSetting('asciiOceanHomeCoverage', settings.asciiOceanHomeCoverage));
+    root.toggleAttribute('data-cgfc-ascii-pointer', settings.asciiOceanPointer);
+    root.setAttribute('data-cgfc-ascii-density', String(normalizeSetting('asciiOceanDensity', settings.asciiOceanDensity)));
+    root.setAttribute('data-cgfc-ascii-quality', normalizeSetting('asciiOceanQuality', settings.asciiOceanQuality));
+    root.setAttribute('data-cgfc-ascii-color-mode', normalizeSetting('asciiOceanColorMode', settings.asciiOceanColorMode));
+    root.setAttribute('data-cgfc-ascii-color-seed', String(normalizeSetting('asciiOceanColorSeed', settings.asciiOceanColorSeed)));
+    for (const [key, attribute] of [['asciiOceanBodyColor', 'body'], ['asciiOceanAccentColor', 'accent'], ['asciiOceanFishColor', 'fish'], ['asciiOceanWakeColor', 'wake']]) root.setAttribute('data-cgfc-ascii-' + attribute + '-color', normalizeSetting(key, settings[key]));
+    root.toggleAttribute('data-cgfc-message-glass', settings.enableAsciiOcean && settings.asciiOceanCoverage === 'glass');
+    root.setAttribute('data-cgfc-message-glass-style', settings.messageGlassStyle);
+    root.setAttribute('data-cgfc-message-glass-render-mode', settings.messageGlassRenderMode);
+    root.toggleAttribute('data-cgfc-message-glass-custom-tint', settings.messageGlassTintMode === 'custom');
+    const messageTint = normalizeSetting('messageGlassTint', settings.messageGlassTint);
+    root.style.setProperty('--cgfc-message-glass-custom-rgb', [1,3,5].map(i => parseInt(messageTint.slice(i,i+2),16)).join(','));
+    for (const [key, css] of [['Opacity','opacity'],['Blur','blur'],['Strength','strength'],['Thickness','thickness'],['Curvature','curvature'],['Bend','bend'],['Chroma','chroma'],['Glare','glare'],['Radius','radius'],['Saturation','saturation'],['Brightness','brightness']]) root.style.setProperty('--cgfc-message-glass-' + css, String(normalizeSetting('messageGlass' + key, settings['messageGlass' + key])) + (key === 'Radius' ? 'px' : ''));
     root.toggleAttribute('data-cgfc-liquid-glass', settings.enableComposerLiquidGlass);
     root.toggleAttribute('data-cgfc-toolbox-liquid-glass', settings.enableToolboxLiquidGlass);
     root.toggleAttribute('data-cgfc-settings-liquid-glass', settings.enableSettingsLiquidGlass);
@@ -14008,6 +14355,26 @@
     button.setAttribute('aria-label', `${label}：${isEnabled ? '脚本覆盖' : key.startsWith('intelligent') ? '跟随正文' : '跟随系统'}`);
   }
 
+  function restoreSettingDefault(key) {
+    if (!Object.prototype.hasOwnProperty.call(defaults, key)) return;
+    settings = { ...settings, [key]: normalizeSetting(key, defaults[key]) };
+    if (OVERRIDEABLE_SETTING_KEYS.has(key)) settings[overrideEnabledKey(key)] = defaults[overrideEnabledKey(key)];
+    if (key === 'asciiOceanColorMode') settings.asciiOceanColorSeed = defaults.asciiOceanColorSeed;
+    applySettings(); persistSoon(); refreshFontSelects();
+    const panel = document.getElementById(PANEL_ID); if (panel) syncPanelInputs(panel);
+    if (key === 'stopAutoScrollWhileGenerating') refreshAutoScrollLockState();
+    if (key === 'enableResidualLatex' && settings.enableResidualLatex) { installKatexCss(); scanAssistantRoots(); }
+  }
+
+  function createSettingReset(options) {
+    const button = document.createElement('button'); button.type = 'button';
+    button.className = 'cgfc-setting-reset'; button.dataset.resetKey = options.key;
+    button.textContent = '恢复默认'; button.title = options.key === 'asciiOceanColorMode' ? '恢复默认配色方案及随机种子，不改变其他设置' : '恢复此项默认值及其覆盖开关，不改变其他设置';
+    button.setAttribute('aria-label', options.label + '：恢复默认');
+    button.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); restoreSettingDefault(options.key); });
+    return button;
+  }
+
   function appendControl(parent, options) {
     if (options.type === 'checkbox') {
       const label = document.createElement('label');
@@ -14020,7 +14387,8 @@
       input.checked = Boolean(settings[options.key]);
       input.addEventListener('change', () => updateSetting(options.key, input.checked));
       label.append(input, caption);
-      parent.appendChild(label);
+      const row = document.createElement('div'); row.className = 'cgfc-check-row';
+      row.append(label, createSettingReset(options)); parent.appendChild(row);
       return input;
     }
 
@@ -14078,6 +14446,7 @@
       input.addEventListener('input', () => updateSetting(options.key, input.value));
     }
 
+    head.appendChild(createSettingReset(options));
     control.append(head, input);
     parent.appendChild(control);
     if (OVERRIDEABLE_SETTING_KEYS.has(options.key)) syncOverrideVisual(control, options.key);
@@ -14144,6 +14513,64 @@
     title.textContent = 'ChatGPT 字体与颜色设置';
     panel.setAttribute('aria-labelledby', title.id);
     panel.appendChild(title);
+    const resetStyle = document.createElement('style');
+    resetStyle.textContent = '.cgfc-setting-reset{flex-shrink:0;font:inherit;font-size:12px;line-height:1.4;padding:4px 7px;border:1px solid #7775;border-radius:6px;color:inherit;background:transparent;cursor:pointer;white-space:nowrap}.cgfc-setting-reset:hover{background:#8882}.cgfc-setting-reset:focus-visible{outline:2px solid currentColor;outline-offset:2px}.cgfc-check-row{display:flex;align-items:center;gap:8px;min-width:0}.cgfc-check-row>.cgfc-check{flex:1;min-width:0}.cgfc-control-head>.cgfc-control-caption{flex:1;min-width:0}';
+    panel.appendChild(resetStyle);
+    const oceanGroup = createSettingsGroup(panel, 'ASCII 鲨鱼海洋（独立装饰）');
+    appendControl(oceanGroup, { label: '启用 ASCII 鲨鱼海洋', key: 'enableAsciiOcean', type: 'checkbox' });
+    appendControl(oceanGroup, { label: '生成回答时暂停动画', key: 'asciiOceanPauseWhileGenerating', type: 'checkbox' });
+    appendControl(oceanGroup, { label: '鼠标扰动（关闭更省资源）', key: 'asciiOceanPointer', type: 'checkbox' });
+    appendControl(oceanGroup, { label: '主页动画（还未发送消息）', key: 'asciiOceanHomeCoverage', type: 'select', choices: [
+      { value: 'full', label: '全页背景 · 文字与输入框在上方' }, { value: 'off', label: '主页不显示动画' },
+    ] });
+    appendControl(oceanGroup, { label: '对话页动画（已发送消息）', key: 'asciiOceanCoverage', type: 'select', choices: [
+      { value: 'gutter', label: '两侧空白 · 从顶部开始避开正文' },
+      { value: 'full', label: '全页背景 · 文字与贴片在上方' },
+      { value: 'glass', label: '回答玻璃 · 仅模型回答，文字在玻璃上方' },
+    ] });
+    appendControl(oceanGroup, { label: '鲨鱼种类', key: 'asciiOceanSpecies', type: 'select', choices: [
+      { value: 'classic', label: '经典鲨鱼 · 原版组合' }, { value: 'mixed', label: '混合 · 双髻 / 虎鲨 / 灰鲭 / 长尾' },
+      { value: 'hammerhead', label: '双髻鲨' }, { value: 'tiger', label: '虎鲨' },
+      { value: 'zebra', label: '豹纹鲨' }, { value: 'greathammer', label: '无沟双髻鲨' },
+      { value: 'mako', label: '灰鲭鲨' }, { value: 'thresher', label: '长尾鲨' }, { value: 'nurse', label: '护士鲨' },
+    ] });
+    const oceanRow = createRow(oceanGroup);
+    appendControl(oceanRow, { label: '装饰不透明度', key: 'asciiOceanOpacity', type: 'number', min: 0.15, max: 0.9, step: 0.05 });
+    appendControl(oceanRow, { label: '帧率上限（默认 12，范围 3–30）', key: 'asciiOceanFps', type: 'number', min: 3, max: 30, step: 1 });
+    appendControl(oceanGroup, { label: '鱼群数量', key: 'asciiOceanDensity', type: 'number', min: 40, max: 160, step: 10 });
+    appendControl(oceanGroup, { label: '画质与负载', key: 'asciiOceanQuality', type: 'select', choices: [
+      { value: 'eco', label: '节能 · 较低画质，最多 18 帧' }, { value: 'balanced', label: '均衡 · 保留完整边缘细节' }, { value: 'fine', label: '精细 · 更高屏幕分辨率' },
+    ] });
+    const oceanColors = createSettingsGroup(oceanGroup, '海洋配色');
+    appendControl(oceanColors, { label: '配色方案', key: 'asciiOceanColorMode', type: 'select', choices: [
+      { value: 'auto', label: '自动适配明暗背景' }, { value: 'original', label: '仓库原版' },
+      { value: 'cyan', label: '青蓝' }, { value: 'aurora', label: '极光紫' }, { value: 'warm', label: '暖金' },
+      { value: 'random', label: '随机和谐配色' }, { value: 'custom', label: '自选颜色' },
+    ] });
+    for (const [key, label] of [['asciiOceanBodyColor', '鲨鱼颜色'], ['asciiOceanAccentColor', '点缀颜色'], ['asciiOceanFishColor', '鱼群颜色'], ['asciiOceanWakeColor', '尾迹颜色']]) {
+      const input = appendControl(oceanColors, { label, key, type: 'color' });
+      input.addEventListener('input', () => { if (settings.asciiOceanColorMode !== 'custom') { updateSetting('asciiOceanColorMode', 'custom'); syncPanelInputs(panel); } });
+    }
+    const randomColors = document.createElement('button');
+    randomColors.type = 'button'; randomColors.textContent = '换一组随机颜色';
+    randomColors.addEventListener('click', () => {
+      settings = { ...settings, asciiOceanColorMode: 'random', asciiOceanColorSeed: Math.floor(Math.random() * 2147483646) + 1 };
+      writeStore(STORAGE_KEY, settings); applySettings(); syncPanelInputs(panel);
+    });
+    oceanColors.appendChild(randomColors);
+    const messageGlassGroup = createSettingsGroup(oceanGroup, '回答玻璃（仅模型回答，独立设置）');
+    const messageHint = document.createElement('p'); messageHint.className = 'cgfc-hint';
+    messageHint.textContent = '仅在对话页动画选择“回答玻璃”时生效。仅模型回答各自一块，用户消息保留原样；以下参数不影响输入框、导航、队列或其他贴片。只为屏幕附近的消息启用滤镜，滚出屏幕后释放。'; messageGlassGroup.appendChild(messageHint);
+    appendControl(messageGlassGroup, {label:'正文玻璃风格',key:'messageGlassStyle',type:'select',choices:[{value:'soft',label:'柔和玻璃（至少 6px 模糊）'},{value:'clear',label:'通透玻璃（使用所设模糊）'}]});
+    appendControl(messageGlassGroup, {label:'正文玻璃渲染',key:'messageGlassRenderMode',type:'select',choices:[{value:'balanced',label:'均衡折射'},{value:'full',label:'完整折射与色散'},{value:'frosted',label:'磨砂（不计算折射）'}]});
+    for (const [label,key,min,max,step] of [['底色不透明度','Opacity',0,.9,.01],['背景模糊 px','Blur',0,20,1],['折射强度','Strength',0,60,1],['边缘厚度','Thickness',4,48,1],['曲率','Curvature',0,1,.05],['弯折','Bend',0,1,.05],['色散（完整折射模式）','Chroma',0,.6,.01],['边缘高光','Glare',0,1.6,.05],['圆角 px','Radius',0,48,1],['背景饱和度','Saturation',.5,2,.05],['背景亮度','Brightness',.5,1.5,.05]]) appendControl(messageGlassGroup,{label,key:'messageGlass'+key,type:'number',min,max,step});
+    appendControl(messageGlassGroup,{label:'正文玻璃底色',key:'messageGlassTintMode',type:'select',choices:[{value:'auto',label:'自动适配明暗'},{value:'custom',label:'自选颜色'}]});
+    const messageTintInput = appendControl(messageGlassGroup,{label:'自选正文玻璃颜色',key:'messageGlassTint',type:'color'});
+    messageTintInput.addEventListener('input',()=>{if(settings.messageGlassTintMode!=='custom'){updateSetting('messageGlassTintMode','custom');syncPanelInputs(panel);}});
+    const oceanHint = document.createElement('p');
+    oceanHint.className = 'cgfc-hint';
+    oceanHint.textContent = '主页与对话页独立设置，所有模式都位于文字、输入框和贴片下方，并避开最左侧导航栏和滚动条。避开正文模式从顶部起按实际正文边界避让。滚动时连续游动；鼠标扰动默认关闭，关闭时不监听鼠标事件。被挡住的区域跳过绘制。默认 12 帧，可调至 3–30 帧；3–5 帧更省但跳格更明显，游动速度与尾迹衰减不随帧率减慢。鱼群默认 90 条；可选节能档。正文玻璃为每条消息独立设置，仅处理屏幕附近的消息。随机颜色每次生成后保持稳定，可再次换色。改编自 stackedlol/ascii-sharks。';
+    oceanGroup.appendChild(oceanHint);
 
     detectKnownLocalFonts();
 
@@ -14424,6 +14851,7 @@
       next.toolboxUseCustomColors = false;
       next.queueUseCustomColors = false;
       next.enableNeumorphicAppearance = false;
+      next.enableAsciiOcean = false;
       next.enableComposerLiquidGlass = false;
       next.enableToolboxLiquidGlass = false;
       next.enableSettingsLiquidGlass = false;
@@ -16051,6 +16479,2149 @@
   });
 })();
 
+    // BEGIN ASCII OCEAN ADAPTER (independent failure boundary)
+    // Adapted from stackedlol/ascii-sharks by stackedlol.
+    // https://github.com/stackedlol/ascii-sharks/tree/c521e24a787e6d4cc460d4cf2b9815f25e4fe453
+    // Upstream snapshot has no LICENSE; its license is not inferred from this script's GPL header.
+    try {
+(() => {
+  // work/ocean65-src/math.ts
+  var TAU = Math.PI * 2;
+  var clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+  var rand = (lo, hi) => lo + Math.random() * (hi - lo);
+  var randInt = (lo, hi) => Math.floor(rand(lo, hi + 1));
+  function smoothstep(e0, e1, x) {
+    const t = clamp((x - e0) / (e1 - e0), 0, 1);
+    return t * t * (3 - 2 * t);
+  }
+  function angleDiff(a, b) {
+    let d = (b - a) % TAU;
+    if (d > Math.PI) d -= TAU;
+    if (d < -Math.PI) d += TAU;
+    return d;
+  }
+  function hash3(x, y, z) {
+    let h = Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263) ^ Math.imul(z | 0, 1442695041);
+    h = Math.imul(h ^ h >>> 13, 1274126177);
+    h ^= h >>> 16;
+    return (h >>> 0) / 4294967296;
+  }
+  var K1 = 1 / 260;
+  var K2 = 1 / 310;
+  var K3 = 1 / 190;
+  var CURRENT_SCALE = 3400;
+  function current(x, y, t, out) {
+    const a = x * K1 + t * 0.07;
+    const b = y * K2 - t * 0.05;
+    const c = (x + y) * K3 + t * 0.11;
+    out.x = (-K2 * Math.sin(a) * Math.sin(b) + 0.5 * K3 * Math.cos(c)) * CURRENT_SCALE;
+    out.y = (-K1 * Math.cos(a) * Math.cos(b) - 0.5 * K3 * Math.cos(c)) * CURRENT_SCALE;
+    return out;
+  }
+
+  // work/ocean65-src/species.ts
+  var SPECIES = [
+    {
+      name: "sardine",
+      cruise: 36,
+      maxSpeed: 64,
+      minSpeed: 18,
+      weight: 3,
+      schoolSize: [18, 28],
+      spacing: [1.8, 1.1],
+      align: 1.6,
+      cohesion: 1.6,
+      jitter: 40,
+      mill: 70,
+      verticalDrag: 0.5
+    },
+    {
+      name: "anchovy",
+      cruise: 46,
+      maxSpeed: 78,
+      minSpeed: 22,
+      weight: 3,
+      schoolSize: [20, 32],
+      spacing: [1.5, 1],
+      align: 3.2,
+      cohesion: 0.45,
+      jitter: 30,
+      mill: 0,
+      verticalDrag: 1.4
+    },
+    {
+      name: "silverside",
+      cruise: 40,
+      maxSpeed: 70,
+      minSpeed: 20,
+      weight: 3,
+      schoolSize: [12, 20],
+      spacing: [2, 1.1],
+      align: 2.4,
+      cohesion: 1.1,
+      jitter: 35,
+      mill: 0,
+      verticalDrag: 1.6
+    },
+    {
+      name: "mackerel",
+      cruise: 32,
+      maxSpeed: 60,
+      minSpeed: 16,
+      weight: 2,
+      schoolSize: [5, 9],
+      spacing: [2.6, 1.3],
+      align: 2,
+      cohesion: 0.9,
+      jitter: 25,
+      mill: 0,
+      verticalDrag: 2
+    },
+    {
+      name: "goby",
+      cruise: 26,
+      maxSpeed: 56,
+      minSpeed: 10,
+      weight: 1,
+      schoolSize: [8, 12],
+      spacing: [1.4, 1.1],
+      align: 0.35,
+      cohesion: 1.4,
+      jitter: 110,
+      mill: 0,
+      verticalDrag: 0.3
+    }
+  ];
+  var TOTAL_WEIGHT = SPECIES.reduce((sum, s) => sum + s.weight, 0);
+  function pickSpecies() {
+    let r = Math.random() * TOTAL_WEIGHT;
+    for (let i = 0; i < SPECIES.length; i++) {
+      r -= SPECIES[i].weight;
+      if (r <= 0) return i;
+    }
+    return 0;
+  }
+
+  // work/ocean65-src/world.ts
+  var SHARK_NODES = 20;
+  var DEFAULT_SHARKS = [
+    { kind: "classic", size: 1 },
+    { kind: "classic", size: 0.7 },
+    { kind: "classic", size: 0.84 },
+    { kind: "classic", size: 0.77 }
+  ];
+  var FISH_SEPARATION_K = 420;
+  var FISH_ALIGN_K = 1.4;
+  var FISH_COHESION_K = 1;
+  var FISH_FLEE_K = 1100;
+  var BLIND_COS = -0.6;
+  var World = class {
+    /** fishCount overrides the area-based population (the sidebar wants a single small school). */
+    constructor(sharkSpecs = DEFAULT_SHARKS, fishCount) {
+      this.sharkSpecs = sharkSpecs;
+      this.fishCount = fishCount;
+    }
+    sharkSpecs;
+    fishCount;
+    width = 0;
+    height = 0;
+    time = 0;
+    fish = [];
+    sharks = [];
+    events = [];
+    pointer = { x: 0, y: 0, active: false };
+    /** Fish neighbourhood radius; the spatial hash bucket size matches it. */
+    perception = 60;
+    /** Per-species personal space in px (x, y). */
+    sepX = [];
+    sepY = [];
+    foreignSep = 40;
+    bucketCols = 0;
+    bucketRows = 0;
+    bucketHead = new Int32Array(0);
+    bucketCount = new Uint16Array(0);
+    bucketNext = new Int32Array(0);
+    lastSpawn = 0;
+    tmp = { x: 0, y: 0 };
+    predatorData = new Float64Array(0);
+    resize(width, height, cellW, cellH) {
+      const first = this.width === 0;
+      this.width = width;
+      this.height = height;
+      this.sepX = SPECIES.map((sp) => sp.spacing[0] * cellW);
+      this.sepY = SPECIES.map((sp) => sp.spacing[1] * cellH);
+      this.perception = Math.max(cellH * 3, cellW * 5.5);
+      this.foreignSep = cellW * 3;
+      if (first || this.fish.length === 0) {
+        this.seed();
+        return;
+      }
+      for (const f of this.fish) {
+        f.x = clamp(f.x, 0, width);
+        f.y = clamp(f.y, 0, height);
+      }
+    }
+    seed() {
+      const { width: W, height: H } = this;
+      const minSide = Math.min(W, H);
+      const baseLength = clamp(minSide * 0.44, 170, 430);
+      const sharkCount = this.sharkSpecs.length;
+      this.sharks = [];
+      for (let i = 0; i < sharkCount; i++) {
+        const { kind, size } = this.sharkSpecs[i];
+        const length = baseLength * size;
+        const orbitRadius = minSide * rand(0.28, 0.4);
+        const a = i / sharkCount * TAU + rand(-0.4, 0.4);
+        const orbitDir = i % 2 === 0 ? 1 : -1;
+        const x = W / 2 + Math.cos(a) * orbitRadius * (W / minSide) * 0.9;
+        const y = H / 2 + Math.sin(a) * orbitRadius;
+        const heading = a + orbitDir * Math.PI / 2;
+        const nodes = new Float32Array(SHARK_NODES * 2);
+        const seg = length / (SHARK_NODES - 1);
+        for (let n = 0; n < SHARK_NODES; n++) {
+          nodes[n * 2] = x - Math.cos(heading) * seg * n;
+          nodes[n * 2 + 1] = y - Math.sin(heading) * seg * n;
+        }
+        this.sharks.push({
+          id: i + 1,
+          kind,
+          length,
+          nodes,
+          heading,
+          speed: 30,
+          phase: rand(0, TAU),
+          turn: 0,
+          hunger: rand(0.25, 0.75),
+          wander: 0,
+          orbitDir,
+          orbitRadius,
+          target: null,
+          retargetAt: 0,
+          depth: size
+        });
+      }
+      this.sharks.sort((a, b) => a.length - b.length);
+      const total = this.fishCount ?? clamp(Math.round(W * H / 4400), 85, 340);
+      this.fish = [];
+      while (this.fish.length < total) {
+        const species = pickSpecies();
+        const sp = SPECIES[species];
+        const size = Math.min(randInt(sp.schoolSize[0], sp.schoolSize[1]), total - this.fish.length);
+        const millDir = Math.random() < 0.5 ? 1 : -1;
+        const cx = rand(W * 0.06, W * 0.94);
+        const cy = rand(H * 0.08, H * 0.92);
+        const dir = (Math.random() < 0.5 ? 0 : Math.PI) + rand(-0.5, 0.5);
+        for (let k = 0; k < size; k++) {
+          this.fish.push({
+            x: cx + rand(-1, 1) * this.sepX[species] * Math.sqrt(size),
+            y: cy + rand(-1, 1) * this.sepY[species] * Math.sqrt(size) * 0.6,
+            vx: Math.cos(dir) * sp.cruise,
+            vy: Math.sin(dir) * sp.cruise,
+            species,
+            alarm: 0,
+            alive: true,
+            respawnAt: 0,
+            phase: rand(0, TAU),
+            turn: 0,
+            depth: rand(0.55, 1),
+            millDir
+          });
+        }
+      }
+      this.bucketNext = new Int32Array(this.fish.length);
+    }
+    splash(x, y) {
+      this.events.push({ kind: "splash", x, y });
+      const r = 240;
+      for (const f of this.fish) {
+        if (!f.alive) continue;
+        const dx = f.x - x;
+        const dy = f.y - y;
+        const d = Math.hypot(dx, dy);
+        if (d > r || d < 1e-3) continue;
+        const k = (1 - d / r) * 260;
+        f.vx += dx / d * k;
+        f.vy += dy / d * k;
+        f.alarm = 1;
+      }
+    }
+    step(dt) {
+      this.time += dt;
+      this.rebuildHash();
+      this.stepFish(dt);
+      this.stepSharks(dt);
+      this.respawn();
+    }
+    rebuildHash() {
+      const size = this.perception;
+      const pad = 2;
+      this.bucketCols = Math.ceil(this.width / size) + pad * 2;
+      this.bucketRows = Math.ceil(this.height / size) + pad * 2;
+      const n = this.bucketCols * this.bucketRows;
+      if (this.bucketHead.length !== n) {
+        this.bucketHead = new Int32Array(n);
+        this.bucketCount = new Uint16Array(n);
+      }
+      this.bucketHead.fill(-1);
+      this.bucketCount.fill(0);
+      if (this.bucketNext.length !== this.fish.length) {
+        this.bucketNext = new Int32Array(this.fish.length);
+      }
+      for (let i = 0; i < this.fish.length; i++) {
+        const f = this.fish[i];
+        if (!f.alive) continue;
+        const b = this.bucketOf(f.x, f.y);
+        this.bucketNext[i] = this.bucketHead[b];
+        this.bucketHead[b] = i;
+        this.bucketCount[b]++;
+      }
+    }
+    bucketOf(x, y) {
+      const size = this.perception;
+      const c = clamp(Math.floor(x / size) + 2, 0, this.bucketCols - 1);
+      const r = clamp(Math.floor(y / size) + 2, 0, this.bucketRows - 1);
+      return r * this.bucketCols + c;
+    }
+    stepFish(dt) {
+      const { fish, sharks, pointer, width: W, height: H, time } = this;
+      const R = this.perception;
+      const R2 = R * R;
+      const foreignSep = this.foreignSep;
+      const size = this.perception;
+      const cols = this.bucketCols;
+      const rows = this.bucketRows;
+      const head = this.bucketHead;
+      const next = this.bucketNext;
+      const cur = this.tmp;
+      const calmDecay = Math.exp(-dt * 0.7);
+      const contagion = Math.min(1, dt * 6);
+      if (this.predatorData.length !== sharks.length * 3) this.predatorData = new Float64Array(sharks.length * 3);
+      const predatorData = this.predatorData;
+      for (let k = 0; k < sharks.length; k++) {
+        predatorData[k * 3] = Math.cos(sharks[k].heading);
+        predatorData[k * 3 + 1] = Math.sin(sharks[k].heading);
+        predatorData[k * 3 + 2] = sharks[k].length * 0.6 + 60;
+      }
+      for (let i = 0; i < fish.length; i++) {
+        const f = fish[i];
+        if (!f.alive) continue;
+        const sp = SPECIES[f.species];
+        const spread = 1 + 1.8 * f.alarm;
+        const sepX = this.sepX[f.species] * spread;
+        const sepY = this.sepY[f.species] * spread;
+        const speed = Math.hypot(f.vx, f.vy) || 1;
+        const hx = f.vx / speed;
+        const hy = f.vy / speed;
+        let ax = 0;
+        let ay = 0;
+        let sx = 0;
+        let sy = 0;
+        let avx = 0;
+        let avy = 0;
+        let cx = 0;
+        let cy = 0;
+        let n = 0;
+        let neighbourAlarm = 0;
+        const bc = clamp(Math.floor(f.x / size) + 2, 0, cols - 1);
+        const br = clamp(Math.floor(f.y / size) + 2, 0, rows - 1);
+        for (let r = Math.max(0, br - 1); r <= Math.min(rows - 1, br + 1); r++) {
+          for (let c = Math.max(0, bc - 1); c <= Math.min(cols - 1, bc + 1); c++) {
+            let j = head[r * cols + c];
+            while (j !== -1) {
+              if (j !== i) {
+                const o = fish[j];
+                const dx = o.x - f.x;
+                const dy = o.y - f.y;
+                const d2 = dx * dx + dy * dy;
+                if (d2 < R2 && d2 > 1e-6) {
+                  const d = Math.sqrt(d2);
+                  if ((dx * hx + dy * hy) / d > BLIND_COS) {
+                    const qx = dx / sepX;
+                    const qy = dy / sepY;
+                    const q2 = qx * qx + qy * qy;
+                    if (q2 < 1) {
+                      const q = Math.sqrt(q2) || 1e-3;
+                      const k = (1 - q) / q;
+                      sx -= qx * k;
+                      sy -= qy * k;
+                    }
+                    if (o.species === f.species) {
+                      avx += o.vx;
+                      avy += o.vy;
+                      cx += dx;
+                      cy += dy;
+                      n++;
+                    } else if (d < foreignSep) {
+                      const k = (1 - d / foreignSep) / d * 0.6;
+                      sx -= dx * k;
+                      sy -= dy * k;
+                    }
+                    if (o.alarm > neighbourAlarm) neighbourAlarm = o.alarm;
+                  }
+                }
+              }
+              j = next[j];
+            }
+          }
+        }
+        ax += sx * FISH_SEPARATION_K;
+        ay += sy * FISH_SEPARATION_K;
+        if (n > 0) {
+          const alignK = FISH_ALIGN_K * sp.align;
+          const cohesionK = FISH_COHESION_K * sp.cohesion * (1 - 0.8 * f.alarm);
+          ax += (avx / n - f.vx) * alignK + cx / n * cohesionK;
+          ay += (avy / n - f.vy) * alignK + cy / n * cohesionK;
+          if (sp.mill > 0) {
+            const cl = Math.hypot(cx, cy) || 1;
+            ax += -cy / cl * f.millDir * sp.mill * (1 - f.alarm);
+            ay += cx / cl * f.millDir * sp.mill * (1 - f.alarm);
+          }
+        }
+        let fear = 0;
+        for (let sharkIndex = 0; sharkIndex < sharks.length; sharkIndex++) {
+          const sh = sharks[sharkIndex];
+          const fearR = predatorData[sharkIndex * 3 + 2];
+          let best = Infinity;
+          let bx = 0;
+          let by = 0;
+          for (let k = 0; k <= 12; k += 3) {
+            const nx = sh.nodes[k * 2];
+            const ny = sh.nodes[k * 2 + 1];
+            const d2 = (f.x - nx) ** 2 + (f.y - ny) ** 2;
+            if (d2 < best) {
+              best = d2;
+              bx = nx;
+              by = ny;
+            }
+          }
+          const d = Math.sqrt(best);
+          if (d >= fearR || d < 1e-3) continue;
+          let w = 1 - d / fearR;
+          w *= w;
+          const awayX = (f.x - bx) / d;
+          const awayY = (f.y - by) / d;
+          const shx = predatorData[sharkIndex * 3];
+          const shy = predatorData[sharkIndex * 3 + 1];
+          const side = shx * (f.y - sh.nodes[1]) - shy * (f.x - sh.nodes[0]) >= 0 ? 1 : -1;
+          ax += (awayX * 0.7 - shy * side * 0.9) * FISH_FLEE_K * w;
+          ay += (awayY * 0.7 + shx * side * 0.9) * FISH_FLEE_K * w;
+          fear = Math.max(fear, Math.sqrt(w));
+        }
+        if (pointer.active) {
+          const pr = 130;
+          const dx = f.x - pointer.x;
+          const dy = f.y - pointer.y;
+          const d = Math.hypot(dx, dy);
+          if (d < pr && d > 1e-3) {
+            const w = (1 - d / pr) ** 2;
+            ax += dx / d * FISH_FLEE_K * w;
+            ay += dy / d * FISH_FLEE_K * w;
+            fear = Math.max(fear, Math.sqrt(w) * 0.8);
+          }
+        }
+        let alarm = Math.max(f.alarm * calmDecay, fear);
+        const relayed = neighbourAlarm * 0.86;
+        if (relayed > alarm) alarm += (relayed - alarm) * contagion;
+        f.alarm = alarm;
+        const m = 36;
+        if (f.x < m) ax += (m - f.x) * 7;
+        else if (f.x > W - m) ax -= (f.x - (W - m)) * 7;
+        if (f.y < m) ay += (m - f.y) * 7;
+        else if (f.y > H - m) ay -= (f.y - (H - m)) * 7;
+        current(f.x, f.y, time, cur);
+        ax += cur.x * 0.5 + (Math.random() - 0.5) * sp.jitter;
+        ay += cur.y * 0.5 + (Math.random() - 0.5) * sp.jitter;
+        ay -= f.vy * sp.verticalDrag * (1 - 0.7 * f.alarm);
+        const preferred = sp.cruise * (1 + 1.3 * f.alarm);
+        ax += (preferred - speed) * hx * 1.6;
+        ay += (preferred - speed) * hy * 1.6;
+        const before = Math.atan2(f.vy, f.vx);
+        f.vx += ax * dt;
+        f.vy += ay * dt;
+        const maxSpeed = sp.maxSpeed * (1 + 1.8 * f.alarm);
+        const s = Math.hypot(f.vx, f.vy);
+        let finalSpeed = s;
+        if (s > maxSpeed) {
+          f.vx *= maxSpeed / s;
+          f.vy *= maxSpeed / s;
+          finalSpeed = Math.hypot(f.vx, f.vy);
+        } else if (s < sp.minSpeed && s > 1e-3) {
+          f.vx *= sp.minSpeed / s;
+          f.vy *= sp.minSpeed / s;
+          finalSpeed = Math.hypot(f.vx, f.vy);
+        }
+        f.turn += (angleDiff(before, Math.atan2(f.vy, f.vx)) / dt - f.turn) * Math.min(1, dt * 8);
+        f.phase += dt * (7 + finalSpeed * 0.12);
+        f.x = clamp(f.x + f.vx * dt, -60, W + 60);
+        f.y = clamp(f.y + f.vy * dt, -60, H + 60);
+      }
+    }
+    stepSharks(dt) {
+      const { sharks, width: W, height: H, time } = this;
+      const minSide = Math.min(W, H);
+      const cxW = W / 2;
+      const cyW = H / 2;
+      for (const sh of sharks) {
+        const L = sh.length;
+        const nodes = sh.nodes;
+        const hx = nodes[0];
+        const hy = nodes[1];
+        sh.hunger = Math.min(1, sh.hunger + dt * 0.03);
+        let dx = Math.cos(sh.heading);
+        let dy = Math.sin(sh.heading);
+        sh.wander = clamp(sh.wander + (Math.random() - 0.5) * dt * 3.2, -1.1, 1.1);
+        dx += Math.cos(sh.heading + sh.wander) * 0.45;
+        dy += Math.sin(sh.heading + sh.wander) * 0.45;
+        if (time >= sh.retargetAt) {
+          sh.target = this.findPrey(sh);
+          sh.retargetAt = time + 0.45;
+        }
+        const t = sh.target;
+        let hunting = false;
+        let closing = 0;
+        if (t && t.alive && sh.hunger > 0.3) {
+          const tx = t.x + t.vx * 0.35 - hx;
+          const ty = t.y + t.vy * 0.35 - hy;
+          const d = Math.hypot(tx, ty) || 1;
+          const w = 1.4 + 2.6 * sh.hunger;
+          dx += tx / d * w;
+          dy += ty / d * w;
+          hunting = true;
+          closing = clamp(1 - d / (L * 0.9), 0, 1);
+        } else {
+          const rx = (hx - cxW) / (W / minSide);
+          const ry = hy - cyW;
+          const r = Math.hypot(rx, ry) || 1;
+          const radius = sh.orbitRadius * (1 + 0.15 * Math.sin(time * 0.05 + sh.id));
+          const radial = clamp((radius - r) / radius, -1, 1);
+          dx += (-ry / r * sh.orbitDir + rx / r * radial * 0.9) * 0.55;
+          dy += (rx / r * sh.orbitDir + ry / r * radial * 0.9) * 0.55;
+        }
+        for (const other of sharks) {
+          if (other === sh) continue;
+          for (let k = 0; k < SHARK_NODES; k += 4) {
+            const ox = hx - other.nodes[k * 2];
+            const oy = hy - other.nodes[k * 2 + 1];
+            const d = Math.hypot(ox, oy);
+            const range = (L + other.length) * 0.45;
+            if (d < range && d > 1e-3) {
+              const w = (1 - d / range) * 3;
+              dx += ox / d * w;
+              dy += oy / d * w;
+            }
+          }
+        }
+        const ex = (hx - cxW) / (W * 0.3);
+        const ey = (hy - cyW) / (H * 0.16);
+        const e2 = ex * ex + ey * ey;
+        if (e2 < 1) {
+          const e = Math.sqrt(e2) || 1e-3;
+          const w = (1 - e) * (hunting ? 1 : 2.5);
+          dx += ex / e * w;
+          dy += ey / e * w;
+        }
+        const over = Math.max(-hx, hx - W, -hy, hy - H);
+        if (over > -L * 0.05) {
+          const w = clamp((over + L * 0.05) / (L * 0.35), 0, 1) * 3.5;
+          const toX = cxW - hx;
+          const toY = cyW - hy;
+          const d = Math.hypot(toX, toY) || 1;
+          dx += toX / d * w;
+          dy += toY / d * w;
+        }
+        const desired = Math.atan2(dy, dx);
+        const agility = Math.min(hunting ? 1.7 + closing : 0.8, sh.speed / (L * 0.22));
+        const maxTurn = agility * dt;
+        const turned = clamp(angleDiff(sh.heading, desired), -maxTurn, maxTurn);
+        sh.heading += turned;
+        sh.turn += (turned / dt - sh.turn) * Math.min(1, dt * 3);
+        const cruise = 30 + L * 0.04;
+        const targetSpeed = hunting ? cruise * (1.45 + closing * 1.5) : cruise;
+        sh.speed += (targetSpeed - sh.speed) * Math.min(1, dt * 1.1);
+        sh.phase += dt * (2 + sh.speed / 24);
+        nodes[0] += Math.cos(sh.heading) * sh.speed * dt;
+        nodes[1] += Math.sin(sh.heading) * sh.speed * dt;
+        const seg = L / (SHARK_NODES - 1);
+        const maxBend = 0.16;
+        let prevAngle = sh.heading + Math.PI;
+        for (let k = 1; k < SHARK_NODES; k++) {
+          const px = nodes[(k - 1) * 2];
+          const py = nodes[(k - 1) * 2 + 1];
+          let angle = Math.atan2(nodes[k * 2 + 1] - py, nodes[k * 2] - px);
+          angle = prevAngle + clamp(angleDiff(prevAngle, angle), -maxBend, maxBend);
+          nodes[k * 2] = px + Math.cos(angle) * seg;
+          nodes[k * 2 + 1] = py + Math.sin(angle) * seg;
+          prevAngle = angle;
+        }
+        if (sh.hunger > 0.15) {
+          const mouthR = L * 0.05 + 8;
+          const mx = nodes[0];
+          const my = nodes[1];
+          for (const f of this.fish) {
+            if (!f.alive) continue;
+            if ((f.x - mx) ** 2 + (f.y - my) ** 2 < mouthR * mouthR) {
+              f.alive = false;
+              f.respawnAt = time + rand(3, 8);
+              sh.hunger = Math.max(0, sh.hunger - 0.16);
+              this.events.push({ kind: "eat", x: f.x, y: f.y });
+            }
+          }
+        }
+      }
+    }
+    /**
+     * Pick prey in the shark's forward cone, preferring close fish in sparse
+     * buckets (stragglers) over fish buried in a dense school.
+     */
+    findPrey(sh) {
+      const range = sh.length * 0.9 + 160;
+      const hx = sh.nodes[0];
+      const hy = sh.nodes[1];
+      const fx = Math.cos(sh.heading);
+      const fy = Math.sin(sh.heading);
+      let best = null;
+      let bestScore = Infinity;
+      let currentScore = Infinity;
+      for (const f of this.fish) {
+        if (!f.alive) continue;
+        const dx = f.x - hx;
+        const dy = f.y - hy;
+        const d = Math.hypot(dx, dy);
+        if (d > range || d < 1e-3) continue;
+        const cos = (dx * fx + dy * fy) / d;
+        if (cos < 0.2) continue;
+        const crowd = this.bucketCount[this.bucketOf(f.x, f.y)];
+        const score = d * (1 + (1 - cos) * 0.8) * (1 + crowd * 0.07);
+        if (score < bestScore) {
+          bestScore = score;
+          best = f;
+        }
+        if (f === sh.target) currentScore = score;
+      }
+      if (sh.target && currentScore < bestScore * 1.3) return sh.target;
+      return best;
+    }
+    respawn() {
+      const { time, width: W, height: H } = this;
+      const due = [];
+      for (const f of this.fish) if (!f.alive && f.respawnAt <= time) due.push(f);
+      if (due.length === 0) return;
+      if (due.length < 6 && time - this.lastSpawn < 9) return;
+      this.lastSpawn = time;
+      const side = randInt(0, 3);
+      const along = rand(0.15, 0.85);
+      const x = side === 0 ? -20 : side === 1 ? W + 20 : along * W;
+      const y = side === 2 ? -20 : side === 3 ? H + 20 : along * H;
+      const inward = Math.atan2(H / 2 - y, W / 2 - x) + rand(-0.5, 0.5);
+      const species = pickSpecies();
+      const sp = SPECIES[species];
+      const millDir = Math.random() < 0.5 ? 1 : -1;
+      for (const f of due.slice(0, sp.schoolSize[1])) {
+        f.alive = true;
+        f.species = species;
+        f.alarm = 0;
+        f.turn = 0;
+        f.millDir = millDir;
+        f.x = x + rand(-1, 1) * this.perception;
+        f.y = y + rand(-1, 1) * this.perception;
+        f.vx = Math.cos(inward) * sp.cruise * 1.4;
+        f.vy = Math.sin(inward) * sp.cruise * 1.4;
+      }
+    }
+  };
+
+  // work/ocean65-src/renderer.ts
+  var ALPHA_LEVELS = 6;
+  var FISH_ALPHAS = [0.28, 0.42, 0.58, 0.74, 0.9];
+  var DOT_RGB = [
+    [48, 52, 235],
+    [52, 205, 60],
+    [228, 50, 44],
+    [190, 212, 255],
+    [110, 230, 255]
+  ];
+  var DOT_BASE_ALPHA = [1, 1, 1, 1, 1];
+  var WAKE = DOT_RGB.length - 1;
+  var ACCENTS = ["#e0892c", "#e03a32", "#b44ae0", "#33c8cc", "#3cb54a", "#3150e8", "#d9c14a"];
+  var SKIN_RAMP = ":;t%SX8#@";
+  var FIN_GLYPHS = "%;tS:";
+  var RIDGE_GLYPHS = "@8%";
+  var EDGE_HEAVY = ":;";
+  var EDGE_LIGHT = ".',`";
+  var FLAG_BODY = 1;
+  var FLAG_EDGE = 2;
+  var FLAG_FIN = 3;
+  var FLAG_RIDGE = 4;
+  var FLAG_EYE = 5;
+  var FLAG_MARK = 6;
+  var MARK_GLYPHS = "#%@";
+  var SUBSAMPLES = [0.25, 0.3, 0.75, 0.3, 0.25, 0.72, 0.75, 0.72];
+  function classicHalfWidth(s) {
+    if (s < 0.13) return 0.09 * Math.pow(Math.sin(s / 0.13 * Math.PI / 2), 0.95);
+    if (s < 0.3) return 0.09 + 0.016 * smoothstep(0.13, 0.3, s);
+    if (s < 0.84) return 0.019 + 0.087 * Math.pow(1 - (s - 0.3) / 0.54, 1.25);
+    const k = (s - 0.84) / 0.16;
+    return 0.019 * (1 - k) + 0.012 * Math.sin(k * Math.PI);
+  }
+  var SHAPES = {
+    classic: {
+      halfWidth: classicHalfWidth,
+      pectoral: [0.15, 0.43, 0.55, 0.26],
+      falcate: true,
+      pelvic: [0.57, 0.65, 0.69, 0.085],
+      caudal: 0.085,
+      dorsal: [0.33, 0.47],
+      secondDorsal: [0.71, 0.76],
+      eye: [0.1, 0.14],
+      gills: [0.19, 0.29],
+      tint: [0.92, 0.97, 1.05]
+    },
+    // Slim neck under a wide, swept-back cephalofoil (drawn in sampleShark),
+    // tall first dorsal, long upper tail lobe. Bronze-olive grey.
+    hammerhead: {
+      halfWidth: (s) => {
+        if (s < 0.06) return 0.045;
+        if (s < 0.3) return 0.045 + 0.061 * smoothstep(0.06, 0.3, s);
+        return classicHalfWidth(s) * 0.92;
+      },
+      head: { span: 0.17, sweep: 0.035, depth: 0.09, notch: 0 },
+      pectoral: [0.17, 0.4, 0.5, 0.22],
+      falcate: true,
+      pelvic: [0.56, 0.63, 0.67, 0.075],
+      caudal: 0.11,
+      dorsal: [0.28, 0.44],
+      secondDorsal: [0.7, 0.74],
+      eye: null,
+      gills: [0.16, 0.26],
+      tint: [0.96, 0.98, 0.9]
+    },
+    // Blunt, square snout on a heavy body; barred back. Warm grey-brown.
+    tiger: {
+      halfWidth: (s) => {
+        if (s < 0.13) return 0.1 * Math.pow(Math.sin(s / 0.13 * Math.PI / 2), 0.45);
+        if (s < 0.3) return 0.1 + 0.014 * smoothstep(0.13, 0.3, s);
+        if (s < 0.84) return 0.019 + 0.095 * Math.pow(1 - (s - 0.3) / 0.54, 1.2);
+        const k = (s - 0.84) / 0.16;
+        return 0.019 * (1 - k) + 0.012 * Math.sin(k * Math.PI);
+      },
+      pectoral: [0.15, 0.42, 0.53, 0.25],
+      falcate: true,
+      pelvic: [0.57, 0.65, 0.69, 0.085],
+      caudal: 0.095,
+      dorsal: [0.33, 0.46],
+      secondDorsal: [0.71, 0.75],
+      eye: [0.08, 0.12],
+      gills: [0.19, 0.28],
+      tint: [1.02, 0.95, 0.84]
+    },
+    // Short rounded head, body done by half-length, then a long ribbon of a
+    // tail fin. Broad rounded pectorals, spotted sandy skin.
+    zebra: {
+      halfWidth: (s) => {
+        if (s < 0.1) return 0.075 * Math.pow(Math.sin(s / 0.1 * Math.PI / 2), 0.7);
+        if (s < 0.28) return 0.075 + 0.025 * smoothstep(0.1, 0.28, s);
+        if (s < 0.55) return 0.022 + 0.078 * Math.pow(1 - (s - 0.28) / 0.27, 1.1);
+        const k = (s - 0.55) / 0.45;
+        return 0.022 * (1 - k * k) + 0.012 * Math.sin(k * Math.PI);
+      },
+      pectoral: [0.12, 0.3, 0.36, 0.19],
+      falcate: false,
+      pelvic: [0.42, 0.48, 0.51, 0.065],
+      caudal: 0,
+      dorsal: [0.36, 0.44],
+      secondDorsal: [0.49, 0.53],
+      eye: [0.06, 0.09],
+      gills: [0.13, 0.2],
+      tint: [1.08, 0.97, 0.74]
+    },
+    // Great hammerhead: a broader, nearly straight-edged cephalofoil with a notch at the centre,
+    // a towering sickle first dorsal (drawn long and bright from above), and a cooler slate skin.
+    greathammer: {
+      halfWidth: (s) => {
+        if (s < 0.05) return 0.04;
+        if (s < 0.3) return 0.04 + 0.07 * smoothstep(0.05, 0.3, s);
+        return classicHalfWidth(s) * 0.95;
+      },
+      head: { span: 0.21, sweep: 6e-3, depth: 0.085, notch: 0.014 },
+      pectoral: [0.16, 0.38, 0.49, 0.24],
+      falcate: true,
+      pelvic: [0.55, 0.62, 0.67, 0.085],
+      caudal: 0.13,
+      dorsal: [0.24, 0.45],
+      secondDorsal: [0.68, 0.74],
+      eye: null,
+      gills: [0.15, 0.25],
+      tint: [0.86, 0.93, 1.02]
+    },
+    // Shortfin mako: a long conical snout, a torpedo body that narrows hard to the tail stalk,
+    // and a tall crescent tail. Metallic indigo back.
+    mako: {
+      halfWidth: (s) => {
+        if (s < 0.17) return 0.088 * Math.pow(Math.sin(s / 0.17 * Math.PI / 2), 1.5);
+        if (s < 0.32) return 0.088 + 0.012 * smoothstep(0.17, 0.32, s);
+        if (s < 0.86) return 0.014 + 0.086 * Math.pow(1 - (s - 0.32) / 0.54, 1.45);
+        const k = (s - 0.86) / 0.14;
+        return 0.014 * (1 - k) + 0.01 * Math.sin(k * Math.PI);
+      },
+      pectoral: [0.18, 0.4, 0.5, 0.21],
+      falcate: true,
+      pelvic: [0.58, 0.64, 0.68, 0.06],
+      caudal: 0.13,
+      dorsal: [0.34, 0.45],
+      secondDorsal: [0.76, 0.79],
+      eye: [0.11, 0.15],
+      gills: [0.2, 0.3],
+      tint: [0.78, 0.9, 1.2]
+    },
+    // Thresher: a compact body over the front half, then the upper tail lobe as a long whip
+    // that's as long as the shark itself. Big eyes, long sickle pectorals, bronze-violet skin.
+    thresher: {
+      halfWidth: (s) => {
+        if (s < 0.08) return 0.07 * Math.pow(Math.sin(s / 0.08 * Math.PI / 2), 0.75);
+        if (s < 0.2) return 0.07 + 0.02 * smoothstep(0.08, 0.2, s);
+        if (s < 0.48) return 0.012 + 0.078 * Math.pow(1 - (s - 0.2) / 0.28, 1.3);
+        const k = (s - 0.48) / 0.52;
+        return 0.012 * (1 - k) + 6e-3 * Math.sin(k * Math.PI * 0.9) + 2e-3;
+      },
+      pectoral: [0.12, 0.27, 0.36, 0.2],
+      falcate: true,
+      pelvic: [0.37, 0.41, 0.44, 0.045],
+      caudal: 0,
+      dorsal: [0.24, 0.32],
+      secondDorsal: [0.45, 0.47],
+      eye: [0.05, 0.1],
+      gills: [0.11, 0.18],
+      tint: [1, 0.9, 1.08]
+    },
+    // Nurse shark: a blunt, broad head, a heavy flattened body with both dorsals set far back,
+    // rounded paddle pectorals, and a long low tail with no lower lobe. Tawny brown.
+    nurse: {
+      halfWidth: (s) => {
+        if (s < 0.08) return 0.085 * Math.pow(Math.sin(s / 0.08 * Math.PI / 2), 0.4);
+        if (s < 0.3) return 0.085 + 0.02 * smoothstep(0.08, 0.3, s);
+        if (s < 0.72) return 0.022 + 0.083 * Math.pow(1 - (s - 0.3) / 0.42, 1.1);
+        const k = (s - 0.72) / 0.28;
+        return 0.022 * (1 - k * k) + 0.014 * Math.sin(k * Math.PI);
+      },
+      pectoral: [0.16, 0.34, 0.4, 0.17],
+      falcate: false,
+      pelvic: [0.45, 0.52, 0.55, 0.075],
+      caudal: 0,
+      dorsal: [0.5, 0.58],
+      secondDorsal: [0.63, 0.69],
+      eye: [0.05, 0.075],
+      gills: [0.14, 0.22],
+      tint: [1.1, 0.96, 0.76]
+    }
+  };
+  var KINDS = Object.keys(SHAPES);
+  function inTriangle(px, py, ax, ay, bx, by, cx, cy) {
+    const d1 = (px - bx) * (ay - by) - (ax - bx) * (py - by);
+    const d2 = (px - cx) * (by - cy) - (bx - cx) * (py - cy);
+    const d3 = (px - ax) * (cy - ay) - (cx - ax) * (py - ay);
+    const neg = d1 < 0 || d2 < 0 || d3 < 0;
+    const pos = d1 > 0 || d2 > 0 || d3 > 0;
+    return !(neg && pos);
+  }
+  var AsciiRenderer = class {
+    constructor(canvas) {
+      this.canvas = canvas;
+      const ctx = canvas.getContext("2d", { alpha: true });
+      if (!ctx) throw new Error("2D canvas unavailable");
+      this.ctx = ctx;
+      for (let c = 0; c < DOT_RGB.length; c++) {
+        const [r, g, b] = DOT_RGB[c];
+        for (let l = 0; l < ALPHA_LEVELS; l++) {
+          const a = DOT_BASE_ALPHA[c] * (l + 1) / ALPHA_LEVELS;
+          this.dotStyles.push(`rgba(${r},${g},${b},${a.toFixed(3)})`);
+        }
+      }
+    }
+    canvas;
+    ctx;
+    occluded = new Uint8Array(0);
+    occlusionKey = "";
+    bodyTint = null;
+    paletteAccents = null;
+    edgeSamples = 4;
+    setDetail(eco) {
+      this.edgeSamples = eco ? 2 : 4;
+    }
+    setPalette(body, accent, fish, wake) {
+      this.bodyTint = body?.map((v) => v / 160) || null;
+      this.paletteAccents = body ? [accent, accent, "rgb(" + body.join(",") + ")"] : null;
+      this.fishStyles = FISH_ALPHAS.map((a) => "rgba(" + fish.join(",") + "," + a + ")");
+      for (let l = 0; l < ALPHA_LEVELS; l++) this.dotStyles[WAKE * ALPHA_LEVELS + l] = "rgba(" + wake.join(",") + "," + (l + 1) / ALPHA_LEVELS + ")";
+    }
+    setOcclusion(rects) {
+      const key = this.cols + "," + this.rows + ":" + rects.map((r) => [r.x, r.y, r.w, r.h].join(",")).join(";");
+      if (key === this.occlusionKey) return;
+      this.occlusionKey = key;
+      this.occluded = new Uint8Array(this.cols * this.rows);
+      for (const rect of rects) {
+        const c0 = Math.max(0, Math.ceil(rect.x / this.cw)), c1 = Math.min(this.cols, Math.floor((rect.x + rect.w) / this.cw));
+        const r0 = Math.max(0, Math.ceil(rect.y / this.ch)), r1 = Math.min(this.rows, Math.floor((rect.y + rect.h) / this.ch));
+        for (let r = r0; r < r1; r++) this.occluded.fill(1, r * this.cols + c0, r * this.cols + c1);
+      }
+    }
+    getOccludedCells() {
+      return this.occluded.reduce((a, b) => a + b, 0);
+    }
+    dpr = 1;
+    width = 0;
+    height = 0;
+    cw = 12;
+    ch = 18;
+    cols = 0;
+    rows = 0;
+    fontFamily = "ui-monospace, Menlo, monospace";
+    dotKind = new Uint8Array(0);
+    // 0 none, 1 blue, 2 green, 3 red, 4 pale
+    dotPhase = new Float32Array(0);
+    dotFreq = new Float32Array(0);
+    energy = new Float32Array(0);
+    energyTmp = new Float32Array(0);
+    heat = new Float32Array(0);
+    bucketOf = new Uint8Array(0);
+    bucketOrder = new Int32Array(0);
+    bucketCounts = new Int32Array(DOT_RGB.length * ALPHA_LEVELS + 1);
+    dotStyles = [];
+    sharkFlag = new Uint8Array(0);
+    sharkShade = new Float32Array(0);
+    sharkKey = new Uint32Array(0);
+    sharkDepth = new Float32Array(0);
+    sharkKind = new Uint8Array(0);
+    /** Cells darkened by a shark's shadow on the seabed. */
+    sharkShadow = new Uint8Array(0);
+    spine = new Float32Array(SHARK_NODES * 2);
+    arc = new Float32Array(SHARK_NODES);
+    arcTotal = 1;
+    segmentData = new Float64Array((SHARK_NODES - 1) * 10);
+    segmentGroups = new Float64Array(5 * 4);
+    nearestSegment = 0;
+    externalFieldClock = false;
+    setExternalFieldClock(value) {
+      this.externalFieldClock = value;
+    }
+    advanceFields(world, dt) {
+      this.consumeEvents(world);
+      this.depositWake(world);
+      this.diffuse(dt);
+    }
+    dotStarts = new Int32Array(DOT_RGB.length * ALPHA_LEVELS + 1);
+    dotCursor = new Int32Array(DOT_RGB.length * ALPHA_LEVELS + 1);
+    shape = SHAPES.classic;
+    sharkId = 0;
+    finTipLeft = 0;
+    finTipRight = 0;
+    // Scratch outputs of sampleShark(), to avoid allocating per sample.
+    hitFlag = 0;
+    hitShade = 0;
+    hitS = 0;
+    hitV = 0;
+    hitDist = 0;
+    /** Cells holding a fish this frame (frame stamp); dots skip them. */
+    fishStamp = new Uint32Array(0);
+    frameId = 0;
+    /** Fish cells bucketed by brightness, so each bucket is one fillStyle. */
+    fishBuckets = FISH_ALPHAS.map(() => []);
+    fishStyles = FISH_ALPHAS.map((a) => `rgba(230,238,255,${a})`);
+    get cellWidth() {
+      return this.cw;
+    }
+    get cellHeight() {
+      return this.ch;
+    }
+    setFontFamily(family) {
+      if (family) this.fontFamily = family;
+    }
+    resize(width, height, dpr) {
+      this.width = width;
+      this.height = height;
+      this.dpr = dpr;
+      this.cw = clamp(Math.round(width / 124), 8, 13);
+      this.ch = Math.round(this.cw * 1.45);
+      this.cols = Math.ceil(width / this.cw);
+      this.rows = Math.ceil(height / this.ch);
+      this.canvas.width = Math.round(width * dpr);
+      this.canvas.height = Math.round(height * dpr);
+      this.occlusionKey = "";
+      this.occluded = new Uint8Array(this.cols * this.rows);
+      const n = this.cols * this.rows;
+      this.dotKind = new Uint8Array(n);
+      this.dotPhase = new Float32Array(n);
+      this.dotFreq = new Float32Array(n);
+      this.energy = new Float32Array(n);
+      this.energyTmp = new Float32Array(n);
+      this.heat = new Float32Array(n);
+      this.bucketOf = new Uint8Array(n);
+      this.bucketOrder = new Int32Array(n);
+      this.sharkFlag = new Uint8Array(n);
+      this.sharkShade = new Float32Array(n);
+      this.sharkKey = new Uint32Array(n);
+      this.sharkDepth = new Float32Array(n);
+      this.sharkKind = new Uint8Array(n);
+      this.sharkShadow = new Uint8Array(n);
+      this.fishStamp = new Uint32Array(n);
+      for (let i = 0; i < n; i++) {
+        const col = i % this.cols;
+        const row = i / this.cols | 0;
+        this.dotKind[i] = 0;
+        this.dotPhase[i] = hash3(col, row, 23) * Math.PI * 2;
+        this.dotFreq[i] = 0.3 + hash3(col, row, 37) * 1.1;
+      }
+    }
+    render(world, dt) {
+      const { ctx, dpr, cols, ch } = this;
+      if (cols === 0) return;
+      const t = world.time;
+      this.rasterizeSharks(world.sharks, t);
+      if (!this.externalFieldClock) this.advanceFields(world, dt);
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      this.markFish(world);
+      this.drawDots(t);
+      ctx.font = `600 ${Math.round(ch * 0.74)}px ${this.fontFamily}`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      this.drawHeat();
+      this.drawFish();
+      this.drawSharks(t);
+    }
+    // ── simulation → field ──────────────────────────────────────────────
+    cellIndex(x, y) {
+      const c = Math.floor(x / this.cw);
+      const r = Math.floor(y / this.ch);
+      if (c < 0 || r < 0 || c >= this.cols || r >= this.rows) return -1;
+      return r * this.cols + c;
+    }
+    stamp(field, x, y, radius, amount) {
+      const c0 = Math.floor(x / this.cw);
+      const r0 = Math.floor(y / this.ch);
+      for (let r = r0 - radius; r <= r0 + radius; r++) {
+        for (let c = c0 - radius; c <= c0 + radius; c++) {
+          if (c < 0 || r < 0 || c >= this.cols || r >= this.rows) continue;
+          const d = Math.hypot(c - c0, (r - r0) * 1.4);
+          if (d > radius + 0.5) continue;
+          const i = r * this.cols + c;
+          field[i] = Math.min(1.6, field[i] + amount * (1 - d / (radius + 1)));
+        }
+      }
+    }
+    consumeEvents(world) {
+      for (const e of world.events) {
+        if (e.kind === "eat") {
+          this.stamp(this.heat, e.x, e.y, 2, 1);
+          this.stamp(this.energy, e.x, e.y, 3, 0.9);
+        } else {
+          this.stamp(this.energy, e.x, e.y, 6, 1.4);
+        }
+      }
+      world.events.length = 0;
+    }
+    depositWake(world) {
+      const { energy } = this;
+      for (const f of world.fish) {
+        if (!f.alive) continue;
+        const i = this.cellIndex(f.x, f.y);
+        if (i >= 0) energy[i] = Math.min(1.6, energy[i] + 0.012 + f.alarm * 0.03);
+      }
+      for (const sh of world.sharks) {
+        for (let k = SHARK_NODES - 6; k < SHARK_NODES; k++) {
+          const i = this.cellIndex(sh.nodes[k * 2], sh.nodes[k * 2 + 1]);
+          if (i >= 0) energy[i] = Math.min(1.6, energy[i] + 0.05 + sh.speed * 12e-4);
+        }
+      }
+      if (world.pointer.active) {
+        this.stamp(energy, world.pointer.x, world.pointer.y, 1, 0.08);
+      }
+    }
+    /** Blur + decay so wakes spread out like ripples and fade. */
+    diffuse(dt) {
+      const { cols, rows, energy, energyTmp: tmp, heat } = this;
+      const decay = Math.exp(-dt * 1.5);
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const i = r * cols + c;
+          const l = c > 0 ? energy[i - 1] : energy[i];
+          const rt = c < cols - 1 ? energy[i + 1] : energy[i];
+          const u = r > 0 ? energy[i - cols] : energy[i];
+          const d = r < rows - 1 ? energy[i + cols] : energy[i];
+          tmp[i] = (energy[i] * 4 + l + rt + u + d) * 0.125 * decay;
+        }
+      }
+      this.energy = tmp;
+      this.energyTmp = energy;
+      const heatDecay = Math.exp(-dt * 2.2);
+      for (let i = 0; i < heat.length; i++) heat[i] *= heatDecay;
+    }
+    // ── sharks ──────────────────────────────────────────────────────────
+    /**
+     * Classify one point against the current shark (spine/arc already built).
+     * Body coordinates: s along the spine (0 snout → 1 tail), v across it.
+     * Writes hit* fields and returns whether the point is on the shark.
+     */
+    sampleShark(px, py, L) {
+      const { arc, segmentData: data, segmentGroups: groups } = this;
+      let bestK = this.nearestSegment, j = bestK * 10;
+      let ax = data[j], ay = data[j + 1], sx = data[j + 2], sy = data[j + 3];
+      let fraction = clamp(((px - ax) * sx + (py - ay) * sy) / data[j + 4], 0, 1);
+      let qx = ax + sx * fraction, qy = ay + sy * fraction;
+      let best = (px - qx) ** 2 + (py - qy) ** 2;
+      let bestU = fraction;
+      for (let group = 0; group < 5; group++) {
+        const g = group * 4;
+        const ex = px < groups[g] ? groups[g] - px : px > groups[g + 1] ? px - groups[g + 1] : 0;
+        const ey = py < groups[g + 2] ? groups[g + 2] - py : py > groups[g + 3] ? py - groups[g + 3] : 0;
+        if (ex * ex + ey * ey > best) continue;
+        for (let k = group * 4; k < Math.min(SHARK_NODES - 1, group * 4 + 4); k++) {
+          if (k === this.nearestSegment) continue;
+          j = k * 10;
+          ax = data[j];
+          ay = data[j + 1];
+          sx = data[j + 2];
+          sy = data[j + 3];
+          fraction = clamp(((px - ax) * sx + (py - ay) * sy) / data[j + 4], 0, 1);
+          qx = ax + sx * fraction;
+          qy = ay + sy * fraction;
+          const d2 = (px - qx) ** 2 + (py - qy) ** 2;
+          if (d2 < best || d2 === best && k < bestK) {
+            best = d2;
+            bestK = k;
+            bestU = fraction;
+          }
+        }
+      }
+      this.nearestSegment = bestK;
+      j = bestK * 10;
+      ax = data[j];
+      ay = data[j + 1];
+      sx = data[j + 2];
+      sy = data[j + 3];
+      const len = data[j + 5];
+      const bestS = (arc[bestK] + bestU * len) / this.arcTotal;
+      const bestSign = sx * (py - ay) - sy * (px - ax) >= 0 ? 1 : -1;
+      const bestNx = -sy / len * bestSign, bestNy = sx / len * bestSign;
+      const a = Math.sqrt(best);
+      const s = bestS;
+      const u = s * L;
+      const shape = this.shape;
+      const w = shape.halfWidth(s) * L;
+      this.hitDist = a;
+      this.hitS = s;
+      this.hitV = a * bestSign;
+      const head = this.shape.head;
+      if (head && u < L * (head.sweep + head.depth + head.notch)) {
+        const span = L * head.span;
+        const r = a / span;
+        const front = L * head.sweep * r * r + L * head.notch * Math.max(0, 1 - r / 0.14);
+        const depth = L * head.depth * (1 - 0.2 * r * r * r * r);
+        if (r <= 1 && u >= front && u <= front + depth) {
+          this.hitFlag = r > 0.84 ? FLAG_EYE : FLAG_BODY;
+          this.hitShade = r > 0.84 ? 0 : 0.62 - 0.2 * r + (u < front + L * 0.012 ? 0.1 : 0);
+          return true;
+        }
+      }
+      if (a <= w) {
+        const across = a / (w || 1);
+        const facing = (bestNx * -0.6 + bestNy * -0.8) * across;
+        let shade = 0.58 - across * across * 0.42 + facing * 0.26;
+        let flag = FLAG_BODY;
+        if (s > shape.dorsal[0] && s < shape.dorsal[1] && across < 0.3) {
+          flag = FLAG_RIDGE;
+          shade = 1;
+        } else if (s > shape.secondDorsal[0] && s < shape.secondDorsal[1] && across < 0.4) {
+          shade = Math.max(shade, 0.82);
+        } else if (shape.eye && s > shape.eye[0] && s < shape.eye[1] && across > 0.6) {
+          flag = FLAG_EYE;
+          shade = 0;
+        } else if (s > shape.gills[0] && s < shape.gills[1] && across > 0.58) {
+          if (Math.floor((s - shape.gills[0]) / (shape.gills[1] - shape.gills[0]) * 5) % 2 === 0) shade *= 0.45;
+        } else if (s < 0.05) {
+          shade = Math.max(shade, 0.7);
+        } else if (shape === SHAPES.zebra && s > 0.08 && s < 0.55 && (across < 0.1 || Math.abs(across - 0.6) < 0.08)) {
+          shade = Math.max(shade, 0.8);
+        } else if (this.marked(s, a * bestSign, L, across)) {
+          flag = FLAG_MARK;
+        }
+        this.hitFlag = flag;
+        this.hitShade = shade;
+        return true;
+      }
+      const tip = bestSign > 0 ? this.finTipRight : this.finTipLeft;
+      const [p0, p1, p2] = shape.pectoral;
+      if (inTriangle(u, a, L * p0, 0, L * p1, 0, L * p2, tip) && // Falcate (sickle) fins get a concave trailing edge.
+      !(shape.falcate && inTriangle(u, a, L * p1, 0, L * (p1 + (p2 - p1) * 0.33), tip * 0.55, L * p2, tip))) {
+        this.hitFlag = this.marked(s, a * bestSign, L, 0) ? FLAG_MARK : FLAG_FIN;
+        this.hitShade = 0.38 + 0.22 * (1 - clamp(a / tip, 0, 1));
+        return true;
+      }
+      const [v0, v1, v2, vr] = shape.pelvic;
+      if (inTriangle(u, a, L * v0, 0, L * v1, 0, L * v2, L * vr) || // Forked caudal fin.
+      shape.caudal > 0 && inTriangle(u, a, L * 0.86, 0, L * 0.95, 0, L, L * shape.caudal)) {
+        this.hitFlag = FLAG_FIN;
+        this.hitShade = 0.36;
+        return true;
+      }
+      return false;
+    }
+    /** Whether a body point (s along, v across) falls on a dark marking. */
+    marked(s, v, L, across) {
+      if (this.shape === SHAPES.tiger) {
+        if (s < 0.2 || s > 0.9 || across > 0.85) return false;
+        const wobble = 0.35 * Math.sin(v / L * 25 + s * 5);
+        const bar = Math.sin(s * Math.PI * 2 * 9 + wobble);
+        return bar > 0.65 - 0.5 * smoothstep(0.2, 0.42, s) + 0.4 * smoothstep(0.8, 0.9, s);
+      }
+      if (this.shape === SHAPES.zebra) {
+        if (s < 0.07) return false;
+        const gu = s * L / (L * 0.06);
+        const gv = v / (L * 0.045);
+        const cu = Math.floor(gu);
+        const cv = Math.floor(gv);
+        const jx = hash3(cu, cv, this.sharkId) * 0.5 + 0.25;
+        const jy = hash3(cu, cv, this.sharkId + 11) * 0.5 + 0.25;
+        return (gu - cu - jx) ** 2 + (gv - cv - jy) ** 2 < 0.08;
+      }
+      return false;
+    }
+    /**
+     * Build a smooth, undulating render spine from the sim spine, then
+     * supersample every cell in the shark's bounding box against the shape.
+     * Fully covered cells become solid skin; partial cells become edge glyphs.
+     */
+    rasterizeSharks(sharks, t) {
+      const { sharkFlag, sharkShade, sharkKey, sharkDepth, sharkKind, sharkShadow, spine, arc, cw, ch, cols, rows } = this;
+      sharkFlag.fill(0);
+      sharkShadow.fill(0);
+      for (const sh of sharks) {
+        const L = sh.length;
+        const N = SHARK_NODES;
+        const n = sh.nodes;
+        const swim = clamp(sh.speed / 60, 0.4, 1.4);
+        this.shape = SHAPES[sh.kind];
+        this.sharkId = sh.id;
+        const kindIndex = KINDS.indexOf(sh.kind);
+        for (let k = 0; k < N; k++) {
+          const s = k / (N - 1);
+          const a = Math.max(0, k - 1);
+          const b = Math.min(N - 1, k + 1);
+          let tx = n[a * 2] - n[b * 2];
+          let ty = n[a * 2 + 1] - n[b * 2 + 1];
+          const tl = Math.hypot(tx, ty) || 1;
+          tx /= tl;
+          ty /= tl;
+          const amp = L * 0.05 * (0.1 + 0.9 * Math.pow(s, 1.8)) * swim;
+          const off = amp * Math.sin(sh.phase - s * 5.2);
+          spine[k * 2] = n[k * 2] - ty * off;
+          spine[k * 2 + 1] = n[k * 2 + 1] + tx * off;
+        }
+        arc[0] = 0;
+        for (let k = 1; k < N; k++) {
+          arc[k] = arc[k - 1] + Math.hypot(spine[k * 2] - spine[(k - 1) * 2], spine[k * 2 + 1] - spine[(k - 1) * 2 + 1]);
+        }
+        this.arcTotal = arc[N - 1] || 1;
+        for (let k = 0; k < N - 1; k++) {
+          const j = k * 10, ax = spine[k * 2], ay = spine[k * 2 + 1];
+          const bx = spine[(k + 1) * 2], by = spine[(k + 1) * 2 + 1];
+          const sx = bx - ax, sy = by - ay, len2 = sx * sx + sy * sy || 1;
+          const data = this.segmentData;
+          data[j] = ax;
+          data[j + 1] = ay;
+          data[j + 2] = sx;
+          data[j + 3] = sy;
+          data[j + 4] = len2;
+          data[j + 5] = Math.sqrt(len2);
+          data[j + 6] = Math.min(ax, bx);
+          data[j + 7] = Math.max(ax, bx);
+          data[j + 8] = Math.min(ay, by);
+          data[j + 9] = Math.max(ay, by);
+        }
+        this.nearestSegment = 0;
+        for (let group = 0; group < 5; group++) {
+          let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+          for (let k = group * 4; k < Math.min(N - 1, group * 4 + 4); k++) {
+            const j = k * 10, data = this.segmentData;
+            x0 = Math.min(x0, data[j + 6]);
+            x1 = Math.max(x1, data[j + 7]);
+            y0 = Math.min(y0, data[j + 8]);
+            y1 = Math.max(y1, data[j + 9]);
+          }
+          const g = group * 4;
+          this.segmentGroups[g] = x0;
+          this.segmentGroups[g + 1] = x1;
+          this.segmentGroups[g + 2] = y0;
+          this.segmentGroups[g + 3] = y1;
+        }
+        const bank = clamp(sh.turn * 0.45, -0.35, 0.35);
+        const flex = 1 + 0.06 * Math.sin(sh.phase * 0.5);
+        const reachFin = this.shape.pectoral[3];
+        this.finTipRight = L * reachFin * flex * (1 - bank);
+        this.finTipLeft = L * reachFin * flex * (1 + bank);
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        for (let k = 0; k < N; k++) {
+          minX = Math.min(minX, spine[k * 2]);
+          maxX = Math.max(maxX, spine[k * 2]);
+          minY = Math.min(minY, spine[k * 2 + 1]);
+          maxY = Math.max(maxY, spine[k * 2 + 1]);
+        }
+        const reach = L * 0.36;
+        const c0 = Math.max(0, Math.floor((minX - reach) / cw));
+        const c1 = Math.min(cols - 1, Math.floor((maxX + reach) / cw));
+        const r0 = Math.max(0, Math.floor((minY - reach) / ch));
+        const r1 = Math.min(rows - 1, Math.floor((maxY + reach) / ch));
+        if (c0 > c1 || r0 > r1) continue;
+        const skipBeyond = reach + Math.hypot(cw, ch);
+        const shadowDc = Math.round(L * 0.035 / cw) + 1;
+        const shadowDr = Math.round(L * 0.02 / ch) + 1;
+        for (let r = r0; r <= r1; r++) {
+          for (let c = c0; c <= c1; c++) {
+            if (this.occluded[r * cols + c]) continue;
+            const x = c * cw;
+            const y = r * ch;
+            const centerHit = this.sampleShark(x + cw / 2, y + ch / 2, L);
+            if (!centerHit && this.hitDist > skipBeyond) continue;
+            const flag = this.hitFlag;
+            const shade = this.hitShade;
+            const s = this.hitS;
+            const v = this.hitV;
+            let hits = centerHit ? 1 : 0;
+            for (let k = 0; k < this.edgeSamples * 2; k += 2) {
+              if (this.sampleShark(x + SUBSAMPLES[k] * cw, y + SUBSAMPLES[k + 1] * ch, L)) hits++;
+            }
+            if (hits === 0) continue;
+            const coverage = hits / (1 + this.edgeSamples);
+            const i = r * cols + c;
+            const key = hash3(Math.round(s * 52), Math.round(v / (cw * 0.9)), sh.id) * 4294967295 >>> 0;
+            sharkKey[i] = key;
+            sharkDepth[i] = sh.depth;
+            sharkKind[i] = kindIndex;
+            if (centerHit && coverage >= 0.6) {
+              sharkFlag[i] = flag;
+              const flicker = (hash3(c, r, Math.floor(t * 6)) - 0.5) * 0.06;
+              sharkShade[i] = clamp(shade + flicker, 0, 1);
+              const sc = c + shadowDc;
+              const sr = r + shadowDr;
+              if (sc < cols && sr < rows) sharkShadow[sr * cols + sc] = 1;
+            } else {
+              sharkFlag[i] = FLAG_EDGE;
+              sharkShade[i] = coverage;
+            }
+          }
+        }
+      }
+    }
+    drawSharks(t) {
+      const { ctx, cols, rows, cw, ch, sharkFlag, sharkShade, sharkKey, sharkDepth, sharkKind } = this;
+      const n = cols * rows;
+      for (let i = 0; i < n; i++) {
+        const flag = sharkFlag[i];
+        if (!flag) continue;
+        const col = i % cols;
+        const row = i / cols | 0;
+        const x = col * cw;
+        const y = row * ch;
+        const key = sharkKey[i];
+        const shade = sharkShade[i];
+        const dim = 0.7 + 0.3 * sharkDepth[i];
+        const [tr, tg, tb] = this.bodyTint || SHAPES[KINDS[sharkKind[i]]].tint;
+        const tick = Math.floor(t * 2.4 + key % 997 / 97);
+        const roll = hash3(key, tick, 7);
+        if (flag === FLAG_EDGE) {
+          const set = shade >= 0.5 ? EDGE_HEAVY : EDGE_LIGHT;
+          const g = (70 + shade * 80) * dim;
+          ctx.fillStyle = roll < 0.07 ? (this.paletteAccents || ACCENTS)[key % (this.paletteAccents || ACCENTS).length] : `rgb(${Math.round(g * tr)},${Math.round(g * tg)},${Math.min(255, Math.round(g * tb + 6))})`;
+          ctx.fillText(set[(key >>> 8) % set.length], x + cw / 2, y + ch / 2 + 1);
+          continue;
+        }
+        let level;
+        let glyph;
+        if (flag === FLAG_RIDGE) {
+          level = 226;
+          glyph = RIDGE_GLYPHS[(key >>> 8) % RIDGE_GLYPHS.length];
+        } else if (flag === FLAG_EYE) {
+          level = 12;
+          glyph = "o";
+        } else if (flag === FLAG_MARK) {
+          level = 24 + shade * 22;
+          glyph = MARK_GLYPHS[(key >>> 8) % MARK_GLYPHS.length];
+        } else if (flag === FLAG_FIN) {
+          level = 40 + shade * 120;
+          glyph = FIN_GLYPHS[(key >>> 8) % FIN_GLYPHS.length];
+        } else {
+          level = 46 + shade * 160;
+          const jitter = (key >>> 4) % 3 - 1;
+          glyph = SKIN_RAMP[clamp(Math.floor((1 - shade) * 8.99) + jitter, 0, SKIN_RAMP.length - 1)];
+        }
+        level *= dim;
+        ctx.fillStyle = `rgb(${Math.min(255, Math.round(level * tr))},${Math.min(255, Math.round(level * tg))},${Math.min(255, Math.round(level * tb + 4))})`;
+        ctx.fillRect(x + 1, y + 1, cw - 1, ch - 1);
+        let color;
+        if (flag === FLAG_EYE) color = "#9aa0ad";
+        else if (flag === FLAG_MARK) color = `rgb(${Math.round(70 * tr)},${Math.round(70 * tg)},${Math.round(70 * tb)})`;
+        else if (roll < 0.09) color = (this.paletteAccents || ACCENTS)[key % (this.paletteAccents || ACCENTS).length];
+        else if (roll < 0.13) color = "#ffffff";
+        else color = shade > 0.55 ? "#0e0f13" : "#1b1d24";
+        ctx.fillStyle = color;
+        ctx.fillText(glyph, x + cw / 2, y + ch / 2 + 1);
+      }
+    }
+    // ── fish, dots, heat ────────────────────────────────────────────────
+    /**
+     * Snap each fish to a cell and bucket it by brightness: far fish are dim,
+     * near fish brighter, and turning or panicking fish glint. Nearer fish
+     * claim a cell first when two land in the same one.
+     */
+    markFish(world) {
+      const { fishStamp, fishBuckets, sharkFlag } = this;
+      const frame = ++this.frameId;
+      for (const bucket of fishBuckets) bucket.length = 0;
+      for (let pass = 0; pass < 2; pass++) {
+        for (const f of world.fish) {
+          if (!f.alive || (f.depth > 0.78 ? 0 : 1) !== pass) continue;
+          const i = this.cellIndex(f.x, f.y);
+          if (i < 0 || fishStamp[i] === frame || sharkFlag[i]) continue;
+          fishStamp[i] = frame;
+          const glint = clamp(Math.abs(f.turn) / 3.5, 0, 1);
+          const v = 0.3 + 0.4 * (f.depth - 0.55) / 0.45 + 0.3 * Math.max(glint, f.alarm);
+          fishBuckets[clamp(Math.floor(v * FISH_ALPHAS.length), 0, FISH_ALPHAS.length - 1)].push(i);
+        }
+      }
+    }
+    drawFish() {
+      const { ctx, cw, ch, cols, fishBuckets } = this;
+      for (let b = 0; b < fishBuckets.length; b++) {
+        const bucket = fishBuckets[b];
+        if (!bucket.length) continue;
+        ctx.fillStyle = this.fishStyles[b];
+        for (const i of bucket) {
+          if (this.occluded[i]) continue;
+          ctx.fillText("-", i % cols * cw + cw / 2, (i / cols | 0) * ch + ch / 2 + 1);
+        }
+      }
+    }
+    drawHeat() {
+      const { ctx, heat, cols, cw, ch } = this;
+      for (let i = 0; i < heat.length; i++) {
+        if (this.occluded[i]) continue;
+        const h = heat[i];
+        if (h < 0.08) continue;
+        const col = i % cols;
+        const row = i / cols | 0;
+        ctx.fillStyle = h > 0.5 ? `rgba(255,120,60,${h.toFixed(2)})` : `rgba(220,40,40,${(h * 1.6).toFixed(2)})`;
+        ctx.fillText(h > 0.6 ? "*" : "\xB7", col * cw + cw / 2, row * ch + ch / 2 + 1);
+      }
+    }
+    /**
+     * Every cell's dot twinkles on its own clock, is modulated by slow
+     * caustic light bands, and flares cyan where the wake field is strong.
+     * Dots are bucketed by colour/alpha so each bucket is one fillStyle.
+     */
+    drawDots(t) {
+      const { ctx, cols, rows, cw, ch, dotKind, dotPhase, dotFreq, energy, sharkFlag, sharkShadow, fishStamp, frameId } = this;
+      const { bucketOf, bucketOrder, bucketCounts } = this;
+      const n = cols * rows;
+      const SKIP = bucketCounts.length - 1;
+      bucketCounts.fill(0);
+      for (let i = 0; i < n; i++) {
+        const e = energy[i];
+        const kind = dotKind[i];
+        if (this.occluded[i] || sharkFlag[i] || fishStamp[i] === frameId || kind === 0 && e < 0.45) {
+          bucketOf[i] = SKIP;
+          continue;
+        }
+        let bucket;
+        if (e > 0.45) {
+          const level = clamp(Math.floor((e - 0.45) * 5), 0, ALPHA_LEVELS - 1);
+          bucket = WAKE * ALPHA_LEVELS + level;
+        } else {
+          const col = i % cols;
+          const row = i / cols | 0;
+          const twinkle = 0.5 + 0.5 * Math.sin(t * dotFreq[i] + dotPhase[i]);
+          const caustic = 0.85 + 0.15 * Math.sin(col * 0.11 + t * 0.35) * Math.sin(row * 0.17 - t * 0.27);
+          let v = clamp((0.55 + 0.45 * twinkle) * caustic + e * 2, 0, 1);
+          if (sharkShadow[i]) v *= 0.2;
+          bucket = (kind - 1) * ALPHA_LEVELS + clamp(Math.floor(v * ALPHA_LEVELS), 0, ALPHA_LEVELS - 1);
+        }
+        bucketOf[i] = bucket;
+        bucketCounts[bucket]++;
+      }
+      const starts = this.dotStarts;
+      for (let b = 1; b < bucketCounts.length; b++) starts[b] = starts[b - 1] + bucketCounts[b - 1];
+      const cursor = this.dotCursor;
+      cursor.set(starts);
+      for (let i = 0; i < n; i++) {
+        const b = bucketOf[i];
+        if (b !== SKIP) bucketOrder[cursor[b]++] = i;
+      }
+      const small = Math.max(2, Math.round(cw * 0.19));
+      const large = small + 1;
+      for (let b = 0; b < SKIP; b++) {
+        const count = bucketCounts[b];
+        if (!count) continue;
+        ctx.fillStyle = this.dotStyles[b];
+        const size = b >= WAKE * ALPHA_LEVELS ? large : small;
+        const start = starts[b];
+        for (let k = start; k < start + count; k++) {
+          const i = bucketOrder[k];
+          const col = i % cols;
+          const row = i / cols | 0;
+          ctx.fillRect(Math.round(col * cw + cw * 0.66 - size / 2), Math.round(row * ch + ch * 0.64 - size / 2), size, size);
+        }
+      }
+    }
+  };
+
+  // work/message-glass-v65.ts
+  function createMessageGlass(runtime) {
+    const root = document.documentElement;
+    const style = document.createElement("style");
+    style.id = "cgpt-ascii-message-glass-style";
+    style.textContent = `
+    :root { --cgfc-message-glass-auto-tint:255,255,255; }
+    html.dark:not([data-cgfc-theme="light"]),html[data-cgfc-theme="dark"] { --cgfc-message-glass-auto-tint:16,18,22; }
+    [data-cgfc-liquid-surface="message"] {
+      --cgfc-glass-tint:var(--cgfc-message-glass-auto-tint);
+      --cgfc-glass-fill:var(--cgfc-message-glass-opacity,.18);
+      --cgfc-glass-luminance:var(--cgfc-message-glass-brightness,1);
+      --cgfc-glass-saturation:var(--cgfc-message-glass-saturation,1.12);
+      border-radius:var(--cgfc-message-glass-radius,18px)!important;
+      padding:12px 14px!important;box-sizing:border-box!important;
+      box-shadow:inset 0 1px 0 rgba(255,255,255,calc(var(--cgfc-message-glass-glare,.45)*.22)),0 6px 18px -10px rgba(0,0,0,.18)!important;
+      transition:none!important;
+    }
+    html[data-cgfc-message-glass-custom-tint] [data-cgfc-liquid-surface="message"] { --cgfc-glass-tint:var(--cgfc-message-glass-custom-rgb); }
+  `;
+    (document.head || root).appendChild(style);
+    const entries = /* @__PURE__ */ new Map();
+    let enabled = false, main = null, timer = 0, disposed = false, settingsKey = "", scans = 0;
+    const destroyEntry = (el, entry) => {
+      entry.controller?.destroy();
+      entry.controller = null;
+    };
+    const attach = (el, entry) => {
+      if (!enabled || !entry.visible || !el.isConnected) return;
+      const Glass = runtime.composerLiquidGlass?.constructor;
+      if (!Glass) return;
+      if (!entry.controller) entry.controller = new Glass(runtime, { kind: "message", direct: true, managed: true, sharedStyle: true, enabledAttribute: "data-cgfc-message-glass" });
+      entry.controller.attach(el);
+    };
+    const io = new IntersectionObserver((records) => {
+      for (const record of records) {
+        const entry = entries.get(record.target);
+        if (!entry) continue;
+        entry.visible = record.isIntersecting;
+        if (entry.visible) attach(record.target, entry);
+        else destroyEntry(record.target, entry);
+      }
+    }, { rootMargin: "80px" });
+    const observer = new MutationObserver((records) => {
+      const selector = runtime.dom.message + "," + runtime.dom.content + ", [data-message-content], .whitespace-pre-wrap";
+      if (records.some((r) => [...r.addedNodes, ...r.removedNodes].some((n) => n instanceof Element && (n.matches(selector) || n.querySelector(selector))))) schedule();
+    });
+    function clear() {
+      observer.disconnect();
+      io.disconnect();
+      for (const [el, entry] of entries) destroyEntry(el, entry);
+      entries.clear();
+      main = null;
+    }
+    function scan() {
+      timer = 0;
+      if (disposed || !enabled) return;
+      scans++;
+      const next = runtime.dom.main();
+      if (main !== next) {
+        clear();
+        main = next;
+        if (main) observer.observe(main, { childList: true, subtree: true });
+      }
+      if (!main) return;
+      const wanted = /* @__PURE__ */ new Set(), fresh = [];
+      for (const message of main.querySelectorAll(runtime.dom.assistant)) {
+        if (runtime.dom.isThinkingOverview(message)) continue;
+        const el = runtime.dom.contentRoot(message) || message;
+        wanted.add(el);
+        if (!entries.has(el)) {
+          const entry = { controller: null, visible: false };
+          entries.set(el, entry);
+          io.observe(el);
+          fresh.push([el, entry]);
+        }
+      }
+      for (const [el, entry] of entries) if (!wanted.has(el) || !el.isConnected) {
+        io.unobserve(el);
+        destroyEntry(el, entry);
+        entries.delete(el);
+      }
+      for (const [el, entry] of fresh) {
+        const turn = el.closest(runtime.dom.turn) || el;
+        const r = turn.getBoundingClientRect();
+        entry.visible = r.width > 0 && r.height > 0 && r.bottom > -80 && r.top < innerHeight + 80;
+      }
+      for (const [el, entry] of fresh) if (entry.visible) attach(el, entry);
+    }
+    function schedule() {
+      if (enabled && !timer && !disposed) timer = window.setTimeout(scan, 160);
+    }
+    function refresh() {
+      const active = root.hasAttribute("data-cgfc-message-glass");
+      if (active !== enabled) {
+        enabled = active;
+        if (!enabled) {
+          clearTimeout(timer);
+          timer = 0;
+          clear();
+          return;
+        }
+        scan();
+      } else if (enabled) {
+        scan();
+        for (const [el, entry] of entries) attach(el, entry);
+      }
+      if (document.hidden) for (const entry of entries.values()) entry.controller?.pause();
+    }
+    function onSettings() {
+      const key = [root.hasAttribute("data-cgfc-message-glass"), root.getAttribute("data-cgfc-message-glass-style"), root.getAttribute("data-cgfc-message-glass-render-mode"), ...["blur", "strength", "thickness", "curvature", "bend", "chroma", "radius"].map((name) => root.style.getPropertyValue("--cgfc-message-glass-" + name))].join("|");
+      if (key === settingsKey) return;
+      settingsKey = key;
+      refresh();
+    }
+    function destroy() {
+      disposed = true;
+      enabled = false;
+      clearTimeout(timer);
+      clear();
+      style.remove();
+      document.removeEventListener("cgpt-unified-ui-settings-change", onSettings);
+      document.removeEventListener("visibilitychange", refresh);
+    }
+    document.addEventListener("cgpt-unified-ui-settings-change", onSettings);
+    onSettings();
+    document.addEventListener("visibilitychange", refresh);
+    return { refresh, destroy, followMain: (next) => {
+      if (enabled && next !== main) schedule();
+    }, getState: () => ({ enabled, observed: entries.size, active: [...entries.values()].filter((e) => e.controller).length, scans }) };
+  }
+
+  // work/ocean-controller-v65.ts
+  (() => {
+    "use strict";
+    const runtime = globalThis.__cgptUnifiedRuntimeV1;
+    if (!runtime) return;
+    runtime.asciiSharks?.destroy();
+    const messageGlass = createMessageGlass(runtime);
+    runtime.asciiMessageGlass = messageGlass;
+    const root = document.documentElement;
+    const motion = matchMedia("(prefers-reduced-motion: reduce)");
+    const EDITOR = '#prompt-textarea, textarea[name="prompt-textarea"], .ProseMirror[contenteditable="true"], [data-composer-markdown][contenteditable="true"], [contenteditable="true"][role="textbox"]';
+    const layerStyle = document.createElement("style");
+    layerStyle.id = "cgpt-unified-ascii-layer-style";
+    layerStyle.textContent = '[data-cgpt-ascii-foreground="position"]{position:relative!important;z-index:1!important}[data-cgpt-ascii-foreground="stack"]{z-index:1!important}';
+    (document.head || root).appendChild(layerStyle);
+    let canvas = null, world = null, renderer = null;
+    let foreground = /* @__PURE__ */ new Set();
+    let raf = 0, frameTimer = 0, timer = 0, last = 0, acc = 0, fieldAcc = 0, layoutAt = -Infinity, busyAt = -Infinity;
+    let width = 0, height = 0, dpr = 1, species = "", density = 90, quality = "balanced";
+    let disposed = false, suspended = false, enabled = false, busy = false, pauseBusy = true;
+    let opacity = 0.65, fps = 12, homeCoverage = "full", chatCoverage = "gutter", coverage = "gutter";
+    let scene = "chat", scenePlaced = false, layoutDirty = true, pointerEnabled = false, pointerBound = false;
+    let firstFrame = true;
+    let colorMode = "auto", colorSeed = 0, bodyColor = "#7ed8f0", accentColor = "#c79aff", fishColor = "#b8e7f7", wakeColor = "#55d8ea";
+    const sessionSeed = Math.floor(Math.random() * 2147483647);
+    let paletteKey = "", masks = [], scrollbarMasks = [], reading = null;
+    let settingsKey = "";
+    let drawable = false, currentMain = null, scrollerNodes = [], scrollerKey = null;
+    let mountedShell = null, mountedMain = null, mountedScene = "";
+    let layoutReads = 0, drawnFrames = 0, frameCallbacks = 0, fieldTicks = 0, meanWorkMs = 0;
+    const insideMask = (x, y) => masks.some((r) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h);
+    function stopFrames() {
+      cancelAnimationFrame(raf);
+      raf = 0;
+      clearTimeout(frameTimer);
+      frameTimer = 0;
+    }
+    function queueFrame() {
+      if (raf || frameTimer || !allowed() || motion.matches) return;
+      const target = quality === "eco" ? Math.min(fps, 18) : fps;
+      const delay = last ? 1e3 / target - (performance.now() - last) - 2 : 0;
+      if (delay > 16) frameTimer = window.setTimeout(() => {
+        frameTimer = 0;
+        raf = requestAnimationFrame(frame);
+      }, delay);
+      else raf = requestAnimationFrame(frame);
+    }
+    function clearForeground() {
+      for (const el of foreground) el.removeAttribute("data-cgpt-ascii-foreground");
+      foreground.clear();
+    }
+    function release() {
+      stopFrames();
+      canvas?.remove();
+      canvas = null;
+      world = null;
+      renderer = null;
+      clearForeground();
+      width = height = 0;
+      last = acc = fieldAcc = 0;
+      scenePlaced = false;
+      paletteKey = "";
+      scrollerKey = null;
+      mountedShell = mountedMain = null;
+      mountedScene = "";
+    }
+    function create() {
+      firstFrame = true;
+      canvas = document.createElement("canvas");
+      canvas.id = "cgpt-unified-ascii-ocean";
+      canvas.setAttribute("aria-hidden", "true");
+      canvas.setAttribute("role", "presentation");
+      canvas.style.cssText = 'position:fixed!important;top:0!important;left:0!important;pointer-events:none!important;user-select:none!important;z-index:0!important;background:transparent!important;font-family:Consolas,"Courier New",monospace!important;contain:strict!important;';
+      const kinds = species === "mixed" ? ["hammerhead", "tiger", "mako", "thresher"] : Array(4).fill(species || "classic");
+      world = new World(kinds.map((kind, i) => ({ kind, size: [1, 0.7, 0.84, 0.77][i] })), density);
+      renderer = new AsciiRenderer(canvas);
+      renderer.setFontFamily('Consolas,"Courier New",monospace');
+      renderer.setDetail(quality === "eco");
+      renderer.setExternalFieldClock(true);
+    }
+    function readBusy(editor) {
+      const visible = (el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== "hidden";
+      if ([...document.querySelectorAll('[data-testid="stop-button"], [data-testid="composer-stop-button"], [data-testid*="stop-generating"]')].some(visible)) return true;
+      const shell = editor?.closest("form, [data-chatgpt-composer]");
+      return [...shell?.querySelectorAll('button,[role="button"]') || []].some((el) => visible(el) && /^(?:stop(?: (?:generating|streaming|response))?|停止(?:生成|回答)?|中止生成)$/i.test((el.getAttribute("aria-label") || el.getAttribute("title") || el.textContent || "").trim()));
+    }
+    function mount(main, shell, first) {
+      if (mountedMain === main && mountedShell === shell && mountedScene === scene && canvas?.isConnected && [...foreground].every((el) => el.isConnected)) return;
+      let host = main;
+      for (let el = shell?.parentElement; el && el !== main; el = el.parentElement) {
+        if (getComputedStyle(el).isolation === "isolate" && (!first || el.contains(first))) {
+          host = el;
+          break;
+        }
+      }
+      if (canvas.parentElement !== host) {
+        clearForeground();
+        host.appendChild(canvas);
+        scrollerKey = null;
+      }
+      const next = /* @__PURE__ */ new Set();
+      const targets = [shell, first, main.querySelector("h1")];
+      for (const target of targets) {
+        if (!target || !host.contains(target)) continue;
+        let branch = target;
+        while (branch.parentElement && branch.parentElement !== host) branch = branch.parentElement;
+        if (branch.parentElement !== host || branch === canvas) continue;
+        const s = getComputedStyle(branch), z = Number(s.zIndex);
+        if (foreground.has(branch) || s.zIndex === "auto" || z <= 0) {
+          const kind = foreground.has(branch) ? branch.getAttribute("data-cgpt-ascii-foreground") : s.position === "static" ? "position" : "stack";
+          branch.setAttribute("data-cgpt-ascii-foreground", kind);
+          next.add(branch);
+        }
+      }
+      for (const el of foreground) if (!next.has(el)) el.removeAttribute("data-cgpt-ascii-foreground");
+      foreground = next;
+      mountedShell = shell;
+      mountedMain = main;
+      mountedScene = scene;
+    }
+    function colorRgb(hex) {
+      return [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+    }
+    function hsl(h, s, l) {
+      const a = s * Math.min(l, 1 - l), f = (n) => {
+        const k = (n + h / 30) % 12;
+        return Math.round(255 * (l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1))));
+      };
+      return [f(0), f(8), f(4)];
+    }
+    function applyPalette() {
+      const light = root.getAttribute("data-cgfc-theme") === "light" || root.classList.contains("light");
+      const key = [colorMode, colorSeed, bodyColor, accentColor, fishColor, wakeColor, light].join("|");
+      if (key === paletteKey) return;
+      paletteKey = key;
+      let body = colorRgb(bodyColor), accent = accentColor, fish = colorRgb(fishColor), wake = colorRgb(wakeColor);
+      if (colorMode === "original") {
+        renderer.setPalette(null, "#e0892c", [230, 238, 255], [110, 230, 255]);
+        canvas.style.filter = light ? "brightness(.55)" : "none";
+        return;
+      }
+      canvas.style.filter = "none";
+      if (colorMode === "auto") {
+        body = colorRgb(light ? "#3f7286" : "#8dd8ea");
+        accent = light ? "#7e4ba3" : "#c79aff";
+        fish = colorRgb(light ? "#355e70" : "#b8e7f7");
+        wake = colorRgb(light ? "#208ca6" : "#55d8ea");
+      } else if (colorMode !== "custom") {
+        const hue = colorMode === "cyan" ? 190 : colorMode === "aurora" ? 265 : colorMode === "warm" ? 30 : (colorSeed || sessionSeed) % 360;
+        body = hsl(hue, 0.65, light ? 0.39 : 0.72);
+        fish = hsl((hue + 15) % 360, 0.6, light ? 0.32 : 0.83);
+        wake = hsl((hue + 40) % 360, 0.75, light ? 0.42 : 0.65);
+        accent = "rgb(" + hsl((hue + 110) % 360, 0.85, light ? 0.45 : 0.7).join(",") + ")";
+      }
+      renderer.setPalette(body, accent, fish, wake);
+    }
+    function contentRect(el) {
+      const content = runtime.dom.contentRoot(el) || el;
+      const r = content.getBoundingClientRect();
+      if (r.width < 1) return null;
+      const s = getComputedStyle(content);
+      let l = r.left + parseFloat(s.paddingLeft || "0") + parseFloat(s.borderLeftWidth || "0");
+      let rr = r.right - parseFloat(s.paddingRight || "0") - parseFloat(s.borderRightWidth || "0");
+      if (r.width > currentMain.clientWidth * 0.92) {
+        const block = content.matches("p,h1,h2,h3,h4,pre,table,li") ? content : content.querySelector("p,h1,h2,h3,h4,pre,table,li");
+        if (block) {
+          const br = block.getBoundingClientRect();
+          if (br.width > 0) {
+            l = br.left;
+            rr = br.right;
+          }
+        }
+      }
+      return new DOMRect(l, r.top, Math.max(0, rr - l), r.height);
+    }
+    function updateLayout() {
+      if (!canvas || !world || !renderer) return;
+      layoutReads++;
+      const w = root.clientWidth, h = innerHeight, ratio = Math.min(devicePixelRatio || 1, quality === "eco" ? 1 : quality === "fine" ? 1.5 : 1.25);
+      if (w !== width || h !== height || ratio !== dpr) {
+        width = w;
+        height = h;
+        dpr = ratio;
+        renderer.resize(w, h, dpr);
+        world.resize(w, h, renderer.cellWidth, renderer.cellHeight);
+        canvas.style.setProperty("width", `${w}px`, "important");
+        canvas.style.setProperty("height", `${h}px`, "important");
+      }
+      const main = runtime.dom.main();
+      currentMain = main;
+      messageGlass.followMain(main);
+      masks = [];
+      scrollbarMasks = [];
+      reading = null;
+      if (!main) {
+        drawable = false;
+        layoutDirty = false;
+        return;
+      }
+      const bounds = main.getBoundingClientRect();
+      if (bounds.width < 1) {
+        drawable = false;
+        layoutDirty = false;
+        return;
+      }
+      const mainLeft = Math.max(0, bounds.left), mainRight = Math.min(w, bounds.right);
+      const editor = main.querySelector(EDITOR), shell = editor?.closest('[data-composer-surface="true"], [data-composer-surface-variant], form, [data-chatgpt-composer]') || editor;
+      const first = main.querySelector(runtime.dom.message);
+      scene = first ? "chat" : "home";
+      coverage = scene === "home" ? homeCoverage : chatCoverage;
+      mount(main, shell, first);
+      masks.push({ x: 0, y: 0, w: mainLeft, h }, { x: mainRight, y: 0, w: w - mainRight, h });
+      let left = mainRight, right = mainLeft;
+      if (coverage === "gutter") {
+        const samples = /* @__PURE__ */ new Set(), center = (mainLeft + mainRight) / 2;
+        for (const y of [8, h * 0.18, h * 0.4, h * 0.64, h * 0.84]) for (const x of [center, mainLeft + (mainRight - mainLeft) * 0.34]) {
+          const hit = document.elementFromPoint(x, y), message = hit?.closest(runtime.dom.message);
+          if (message && main.contains(message)) samples.add(message);
+        }
+        if (!samples.size && first) samples.add(first);
+        for (const message of samples) {
+          const r = contentRect(message);
+          if (r) {
+            left = Math.min(left, r.left);
+            right = Math.max(right, r.right);
+          }
+        }
+        if (left > right) {
+          const r = shell?.getBoundingClientRect();
+          left = r?.left ?? mainLeft;
+          right = r?.right ?? mainRight;
+        }
+        left = Math.max(mainLeft, left - 3);
+        right = Math.min(mainRight, right + 3);
+        reading = { x: left, y: 0, w: Math.max(0, right - left), h };
+        masks.push(reading);
+      }
+      if (!scenePlaced && (coverage === "full" || left - mainLeft >= 50 && mainRight - right >= 50)) {
+        scenePlaced = true;
+        if (coverage === "gutter") {
+          const centers = [(mainLeft + left) / 2, (right + mainRight) / 2];
+          for (const [i, f] of world.fish.entries()) {
+            const side = i % 2, span = side ? mainRight - right : left - mainLeft;
+            f.x = centers[side] + Math.sin(i * 2.4) * Math.min(70, span * 0.3);
+            f.y = 32 + i % 17 / 17 * Math.max(1, h - 64);
+          }
+          for (const [i, shark] of world.sharks.entries()) {
+            const heading = i < 2 ? Math.PI / 2 : -Math.PI / 2;
+            shark.heading = heading;
+            for (let n = 0; n < shark.nodes.length / 2; n++) {
+              shark.nodes[n * 2] = centers[i % 2];
+              shark.nodes[n * 2 + 1] = h * (i < 2 ? 0.68 : 0.32) - Math.sin(heading) * shark.length * n / (shark.nodes.length / 2 - 1);
+            }
+          }
+        }
+      }
+      const anchor = editor || first || main;
+      if (scrollerKey !== anchor) {
+        scrollerKey = anchor;
+        const set = /* @__PURE__ */ new Set([main, root]);
+        for (const sample of [editor, first]) for (let el = sample; el && el !== document.body; el = el.parentElement) if (el instanceof HTMLElement) set.add(el);
+        scrollerNodes = [...set];
+      }
+      for (const el of scrollerNodes) {
+        if (!el.isConnected) continue;
+        const ch = el.clientHeight, cw = el.clientWidth;
+        if (ch < 1 || cw < 1) continue;
+        const vertical = el.scrollHeight > ch + 1, horizontal = el.scrollWidth > cw + 1;
+        if (!vertical && !horizontal) continue;
+        const isRoot = el === root, s = getComputedStyle(el), r = el.getBoundingClientRect();
+        if (vertical && (isRoot || /auto|scroll|overlay/.test(s.overflowY))) {
+          const track = Math.max(12, el.offsetWidth - cw);
+          scrollbarMasks.push({ x: isRoot ? w - 12 : s.direction === "rtl" ? r.left : r.right - track, y: isRoot ? 0 : r.top, w: track, h: isRoot ? h : r.height });
+        }
+        if (horizontal && (isRoot || /auto|scroll|overlay/.test(s.overflowX))) {
+          const track = Math.max(12, el.offsetHeight - ch);
+          scrollbarMasks.push({ x: isRoot ? 0 : r.left, y: isRoot ? h - track : r.bottom - track, w: isRoot ? w : r.width, h: track });
+        }
+      }
+      masks.push(...scrollbarMasks);
+      renderer.setOcclusion(masks);
+      drawable = coverage !== "off" && h > 200 && (coverage === "full" || Math.max(left - mainLeft, mainRight - right) >= 40);
+      if (canvas.style.opacity !== String(opacity)) canvas.style.opacity = String(opacity);
+      applyPalette();
+      layoutAt = performance.now();
+      layoutDirty = false;
+      if (performance.now() - busyAt > 600) {
+        busy = pauseBusy && readBusy(editor);
+        busyAt = performance.now();
+      }
+    }
+    function draw(dt) {
+      renderer.render(world, dt);
+      const g = canvas.getContext("2d");
+      g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      for (const r of masks) g.clearRect(r.x, r.y, r.w, r.h);
+      const state = motion.matches ? "reduced-motion" : "running";
+      if (canvas.dataset.state !== state) canvas.dataset.state = state;
+      drawnFrames++;
+      firstFrame = false;
+    }
+    function allowed() {
+      return enabled && !disposed && !suspended && !document.hidden && drawable && !(pauseBusy && busy);
+    }
+    function frame(now) {
+      raf = 0;
+      frameCallbacks++;
+      try {
+        if (!allowed() || motion.matches) return;
+        if (!last) last = now;
+        const target = quality === "eco" ? Math.min(fps, 18) : fps;
+        if (now - last >= 1e3 / target) {
+          const start = performance.now();
+          if (layoutDirty && now - layoutAt >= 140 || now - layoutAt > 1200) updateLayout();
+          if (!allowed()) {
+            refresh();
+            return;
+          }
+          const dt = Math.min(0.5, (now - last) / 1e3);
+          last = now;
+          acc += dt;
+          let steps = 0;
+          while (acc >= 1 / 60 && steps++ < 30) {
+            world.step(1 / 60);
+            acc -= 1 / 60;
+            fieldAcc += 1 / 60;
+            while (fieldAcc >= 1 / 24) {
+              renderer.advanceFields(world, 1 / 24);
+              fieldAcc -= 1 / 24;
+              fieldTicks++;
+            }
+          }
+          if (steps >= 30) acc = 0;
+          draw(dt);
+          const work = performance.now() - start;
+          meanWorkMs = meanWorkMs ? meanWorkMs * 0.9 + work * 0.1 : work;
+        }
+        queueFrame();
+      } catch (error) {
+        fail(error);
+      }
+    }
+    function refresh() {
+      if (disposed) return;
+      try {
+        if (!enabled || suspended) {
+          release();
+          return;
+        }
+        if (!document.body) return;
+        if (document.hidden) {
+          stopFrames();
+          if (canvas) {
+            canvas.hidden = true;
+            canvas.dataset.state = "hidden";
+          }
+          last = acc = 0;
+          return;
+        }
+        if (!canvas) create();
+        updateLayout();
+        canvas.hidden = !allowed();
+        if (!allowed()) {
+          stopFrames();
+          last = acc = 0;
+          canvas.dataset.state = busy ? "generating" : coverage === "off" ? "scene-off" : "no-gutter";
+          return;
+        }
+        const activeState = motion.matches ? "reduced-motion" : "running";
+        if (canvas.dataset.state !== activeState) canvas.dataset.state = activeState;
+        if (motion.matches) {
+          stopFrames();
+          last = acc = 0;
+          draw(1 / 60);
+        } else {
+          if (firstFrame) draw(1 / 60);
+          queueFrame();
+        }
+      } catch (error) {
+        fail(error);
+      }
+    }
+    function readNumber(name, fallback, min, max) {
+      const value = Number(root.getAttribute(name));
+      return Number.isFinite(value) && root.hasAttribute(name) ? Math.max(min, Math.min(max, value)) : fallback;
+    }
+    function readColor(name, fallback) {
+      const value = root.getAttribute(name) || "";
+      return /^#[\da-f]{6}$/i.test(value) ? value : fallback;
+    }
+    function settingsChanged() {
+      const key = JSON.stringify(["ocean", "opacity", "fps", "species", "density", "quality", "pause-busy", "coverage", "home-coverage", "pointer", "color-mode", "color-seed", "body-color", "accent-color", "fish-color", "wake-color"].map((name) => root.getAttribute("data-cgfc-ascii-" + name))) + "|" + root.getAttribute("data-cgfc-theme");
+      if (key === settingsKey) {
+        if (enabled && !canvas) refresh();
+        return;
+      }
+      settingsKey = key;
+      const nextSpecies = root.getAttribute("data-cgfc-ascii-species") || "classic";
+      const nextDensity = readNumber("data-cgfc-ascii-density", 90, 40, 160), nextQuality = root.getAttribute("data-cgfc-ascii-quality") || "balanced";
+      if (species !== nextSpecies || density !== nextDensity || quality !== nextQuality) {
+        release();
+        species = nextSpecies;
+        density = nextDensity;
+        quality = nextQuality;
+      }
+      enabled = root.hasAttribute("data-cgfc-ascii-ocean");
+      opacity = readNumber("data-cgfc-ascii-opacity", 0.65, 0.15, 0.9);
+      const nextFps = readNumber("data-cgfc-ascii-fps", 12, 3, 30);
+      if (nextFps !== fps) stopFrames();
+      fps = nextFps;
+      pauseBusy = root.hasAttribute("data-cgfc-ascii-pause-busy");
+      busyAt = -Infinity;
+      const range = root.getAttribute("data-cgfc-ascii-coverage");
+      chatCoverage = range === "full" || range === "glass" ? range : "gutter";
+      homeCoverage = root.getAttribute("data-cgfc-ascii-home-coverage") === "off" ? "off" : "full";
+      pointerEnabled = root.hasAttribute("data-cgfc-ascii-pointer");
+      syncPointerListeners();
+      colorMode = root.getAttribute("data-cgfc-ascii-color-mode") || "auto";
+      colorSeed = readNumber("data-cgfc-ascii-color-seed", 0, 0, 2147483647);
+      bodyColor = readColor("data-cgfc-ascii-body-color", "#7ed8f0");
+      accentColor = readColor("data-cgfc-ascii-accent-color", "#c79aff");
+      fishColor = readColor("data-cgfc-ascii-fish-color", "#b8e7f7");
+      wakeColor = readColor("data-cgfc-ascii-wake-color", "#55d8ea");
+      clearInterval(timer);
+      timer = 0;
+      if (enabled) timer = window.setInterval(() => {
+        if (!document.hidden && !suspended) refresh();
+      }, 1e3);
+      refresh();
+    }
+    function pointerMove(e) {
+      if (!world || !canvas || canvas.hidden || motion.matches) return;
+      const blocked = e.target?.closest?.('button,a,input,textarea,[contenteditable],[role="button"]');
+      world.pointer = { x: e.clientX, y: e.clientY, active: e.pointerType !== "touch" && !blocked && !insideMask(e.clientX, e.clientY) };
+    }
+    function pointerDown(e) {
+      pointerMove(e);
+      if (e.button === 0 && world?.pointer.active) world.splash(e.clientX, e.clientY);
+    }
+    function leave() {
+      if (world) world.pointer.active = false;
+    }
+    function syncPointerListeners() {
+      const bind = enabled && pointerEnabled && !disposed;
+      if (bind === pointerBound) return;
+      pointerBound = bind;
+      if (bind) {
+        window.addEventListener("pointermove", pointerMove, { passive: true });
+        window.addEventListener("pointerdown", pointerDown, { passive: true });
+        window.addEventListener("blur", leave);
+        root.addEventListener("pointerleave", leave);
+      } else {
+        window.removeEventListener("pointermove", pointerMove);
+        window.removeEventListener("pointerdown", pointerDown);
+        window.removeEventListener("blur", leave);
+        root.removeEventListener("pointerleave", leave);
+        leave();
+      }
+    }
+    function layoutChanged() {
+      if (!enabled || disposed || suspended || document.hidden) return;
+      layoutDirty = true;
+      if (motion.matches || !raf && !frameTimer) refresh();
+    }
+    function pageHide() {
+      suspended = true;
+      release();
+    }
+    function pageShow() {
+      suspended = false;
+      refresh();
+    }
+    function fail(error) {
+      console.warn("[ChatGPT ASCII Ocean] \u88C5\u9970\u5C42\u5DF2\u505C\u6B62\uFF0C\u5DE5\u5177\u7BB1\u7EE7\u7EED\u8FD0\u884C\u3002", error);
+      destroy();
+    }
+    const themeObserver = new MutationObserver(() => {
+      layoutDirty = true;
+      if (enabled && motion.matches) refresh();
+    });
+    themeObserver.observe(root, { attributes: true, attributeFilter: ["class", "data-cgfc-theme", "data-theme"] });
+    function destroy() {
+      disposed = true;
+      release();
+      messageGlass.destroy();
+      clearInterval(timer);
+      timer = 0;
+      syncPointerListeners();
+      themeObserver.disconnect();
+      layerStyle.remove();
+      document.removeEventListener("cgpt-unified-ui-settings-change", settingsChanged);
+      document.removeEventListener("visibilitychange", refresh);
+      document.removeEventListener("DOMContentLoaded", settingsChanged);
+      motion.removeEventListener("change", refresh);
+      window.removeEventListener("resize", layoutChanged);
+      window.removeEventListener("pagehide", pageHide);
+      window.removeEventListener("pageshow", pageShow);
+      document.removeEventListener("scroll", layoutChanged, true);
+    }
+    runtime.asciiSharks = { destroy, refresh, getState: () => ({ enabled, disposed, scene, coverage, homeCoverage, chatCoverage, state: canvas?.dataset.state || "off", fps, quality, density, colorMode, colorSeed, pointerEnabled, pointerBound, pointerActive: world?.pointer.active || false, fish: world?.fish.length || 0, sharks: world?.sharks.map((s) => s.kind) || [], masks, reading, scrollbarMasks, time: world?.time || 0, foreground: [...foreground].map((e) => e.tagName), layoutReads, drawnFrames, frameCallbacks, fieldTicks, meanWorkMs, occludedCells: renderer?.getOccludedCells() || 0 }) };
+    document.addEventListener("cgpt-unified-ui-settings-change", settingsChanged);
+    document.addEventListener("visibilitychange", refresh);
+    motion.addEventListener("change", refresh);
+    window.addEventListener("resize", layoutChanged, { passive: true });
+    window.addEventListener("pagehide", pageHide);
+    window.addEventListener("pageshow", pageShow);
+    document.addEventListener("scroll", layoutChanged, { capture: true, passive: true });
+    if (document.body) settingsChanged();
+    else document.addEventListener("DOMContentLoaded", settingsChanged, { once: true });
+  })();
+})();
+
+    } catch (error) { console.warn('[ChatGPT ASCII Ocean] 装饰层未启动，工具箱继续运行。', error); }
+    // END ASCII OCEAN ADAPTER
     bootstrapState = 'bundles-evaluated';
     stampBootstrap();
   } catch (error) {

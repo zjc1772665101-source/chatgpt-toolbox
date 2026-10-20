@@ -1,5 +1,11 @@
 # Third-Party Notices
 
+## ASCII Sharks
+
+ASCII 海洋的世界模拟与字符绘制改编自 [stackedlol/ascii-sharks](https://github.com/stackedlol/ascii-sharks)，固定源提交为 `c521e24a787e6d4cc460d4cf2b9815f25e4fe453`。
+
+本项目增加浏览器画布适配、页面遮罩、独立设置、帧率调度、配色、缓存及回答玻璃连接。该上游快照未提供 LICENSE 文件；此处保留来源归属，不将本仓库的 GPL 声明作为上游的许可授权。
+
 ## ChatGPT Lazy Chat++
 
 本项目的长对话性能模块包含并修改了以下 GPL 项目中的代码：
