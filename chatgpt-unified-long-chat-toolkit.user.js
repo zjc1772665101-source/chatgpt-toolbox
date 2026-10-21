@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 工具箱
 // @namespace    local.codex.chatgpt.unified
-// @version      1.6.79
-// @description  ChatGPT 长对话工具箱；独立玻璃参数与折叠设置、GPU 海洋与轨迹回放、新版输入框与顶栏适配、269 项界面默认设置。
+// @version      1.6.81
+// @description  ChatGPT 长对话工具箱；独立玻璃参数与折叠设置、GPU 海洋与轨迹回放、新版输入框与顶栏适配、272 项界面默认设置。
 // @author       Codex；含 Alex S Hamilton 的 ChatGPT Lazy Chat++（GPL-3.0-or-later）
 // @homepageURL  https://github.com/zjc1772665101-source/chatgpt-toolbox
 // @supportURL   https://github.com/zjc1772665101-source/chatgpt-toolbox/issues
@@ -51,7 +51,7 @@
   const stampBootstrap = () => {
     const root = document.documentElement;
     if (!root) return;
-    root.setAttribute('data-cgpt-unified-version', '1.6.79');
+    root.setAttribute('data-cgpt-unified-version', '1.6.81');
     root.setAttribute('data-cgpt-unified-surface', isFrame ? (allowedSurface ? 'side-chat' : 'other-frame') : 'tab');
     root.setAttribute('data-cgpt-unified-bootstrap', bootstrapState);
   };
@@ -69,7 +69,7 @@
   const PROMPT_STORAGE_KEY = 'cgpt-unified-prompt-library-v1';
   const runtime = globalThis[RUNTIME_KEY] || (globalThis[RUNTIME_KEY] = {});
 
-  runtime.version = '1.6.79';
+  runtime.version = '1.6.81';
   // Shared scheduling for navigation and floating UI. Cache only during a
   // synchronous read phase; never retain DOM snapshots across frames/awaits.
   runtime.pageWork = (() => {
@@ -97,6 +97,31 @@
         if (!clients.size) { resizeObserver.unobserve(element); sizeClients.delete(element); }
         if (!sizeClients.size) { resizeObserver.disconnect(); resizeObserver = null; }
       } };
+    }
+
+    // Native boundary/elastic scrolling can emit scroll notifications without
+    // changing a DOM scroll offset. Each subscriber keeps its own history so
+    // one module cannot consume an event needed by another module.
+    function onScrollChange(callback) {
+      const positions = new WeakMap();
+      return event => {
+        if (event?.type === 'scroll') {
+          const target = event.target;
+          let position = null;
+          if (target && target === window.visualViewport) {
+            position = [target.offsetLeft, target.offsetTop, target.width, target.height, target.scale].join('|');
+          } else if (target === document || target === window) {
+            position = [window.scrollX, window.scrollY].join('|');
+          } else if (target && typeof target.scrollTop === 'number' && typeof target.scrollLeft === 'number') {
+            position = [target.scrollLeft, target.scrollTop].join('|');
+          }
+          if (position !== null) {
+            if (positions.get(target) === position) return;
+            positions.set(target, position);
+          }
+        }
+        return callback(event);
+      };
     }
 
     function fresh() { cache = new WeakMap(); }
@@ -153,7 +178,7 @@
       entry.observer.observe(entry.root, options);
     }
     return {
-      observeSize,
+      observeSize, onScrollChange,
       requestFrame: callback => request(callback),
       requestLayout: (callback, priority = 0) => request(callback, true, priority),
       cancelFrame(id) { jobs.delete(id); if (!jobs.size && raf) { cancelAnimationFrame(raf); raf = 0; } },
@@ -169,7 +194,7 @@
         deliver(entry, entry.observer.takeRecords());
         const item = { options, callback }; entry.clients.add(item); reobserve(entry);
         let disconnected = false;
-        return { disconnect() { if (disconnected) return; disconnected = true; deliver(entry, entry.observer.takeRecords()); entry.clients.delete(item); reobserve(entry); } };
+        return { flush() { if (!disconnected) deliver(entry, entry.observer.takeRecords()); }, disconnect() { if (disconnected) return; disconnected = true; deliver(entry, entry.observer.takeRecords()); entry.clients.delete(item); reobserve(entry); } };
       },
       getState: () => ({ ...stats, queued: jobs.size, resizeObservers: resizeObserver ? 1 : 0, resizeTargets: sizeClients.size, observers: roots.size, subscribers: [...roots.values()].reduce((n, entry) => n + entry.clients.size, 0) }),
     };
@@ -291,7 +316,96 @@
   runtime.lazy = runtime.lazy || null;
   // A disappearing stop button is only a pause, not proof that the final answer
   // finished. Thinking summaries can have their own copy button and markdown.
+  // Busy-only consumers share a short-lived view of the latest turn. Queue
+  // completion/signature reads below remain fresh and retain all safeguards.
+  runtime.generation?.destroy?.();
+  runtime.generation = (() => {
+    let main = null, href = '', scope = null, scopeDirty = true, dirty = true;
+    let cached = { busy: false }, readAt = -Infinity, reading = false, mainObserver = null;
+    let reads = 0, hits = 0, mainSelections = 0, scopeSelections = 0;
+    const visible = node => {
+      if (!(node instanceof HTMLElement) || !node.isConnected) return false;
+      const style = getComputedStyle(node), rect = node.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+    };
+    const statusSelector = '[aria-busy="true"], [data-is-streaming="true"], [data-is-generating="true"], [role="status"], [aria-live], button, [data-testid*="thinking"], [data-testid*="reasoning"]';
+    const stateSelector = '[aria-busy="true"], [data-is-streaming="true"], [data-is-generating="true"]';
+    const activeLabel = /^(?:正在思考|思考中|正在搜索|搜索中|正在研究|正在处理|正在生成|正在回答|Thinking|Reasoning|Searching|Working|Generating)(?:\s*[.…]*)$/i;
+    const stopLabel = /^(?:stop(?: (?:generating|streaming|response))?|停止(?:生成|回答|流式传输|输出)?|中止生成)$/i;
+    function invalidateMain() { main = scope = null; scopeDirty = dirty = true; }
+    let lifecycle = null;
+    function bindLifecycle() {
+      if (lifecycle || !document.documentElement) return;
+      lifecycle = runtime.pageWork.observe(document.documentElement, { childList: true, subtree: true }, records => {
+      for (const record of records) {
+        if (main && !main.isConnected) { invalidateMain(); return; }
+        if (record.type === 'childList' && (!main || !main.contains(record.target)) && [...record.addedNodes, ...record.removedNodes].some(node =>
+          node instanceof Element && (node.matches('main,[role="main"]') || node.querySelector('main,[role="main"]')))) { invalidateMain(); return; }
+      }
+      });
+    }
+    function getMain() {
+      if (href !== location.href || !main?.isConnected) {
+        mainObserver?.disconnect(); mainObserver = null;
+        runtime.pageWork.invalidate(); main = dom.main(); href = location.href; mainSelections++;
+        scope = null; scopeDirty = dirty = true;
+        if (main) mainObserver = runtime.pageWork.observe(main, { childList: true, characterData: true, subtree: true, attributes: true,
+          attributeFilter: ['aria-label', 'data-testid', 'data-turn-key', 'data-message-author-role', 'data-markdown-text-style', 'disabled', 'class', 'hidden', 'aria-hidden', 'aria-busy', 'data-is-streaming', 'data-is-generating'] }, records => {
+          dirty = true;
+          const selector = dom.turn + ',' + dom.message;
+          for (const record of records) if ((record.type === 'attributes' && ['data-testid', 'data-turn-key', 'data-message-author-role', 'data-markdown-text-style'].includes(record.attributeName) && record.target.matches(selector))
+            || (record.type === 'childList' && (!scope?.isConnected || [...record.addedNodes, ...record.removedNodes].some(node =>
+              node instanceof Element && (node.matches(selector) || node.querySelector(selector)))))) { scopeDirty = true; break; }
+        });
+      }
+      return main;
+    }
+    function latestScope() {
+      if (!scopeDirty && scope?.isConnected) return scope;
+      scopeSelections++; scopeDirty = false;
+      const turns = main.querySelectorAll(dom.turn);
+      scope = turns[turns.length - 1] || null;
+      if (scope) {
+        for (let parent = scope.parentElement; parent && parent !== main; parent = parent.parentElement) if (parent.matches(dom.turn)) scope = parent;
+      } else {
+        const messages = main.querySelectorAll(dom.message), last = messages[messages.length - 1];
+        scope = last?.closest('[data-message-id]') || last?.parentElement || main;
+      }
+      return scope;
+    }
+    function compute() {
+      if ([...document.querySelectorAll('[data-testid="stop-button"], [data-testid="composer-stop-button"], [data-testid*="stop-generating"]')].some(visible)) return { busy: true };
+      if (!main) return { busy: false };
+      const editor = main.querySelector('#prompt-textarea, textarea[name="prompt-textarea"], .ProseMirror[contenteditable="true"], [contenteditable="true"][role="textbox"]');
+      const shell = editor?.closest('form, [data-chatgpt-composer], [data-testid*="composer"]');
+      if ([...shell?.querySelectorAll('button,[role="button"]') || []].some(button => stopLabel.test((button.getAttribute('aria-label') || button.getAttribute('title') || button.textContent || '').trim()) && visible(button))) return { busy: true };
+      const latest = latestScope();
+      return { busy: Boolean(latest && ((latest.matches(stateSelector) && visible(latest)) || [...latest.querySelectorAll(statusSelector)].some(node => (
+        node.matches(stateSelector) || (!node.matches('button,[role="button"],summary,[data-state="closed"],[data-state="open"]')
+          && activeLabel.test((node.getAttribute('aria-label') || node.textContent || '').trim()))
+      ) && visible(node)))) };
+    }
+    function read() {
+      if (reading) { if (!main?.isConnected) return cached; scopeDirty = true; return compute(); }
+      reading = true;
+      try {
+        bindLifecycle(); lifecycle?.flush?.(); getMain(); mainObserver?.flush?.();
+        const now = performance.now();
+        if (!dirty && now - readAt < 250) { hits++; return cached; }
+        // Validate the cached surface at the normal read cadence. Observing all
+        // document style attributes would also receive every glass pointer move.
+        if (main && !visible(main)) { invalidateMain(); getMain(); }
+        reads++; cached = compute(); dirty = false; readAt = now; return cached;
+      } finally { reading = false; }
+    }
+    function routeChanged() { invalidateMain(); }
+    window.addEventListener('popstate', routeChanged); window.navigation?.addEventListener('navigatesuccess', routeChanged);
+    return { read, invalidate: () => { dirty = true; }, getState: () => ({ busy: cached.busy, reads, hits, mainSelections, scopeSelections }),
+      destroy() { lifecycle?.disconnect(); mainObserver?.disconnect(); window.removeEventListener('popstate', routeChanged); window.navigation?.removeEventListener('navigatesuccess', routeChanged); } };
+  })();
+
   runtime.readQueueResponseState = (options = {}) => {
+    if (options.busyOnly) return runtime.generation.read();
     const main = dom.main();
     const visible = (node) => {
       if (!(node instanceof HTMLElement) || !node.isConnected) return false;
@@ -483,10 +597,17 @@
     return children();
   }
 
+  const apiAccessSessions = new WeakMap();
   class SessionExporter {
     constructor() {
       this.apiFailureLoggedFor = '';
-      // 完整会话树只保存在内存中，不落盘，也不保存 accessToken。
+      this.apiFailures = new Map(); this.apiLastSuccess = new Map();
+      this.apiDisposed = false; this.apiDeferredRefresh = null; this.apiInteractiveAttemptAt = -Infinity;
+      this.onApiAvailability = () => this.armApiRefresh();
+      document.addEventListener('visibilitychange', this.onApiAvailability);
+      window.addEventListener('online', this.onApiAvailability);
+      apiAccessSessions.set(this, { token: '', expiresAt: 0, promise: null, failures: 0, retryAt: 0, status: 0 });
+      // 会话树仅在内存中；登录令牌只在私有 WeakMap 短时复用，不写入存储或诊断。
       // 导出与完整问答目录共用这一份缓存，避免重复请求同一会话。
       this.apiTreeCache = {
         conversationId: '',
@@ -769,69 +890,186 @@
       };
     }
 
+    getApiState() {
+      const id = this.getConversationId(), state = this.apiFailures.get(id), access = apiAccessSessions.get(this);
+      const retryAt = Math.max(state?.retryAt || 0, access?.retryAt || 0);
+      const pending = this.apiDeferredRefresh?.conversationId === id ? this.apiDeferredRefresh : null;
+      return { source: this.apiTreeCache.conversationId === id && this.apiTreeCache.tree ? 'api' : 'dom',
+        state: navigator.onLine === false ? 'offline' : Date.now() < retryAt ? 'cooldown' : document.hidden ? 'paused' : pending ? 'pending' : 'ready',
+        retryAt, pending: Boolean(pending), nextRefreshAt: pending?.nextAt || 0,
+        failures: state?.failures || 0, status: state?.status || access?.status || 0 };
+    }
+
+    clearDeferredApiRefresh() {
+      if (this.apiDeferredRefresh) window.clearTimeout(this.apiDeferredRefresh.timer);
+      this.apiDeferredRefresh = null;
+    }
+
+    queueApiRefresh(conversationId, options = {}) {
+      if (this.apiDisposed || this.getConversationId() !== conversationId) return;
+      let pending = this.apiDeferredRefresh;
+      if (pending?.conversationId !== conversationId) {
+        this.clearDeferredApiRefresh();
+        pending = this.apiDeferredRefresh = { conversationId, timer: 0, nextAt: 0, after: 0, reason: 'background', waiting: false };
+      }
+      pending.after = Math.max(pending.after, Number(options.after) || Date.now());
+      if (options.refreshReason === 'generation-end') pending.reason = 'generation-end';
+      this.armApiRefresh();
+    }
+
+    armApiRefresh() {
+      const pending = this.apiDeferredRefresh;
+      if (!pending || this.apiDisposed) return;
+      if (pending.conversationId !== this.getConversationId()) { this.clearDeferredApiRefresh(); return; }
+      if (document.hidden || navigator.onLine === false) {
+        window.clearTimeout(pending.timer); pending.timer = 0; return;
+      }
+      const cache = this.apiTreeCache;
+      if (cache.conversationId === pending.conversationId && cache.promise) {
+        window.clearTimeout(pending.timer); pending.timer = 0;
+        if (!pending.waiting) {
+          pending.waiting = true;
+          cache.promise.catch(() => {}).then(() => {
+            pending.waiting = false;
+            if (this.apiDeferredRefresh === pending) this.armApiRefresh();
+          });
+        }
+        return;
+      }
+      const access = apiAccessSessions.get(this);
+      const interval = pending.reason === 'generation-end' ? 2000 : 10000;
+      const due = Math.max(Date.now(), pending.after,
+        (this.apiLastSuccess.get(pending.conversationId) ?? -Infinity) + interval,
+        this.apiFailures.get(pending.conversationId)?.retryAt || 0, access.retryAt);
+      if (pending.timer && pending.nextAt === due) return;
+      window.clearTimeout(pending.timer); pending.nextAt = due;
+      pending.timer = window.setTimeout(async () => {
+        pending.timer = 0;
+        if (this.apiDeferredRefresh !== pending || this.apiDisposed) return;
+        if (document.hidden || navigator.onLine === false) return;
+        if (this.getConversationId() !== pending.conversationId) { this.clearDeferredApiRefresh(); return; }
+        this.apiDeferredRefresh = null;
+        try { await this.fetchConversationTree({ force: true, after: pending.after, refreshReason: pending.reason }); }
+        catch { this.queueApiRefresh(pending.conversationId, { after: pending.after, refreshReason: pending.reason }); }
+      }, Math.max(0, due - Date.now()));
+    }
+
+    destroy() {
+      this.apiDisposed = true; this.clearDeferredApiRefresh();
+      document.removeEventListener('visibilitychange', this.onApiAvailability);
+      window.removeEventListener('online', this.onApiAvailability);
+    }
+
+    apiHttpError(response, label) {
+      const error = new Error(`${label}（HTTP ${response.status}）`);
+      error.status = response.status;
+      const value = response.headers?.get?.('Retry-After'), seconds = value == null ? NaN : Number(value);
+      const retryAt = Number.isFinite(seconds) ? Date.now() + Math.max(0, seconds) * 1000 : Date.parse(value);
+      error.retryAt = Number.isFinite(retryAt) ? Math.min(Date.now() + 3600000, retryAt) : 0;
+      return error;
+    }
+
+    apiFailureDelay(failures, error) {
+      const base = Math.min(600000, 5000 * 2 ** Math.min(7, Math.max(0, failures - 1)));
+      return Math.max(base, error?.status === 403 ? 300000 : [401, 429].includes(error?.status) ? 60000 : 0,
+        Math.max(0, (error?.retryAt || 0) - Date.now()));
+    }
+
+    async getApiAccessToken(pageFetch, signal, bypassCooldown = false) {
+      const access = apiAccessSessions.get(this), now = Date.now();
+      if (!bypassCooldown && now < access.retryAt) throw Object.assign(new Error('登录会话请求冷却中'), { status: access.status, retryAt: access.retryAt });
+      if (access.token && now < access.expiresAt) return access.token;
+      if (access.promise) return access.promise;
+      access.promise = (async () => {
+        try {
+          const response = await pageFetch('/api/auth/session', { credentials: 'include', cache: 'no-store', signal, headers: { Accept: 'application/json' } });
+          if (!response.ok) throw this.apiHttpError(response, '读取登录会话失败');
+          const session = await response.json();
+          if (!session?.accessToken) throw Object.assign(new Error('当前登录会话没有可用 accessToken'), { status: 401 });
+          const expires = Date.parse(session.expires);
+          access.token = session.accessToken;
+          access.expiresAt = Math.min(Date.now() + 300000, Number.isFinite(expires) ? expires - 30000 : Date.now() + 60000);
+          access.failures = access.retryAt = access.status = 0;
+          return access.token;
+        } catch (error) {
+          access.token = ''; access.expiresAt = 0; access.status = Number(error?.status) || 0;
+          access.retryAt = Date.now() + this.apiFailureDelay(++access.failures, error);
+          throw error;
+        }
+      })();
+      try { return await access.promise; } finally { access.promise = null; }
+    }
+
     async fetchConversationTree(options = {}) {
       const conversationId = this.getConversationId();
-      if (!conversationId) return null;
-
-      const force = Boolean(options.force);
+      if (!conversationId || this.apiDisposed) return null;
+      const force = Boolean(options.force), interactive = options.interactive === true;
       const maxAgeMs = Math.max(0, Number(options.maxAgeMs ?? this.apiTreeDefaultMaxAgeMs) || 0);
-      const cache = this.apiTreeCache;
-      if (
-        !force
-        && cache.conversationId === conversationId
-        && cache.tree
-        && Date.now() - cache.fetchedAt <= maxAgeMs
-      ) {
-        return { conversationId, tree: cache.tree, cached: true };
+      const cache = this.apiTreeCache, cached = cache.conversationId === conversationId && cache.tree, now = Date.now();
+      const payload = () => ({ conversationId, tree: cache.tree, cached: true, requestedAt: cache.requestedAt || cache.fetchedAt,
+        deferred: Boolean(this.apiDeferredRefresh?.conversationId === conversationId || cache.promise) });
+      if (!force && cached && now - cache.fetchedAt <= maxAgeMs) return payload();
+      if (cache.conversationId === conversationId && cache.promise) {
+        if (force && !interactive) this.queueApiRefresh(conversationId, options);
+        return cache.promise;
       }
-      if (cache.conversationId === conversationId && cache.promise) return cache.promise;
-
+      const state = this.apiFailures.get(conversationId), access = apiAccessSessions.get(this);
+      const cooling = now < Math.max(state?.retryAt || 0, access.retryAt);
+      // A user export may make one deliberate retry during cooldown. Repeated
+      // clicks cannot turn it into an unbounded automatic retry loop.
+      const manualRetry = interactive && cooling && now - this.apiInteractiveAttemptAt >= 30000;
+      const interval = options.refreshReason === 'generation-end' ? 2000 : 10000;
+      const deferred = navigator.onLine === false || (!interactive && document.hidden)
+        || (cooling && !manualRetry)
+        || (!interactive && now - (this.apiLastSuccess.get(conversationId) ?? -Infinity) < interval);
+      if (deferred) {
+        if (force && !interactive) this.queueApiRefresh(conversationId, options);
+        return !interactive && cached ? payload() : null;
+      }
+      if (manualRetry) this.apiInteractiveAttemptAt = now;
+      const controller = new AbortController(), requestedAt = Date.now();
+      const timeout = window.setTimeout(() => controller.abort(), 20000);
       const request = (async () => {
         const pageFetch = this.getPageFetch();
-        const sessionResponse = await pageFetch('/api/auth/session', {
-          credentials: 'include',
-          cache: 'no-store',
-          headers: { Accept: 'application/json' },
-        });
-        if (!sessionResponse.ok) throw new Error(`读取登录会话失败（HTTP ${sessionResponse.status}）`);
-
-        const authSession = await sessionResponse.json();
-        const accessToken = authSession?.accessToken;
-        if (!accessToken) throw new Error('当前登录会话没有可用 accessToken');
-
-        const response = await pageFetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
-          method: 'GET',
-          credentials: 'include',
-          cache: 'no-store',
-          headers: {
-            Accept: 'application/json',
-            Authorization: `Bearer ${accessToken}`,
-          },
-        });
-        if (!response.ok) throw new Error(`读取完整会话失败（HTTP ${response.status}）`);
-
+        let response;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const token = await this.getApiAccessToken(pageFetch, controller.signal, manualRetry);
+          response = await pageFetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
+            method: 'GET', credentials: 'include', cache: 'no-store', signal: controller.signal,
+            headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+          });
+          if (response.status !== 401) break;
+          access.token = ''; access.expiresAt = 0;
+          if (attempt === 1) break;
+        }
+        if (!response.ok) throw this.apiHttpError(response, '读取完整会话失败');
         const tree = await response.json();
         if (!tree?.mapping || !tree?.current_node) throw new Error('完整会话接口返回的数据结构不完整');
-
-        if (this.getConversationId() === conversationId && this.apiTreeCache.promise === request) {
-          this.apiTreeCache = { conversationId, tree, fetchedAt: Date.now(), promise: null };
+        this.apiFailures.delete(conversationId);
+        this.apiLastSuccess.delete(conversationId); this.apiLastSuccess.set(conversationId, Date.now());
+        if (this.apiLastSuccess.size > 16) this.apiLastSuccess.delete(this.apiLastSuccess.keys().next().value);
+        if (!this.apiDisposed && this.getConversationId() === conversationId && this.apiTreeCache.promise === request) {
+          this.apiTreeCache = { conversationId, tree, requestedAt, fetchedAt: Date.now(), promise: null };
           this.apiOutlineCache = { conversationId, currentNode: '', items: [] };
+          if (this.apiDeferredRefresh?.conversationId === conversationId && requestedAt >= this.apiDeferredRefresh.after) this.clearDeferredApiRefresh();
+          try { runtime.tokenStats?.scheduleRefresh(false); } catch {}
+          try { runtime.answerToc?.scheduleApiConversationOutlineRefresh(0, false); } catch {}
         }
-        return { conversationId, tree, cached: false };
+        return { conversationId, tree, cached: false, requestedAt, deferred: this.apiDeferredRefresh?.conversationId === conversationId };
       })();
-
-      this.apiTreeCache = {
-        conversationId,
-        tree: cache.conversationId === conversationId ? cache.tree : null,
-        fetchedAt: cache.conversationId === conversationId ? cache.fetchedAt : 0,
-        promise: request,
-      };
-      try {
-        return await request;
+      this.apiTreeCache = { conversationId, tree: cached || null, requestedAt: cached ? cache.requestedAt : 0, fetchedAt: cached ? cache.fetchedAt : 0, promise: request };
+      try { return await request; }
+      catch (error) {
+        const failures = (state?.failures || 0) + 1;
+        this.apiFailures.delete(conversationId);
+        this.apiFailures.set(conversationId, { failures, status: Number(error?.status) || 0, retryAt: Date.now() + this.apiFailureDelay(failures, error) });
+        if (this.apiFailures.size > 16) this.apiFailures.delete(this.apiFailures.keys().next().value);
+        if (force && !interactive) this.queueApiRefresh(conversationId, options);
+        throw error;
       } finally {
-        if (this.apiTreeCache.conversationId === conversationId && this.apiTreeCache.promise === request) {
-          this.apiTreeCache.promise = null;
-        }
+        window.clearTimeout(timeout);
+        if (this.apiTreeCache.conversationId === conversationId && this.apiTreeCache.promise === request) this.apiTreeCache.promise = null;
+        this.armApiRefresh();
       }
     }
 
@@ -865,6 +1103,8 @@
         currentNode: String(cache.tree.current_node || ''),
         fetchedAt: cache.fetchedAt,
         messages: this.getSnapshotMessages(cache.tree),
+        requestedAt: cache.requestedAt || cache.fetchedAt,
+        deferred: Boolean(cache.promise || this.apiDeferredRefresh?.conversationId === conversationId),
       };
     }
 
@@ -887,6 +1127,7 @@
         currentNode: String(tree.current_node || ''),
         fetchedAt: this.apiTreeCache.fetchedAt,
         messages: this.getSnapshotMessages(tree),
+        requestedAt: payload.requestedAt, deferred: payload.deferred,
       };
     }
 
@@ -894,7 +1135,7 @@
       const originUrl = location.href;
       const originTitle = this.getDomTitle();
       // 用户主动导出时优先保证“此刻完整”，不能因为目录缓存而漏掉刚发送的消息。
-      const payload = await this.fetchConversationTree({ force: true, maxAgeMs: 0 });
+      const payload = await this.fetchConversationTree({ force: true, maxAgeMs: 0, interactive: true });
       if (!payload) return null;
       const { conversationId, tree } = payload;
       const messages = this.messagesFromApiTree(tree);
@@ -926,7 +1167,13 @@
           }
         }
       }
-      return this.getConversationId() === conversationId ? this.collectDom() : fallback;
+      if (this.getConversationId() !== conversationId) return null;
+      if (conversationId) {
+        const state = this.getApiState(), seconds = Math.max(0, Math.ceil((state.retryAt - Date.now()) / 1000));
+        const detail = seconds ? '接口冷却约 ' + seconds + ' 秒。' : state.state === 'offline' ? '当前处于离线状态。' : '';
+        if (!window.confirm('完整会话接口暂不可用。' + detail + '\n当前页面快照可能缺少未加载的历史消息。是否仍导出或复制当前页面内容？')) return null;
+      }
+      return this.collectDom();
     }
 
     toMarkdown(session) {
@@ -968,6 +1215,7 @@
         window.alert(`导出失败：${error?.message || error}`);
         return false;
       }
+      if (!session) return false;
       if (!session.messages.length) {
         window.alert('暂未找到可导出的会话内容。');
         return false;
@@ -996,7 +1244,7 @@
         console.error('[ChatGPT 会话导出] 复制失败：', error);
         return false;
       }
-      if (!session.messages.length) return false;
+      if (!session?.messages.length) return false;
       const text = this.toMarkdown(session);
       try {
         await navigator.clipboard.writeText(text);
@@ -1046,6 +1294,7 @@
       this.refreshing = false;
       this.refreshPending = false;
       this.forceApiPending = false;
+      this.needsApiReconcile = false; this.apiReconcileSince = 0; this.apiGenerationEndPending = false;
       this.onSettingsChange = () => {
         this.syncEnabledState();
         if (this.active) {
@@ -1053,7 +1302,12 @@
           this.schedulePosition();
         }
       };
-      this.onViewportChange = () => this.schedulePosition();
+      this.onViewportChange = runtime.pageWork.onScrollChange(event => {
+        const target = event?.target;
+        const shell = this.observedShell || runtime.composerQueueDock?.observedShell;
+        if (event?.type === 'scroll' && target instanceof Element && shell?.isConnected && !target.contains(shell)) return;
+        this.schedulePosition();
+      });
     }
 
     init() {
@@ -1157,6 +1411,7 @@
       this.messageStatsCache = new WeakMap();
       this.apiTokenCache.clear();
       this.statsConversationId = null;
+      this.needsApiReconcile = false; this.apiGenerationEndPending = false; this.apiReconcileSince = 0;
       clearInterval(this.refreshTimer);
       clearTimeout(this.mutationTimer);
       if (this.positionRaf) runtime.pageWork.cancelFrame(this.positionRaf);
@@ -1205,6 +1460,7 @@
         const generating = this.isGenerating();
         const justFinished = this.lastGenerating && !generating;
         this.lastGenerating = generating;
+        if (justFinished) { this.needsApiReconcile = true; this.apiGenerationEndPending = true; this.apiReconcileSince = Date.now(); }
         this.scheduleRefresh(justFinished);
       });
     }
@@ -1469,7 +1725,11 @@
         if (node && node.textContent !== value) node.textContent = value;
       }
       const pill = root.querySelector('.cgpt-token-pill');
-      const title = `可见文本 Token 估算：输入 ≈${input}，输出 ≈${output}，可见上下文 ≈${context}。不包含系统指令、记忆、工具定义、隐藏推理等服务端上下文，因此不是官方 usage。`;
+      const state = this.exporter.getApiState?.();
+      const remaining = Math.max(0, Math.ceil(((state?.retryAt || 0) - Date.now()) / 1000));
+      const sourceLabel = this.summarySource === 'api-dom' ? 'API + 当前页面' : this.summarySource === 'api' ? 'API' : '当前页面 DOM';
+      const statusLabel = remaining ? '；接口冷却约 ' + remaining + ' 秒' : state?.pending ? '；等待接口补拉' : '';
+      const title = `数据源：${sourceLabel}${statusLabel}。可见文本 Token 估算：输入 ≈${input}，输出 ≈${output}，可见上下文 ≈${context}。不包含系统指令、记忆、工具定义、隐藏推理等服务端上下文，因此不是官方 usage。`;
       if (pill && pill.getAttribute('title') !== title) pill.setAttribute('title', title);
       if (pill && pill.getAttribute('aria-label') !== title) pill.setAttribute('aria-label', title);
       const compact = this.compactAlways()
@@ -1642,70 +1902,110 @@
         .some(element => !element.closest('[hidden], [aria-hidden="true"]') && element.getClientRects().length > 0);
     }
 
+    apiCoversLiveRound(apiMessages, domMessages) {
+      if (!domMessages.length) return true;
+      if (!apiMessages.length) return false;
+      const liveUser = domMessages.findLast(message => message.role === 'user');
+      if (!liveUser) return true;
+      const apiUser = apiMessages.findLastIndex(message => message.role === 'user');
+      if (apiUser < 0) return false;
+      const knownId = id => id && !/^dom-\d+$/.test(id);
+      let match = apiUser;
+      if (knownId(liveUser.id) && knownId(apiMessages[apiUser].id)) {
+        match = apiMessages.findLastIndex(message => message.role === 'user' && message.id === liveUser.id);
+        if (match < 0) return false;
+        if (match !== apiUser) return true; // The user is viewing an older round.
+      }
+      const liveStart = domMessages.indexOf(liveUser);
+      const liveAnswers = domMessages.slice(liveStart + 1).filter(message => message.role === 'assistant');
+      const apiAnswers = apiMessages.slice(match + 1).filter(message => message.role === 'assistant');
+      if (liveAnswers.length && !apiAnswers.length) return false;
+      for (const message of liveAnswers) if (knownId(message.id) && !apiAnswers.some(answer => answer.id === message.id || answer.sourceIds?.includes(message.id))) return false;
+      const liveText = normalizeText(liveAnswers.map(message => message.content).join('\n'));
+      const apiText = normalizeText(apiAnswers.map(message => message.content).join('\n'));
+      // Detect a clearly truncated snapshot. Different Markdown/DOM formatting
+      // is not proof of truncation and must not cause endless forced requests.
+      return !(apiText && liveText.length > apiText.length && liveText.startsWith(apiText));
+    }
+
+    summaryMessages(apiMessages, domMessages, generating) {
+      if (!generating && !this.needsApiReconcile) {
+        this.summarySource = apiMessages.length ? 'api' : 'dom';
+        return apiMessages.length ? apiMessages : domMessages;
+      }
+      let merged = this.mergeStreamingTail(apiMessages, domMessages);
+      // With native virtualization there may be no overlapping old round to
+      // prove an append. Show the current DOM estimate until reconciliation,
+      // rather than presenting the old API round as the current answer.
+      const liveUser = domMessages.findLast(message => message.role === 'user');
+      if (this.needsApiReconcile && merged === apiMessages && liveUser
+        && !apiMessages.some(message => message.role === 'user' && (message.id && liveUser.id ? message.id === liveUser.id : message.content === liveUser.content))) merged = domMessages;
+      this.summarySource = merged === apiMessages ? 'api' : merged === domMessages ? 'dom' : 'api-dom';
+      return merged;
+    }
+
     async refresh({ forceApi = false } = {}) {
       if (!this.active || !this.isEnabled()) return;
-      const conversationId = this.exporter.getConversationId();
-      const epoch = this.refreshEpoch;
+      const conversationId = this.exporter.getConversationId(), epoch = this.refreshEpoch;
       if (conversationId !== this.statsConversationId) {
-        this.statsConversationId = conversationId;
-        this.messageStatsCache = new WeakMap();
-        this.apiTokenCache.clear();
+        this.statsConversationId = conversationId; this.messageStatsCache = new WeakMap(); this.apiTokenCache.clear();
+        this.needsApiReconcile = false; this.apiGenerationEndPending = false; this.apiReconcileSince = 0;
       }
-      if (!conversationId) {
-        this.removeUi();
-        return;
-      }
-      const showChips = this.showMessageChips();
-      const showSummary = this.showSummary();
-      if (!showChips && !showSummary) {
-        this.removeUi();
-        return;
-      }
+      if (!conversationId) { this.removeUi(); return; }
+      const showChips = this.showMessageChips(), showSummary = this.showSummary();
+      if (!showChips && !showSummary) { this.removeUi(); return; }
       const roleNodes = this.getAttachedRoleNodes();
-      if (showChips) this.renderMessageChips(roleNodes);
-      else this.removeMessageChips();
-      if (!showSummary) {
-        this.removeSummary();
-        return;
+      if (showChips) this.renderMessageChips(roleNodes); else this.removeMessageChips();
+      if (!showSummary) { this.removeSummary(); return; }
+      const generating = this.isGenerating();
+      if (this.lastGenerating && !generating) {
+        this.needsApiReconcile = true; this.apiGenerationEndPending = true; this.apiReconcileSince = Date.now();
       }
+      if (forceApi && !this.needsApiReconcile) { this.needsApiReconcile = true; this.apiReconcileSince = Date.now(); }
+      this.lastGenerating = generating;
       let domMessages = this.collectAttachedMessages(roleNodes);
       const cached = this.exporter.getCachedActiveMessagesSync?.() || null;
+      if (cached?.deferred) this.needsApiReconcile = true;
       const initialApi = this.withTokenCounts(cached?.messages || []);
-      this.lastGenerating = this.isGenerating();
-      this.renderSummary(this.lastGenerating ? this.mergeStreamingTail(initialApi, domMessages)
-        : (initialApi.length ? initialApi : domMessages));
-      if (cached && !forceApi) return;
-      let apiMessages = [];
+      if (!generating && cached && !this.apiCoversLiveRound(initialApi, domMessages) && !this.needsApiReconcile) {
+        this.needsApiReconcile = true; this.apiGenerationEndPending = true; this.apiReconcileSince = Date.now();
+      }
+      if (!forceApi && cached && !cached.deferred && (cached.requestedAt || cached.fetchedAt) >= this.apiReconcileSince && this.apiCoversLiveRound(initialApi, domMessages)) {
+        this.needsApiReconcile = false; this.apiGenerationEndPending = false;
+      }
+      this.renderSummary(this.summaryMessages(initialApi, domMessages, generating));
+      if (generating && cached && !forceApi) return;
+      if (cached && !forceApi && !this.needsApiReconcile) return;
+      let apiMessages = initialApi;
       try {
-        let result = cached;
-        if (forceApi || !result) {
-          const pending = this.apiStatsRequest;
-          if (pending?.conversationId === conversationId && pending.epoch === epoch) return;
-          const request = { conversationId, epoch, promise: this.exporter.getActiveMessages({ force: forceApi, maxAgeMs: this.apiMaxAgeMs }) };
-          this.apiStatsRequest = request;
-          try { result = await request.promise; }
-          finally { if (this.apiStatsRequest === request) this.apiStatsRequest = null; }
-        }
-        if (!this.active || !this.isEnabled() || epoch !== this.refreshEpoch
-          || this.exporter.getConversationId() !== conversationId) return;
+        const pending = this.apiStatsRequest;
+        if (pending?.conversationId === conversationId && pending.epoch === epoch) return;
+        const request = { conversationId, epoch, promise: this.exporter.getActiveMessages({
+          force: forceApi || this.needsApiReconcile,
+          refreshReason: this.apiGenerationEndPending ? 'generation-end' : 'background',
+          after: this.apiReconcileSince, maxAgeMs: this.apiMaxAgeMs,
+        }) };
+        this.apiStatsRequest = request;
+        let result;
+        try { result = await request.promise; }
+        finally { if (this.apiStatsRequest === request) this.apiStatsRequest = null; }
+        if (!this.active || !this.isEnabled() || epoch !== this.refreshEpoch || this.exporter.getConversationId() !== conversationId) return;
         apiMessages = this.withTokenCounts(result?.messages || []);
+        domMessages = this.collectAttachedMessages(this.getAttachedRoleNodes());
+        if (result && !result.deferred && (result.requestedAt || result.fetchedAt) >= this.apiReconcileSince) {
+          this.apiGenerationEndPending = false;
+          this.needsApiReconcile = !this.apiCoversLiveRound(apiMessages, domMessages);
+          if (this.needsApiReconcile) this.exporter.queueApiRefresh(conversationId, { after: this.apiReconcileSince, refreshReason: 'background' });
+        }
         this.apiFailureKey = '';
       } catch (error) {
         const key = String(error?.message || error);
-        if (key !== this.apiFailureKey) {
-          this.apiFailureKey = key;
-          console.debug('[Token Stats] 完整会话缓存暂不可用，回退到当前 DOM：', error);
-        }
+        if (key !== this.apiFailureKey) { this.apiFailureKey = key; console.debug('[Token Stats] 完整会话暂不可用，保留当前页面统计：', error); }
       }
-      if (!this.active || !this.isEnabled() || epoch !== this.refreshEpoch
-        || this.exporter.getConversationId() !== conversationId) return;
-      const generating = this.isGenerating();
+      if (!this.active || !this.isEnabled() || epoch !== this.refreshEpoch || this.exporter.getConversationId() !== conversationId) return;
       domMessages = this.collectAttachedMessages(this.getAttachedRoleNodes());
-      this.lastGenerating = generating;
-      const messages = generating
-        ? this.mergeStreamingTail(apiMessages, domMessages)
-        : (apiMessages.length ? apiMessages : domMessages);
-      this.renderSummary(messages);
+      this.lastGenerating = this.isGenerating();
+      this.renderSummary(this.summaryMessages(apiMessages, domMessages, this.lastGenerating));
     }
 
     scheduleRefresh(forceApi = false) {
@@ -3437,13 +3737,19 @@
       this.observedShell = null;
       this.neumorphicShell = null;
       this.positionRaf = 0;
+      this.glassRefreshPending = true;
       this.mutationPositionTimer = 0;
       this.heartbeat = 0;
       this.started = false;
-      this.onViewportChange = () => this.schedulePosition();
+      this.onViewportChange = runtime.pageWork.onScrollChange(event => {
+        const target = event?.target;
+        const shell = this.observedShell || runtime.composerQueueDock?.observedShell;
+        if (event?.type === 'scroll' && target instanceof Element && shell?.isConnected && !target.contains(shell)) return;
+        this.schedulePosition();
+      });
       this.onUiSettingsChange = () => {
         this.render();
-        this.schedulePosition();
+        this.schedulePosition(true);
       };
       this.onDocumentPointerDown = (event) => {
         if (!this.isOpen || !this.root || this.root.contains(event.target)) return;
@@ -3473,7 +3779,7 @@
       observe();
       // ResizeObserver + DOM mutations handle normal movement; this is only a
       // low-frequency fallback for route/layout changes that do not emit either.
-      this.heartbeat = window.setInterval(() => this.schedulePosition(), 3000);
+      this.heartbeat = window.setInterval(() => this.schedulePosition(true), 3000);
       window.setTimeout(() => {
         this.ensureRoot();
         this.render();
@@ -4244,21 +4550,27 @@
       // Streamed answer DOM can change every frame. Scroll/resize still use rAF directly.
       this.mutationPositionTimer = window.setTimeout(() => {
         this.mutationPositionTimer = 0;
-        this.schedulePosition();
+        this.schedulePosition(true);
       }, 120);
     }
 
     observeShell(shell) {
-      if (this.observedShell === shell) return;
+      if (this.observedShell === shell && this.observedQueueRoot === this.root) return;
+      this.observedQueueRoot = this.root;
       this.resizeObserver?.disconnect?.();
       this.resizeObserver = null;
       this.observedShell = shell;
       if (!(shell instanceof Element) || typeof ResizeObserver !== 'function') return;
       this.resizeObserver = new ResizeObserver(() => this.schedulePosition());
-      this.resizeObserver.observe(shell);
+      // Async fonts, badge text and opening the panel can change the floating
+      // controls without changing the composer. Observe all three size owners.
+      for (const target of [shell, this.capsule, this.panel]) {
+        if (target instanceof Element) this.resizeObserver.observe(target);
+      }
     }
 
-    schedulePosition() {
+    schedulePosition(refreshGlass = false) {
+      this.glassRefreshPending ||= refreshGlass;
       if (this.positionRaf) return;
       this.positionRaf = this.runtime.pageWork.requestLayout(() => {
         this.positionRaf = 0;
@@ -4270,6 +4582,8 @@
 
     preparePosition() {
       if (!this.ensureRoot()) return;
+      const refreshGlass = this.glassRefreshPending;
+      this.glassRefreshPending = false;
       const composer = this.runtime.promptLibrary?.findComposer?.();
       if (!composer) {
         this.runtime.composerLiquidGlass?.attach(null);
@@ -4294,8 +4608,10 @@
         shell.setAttribute('data-cgfc-neumorphic-composer', 'true');
       }
       if (this.runtime.composerLiquidGlass?.candidate !== shell) this.runtime.composerLiquidGlass?.attach(shell);
-      this.runtime.surfaceLiquidGlass?.refresh(shell);
-      this.runtime.pageWork.invalidate();
+      if (refreshGlass || this.runtime.surfaceLiquidGlass?.composerShell !== shell) {
+        this.runtime.surfaceLiquidGlass?.refresh(shell);
+        this.runtime.pageWork.invalidate();
+      }
       const rect = this.runtime.pageWork.rect(shell);
       if (rect.width <= 0 || rect.height <= 0 || rect.bottom < 0 || rect.top > window.innerHeight) {
         this.root.hidden = true;
@@ -4317,37 +4633,39 @@
       const panelWidth = Math.round(Math.min(Math.max(280, preferredPanelWidth), viewportWidth - edge * 2) * 100) / 100;
       const availableAbove = Math.max(120, rect.top - viewportTop - edge - 6);
       const panelHeight = Math.round(Math.min(440, viewportHeight - edge * 2, availableAbove) * 100) / 100;
-      if (this.panel.style.width !== panelWidth + 'px' || this.panel.style.maxHeight !== panelHeight + 'px') return () => {
-        this.panel.style.width = panelWidth + 'px'; this.panel.style.maxHeight = panelHeight + 'px'; this.schedulePosition(); this.runtime.tokenStats?.schedulePosition();
-      };
       const writes = [];
+      if (this.panel.style.width !== panelWidth + 'px' || this.panel.style.maxHeight !== panelHeight + 'px') writes.push(() => {
+        this.panel.style.width = panelWidth + 'px'; this.panel.style.maxHeight = panelHeight + 'px'; this.schedulePosition(); this.runtime.tokenStats?.schedulePosition();
+      });
 
       const positionAboveComposer = (element, width) => {
+        if (element.hidden) return;
         const elementRect = this.runtime.pageWork.rect(element);
         const safeWidth = Math.max(1, width || elementRect.width || 1);
-        const safeHeight = Math.max(1, elementRect.height || 1);
-        const left = Math.min(
+        const safeHeight = Math.max(1, Math.min(elementRect.height || 1, element === this.panel ? panelHeight : Infinity));
+        const left = Math.round(Math.min(
           viewportRight - edge - safeWidth,
           Math.max(viewportLeft + edge, rect.right - safeWidth - 10),
-        );
-        const top = Math.min(
+        ) * 100) / 100;
+        const top = Math.round(Math.min(
           viewportBottom - edge - safeHeight,
           Math.max(viewportTop + edge, rect.top - safeHeight - 6),
-        );
+        ) * 100) / 100;
         this.runtime.pageWork.planRect(element, new DOMRect(left, top, safeWidth, safeHeight));
         const moved = element.style.left !== left + 'px' || element.style.top !== top + 'px';
+        if (!moved && !element.style.right && !element.style.bottom) return;
         writes.push(() => {
-        element.style.removeProperty('right');
-        element.style.removeProperty('bottom');
-        element.style.left = `${left}px`;
-        element.style.top = `${top}px`;
+        if (element.style.right) element.style.removeProperty('right');
+        if (element.style.bottom) element.style.removeProperty('bottom');
+        if (element.style.left !== `${left}px`) element.style.left = `${left}px`;
+        if (element.style.top !== `${top}px`) element.style.top = `${top}px`;
         if (moved) this.runtime.tokenStats?.schedulePosition();
         });
       };
 
-      positionAboveComposer(this.capsule, this.runtime.pageWork.rect(this.capsule).width);
+      if (!this.capsule.hidden) positionAboveComposer(this.capsule, this.runtime.pageWork.rect(this.capsule).width);
       positionAboveComposer(this.panel, panelWidth);
-      return () => { if (!this.root?.isConnected) return; for (const write of writes) write(); };
+      if (writes.length) return () => { if (!this.root?.isConnected) return; for (const write of writes) write(); };
     }
   }
 
@@ -5293,6 +5611,7 @@
   runtime.surfaceLiquidGlass?.destroy?.();
   runtime.surfaceLiquidGlass = new SupplementaryLiquidGlass(runtime);
   runtime.tokenStats?.destroy?.();
+  runtime.sessionExporter?.destroy?.();
   runtime.sessionExporter = new SessionExporter();
   runtime.tokenStats = new TokenStatsController(runtime.sessionExporter);
   runtime.tokenStats.init();
@@ -5741,7 +6060,7 @@
       this.activeView = this.readViewState();
       this.lastPanelWidthOverride = null;
 
-      this.onScroll = this.onScroll.bind(this);
+      this.onScroll = globalThis.__cgptUnifiedRuntimeV1.pageWork.onScrollChange(this.onScroll.bind(this));
       this.onResize = this.onResize.bind(this);
       this.onKeyDown = this.onKeyDown.bind(this);
       this.onVisibilityChange = this.onVisibilityChange.bind(this);
@@ -10675,14 +10994,27 @@
   bootLazyChat();
 
   function bootNormalCopy() {
-    const forceNormalCopy = (e) => {
-      e.stopImmediatePropagation();
-      return true;
+    const forceNormalCopy = event => {
+      if (!document.documentElement?.hasAttribute('data-cgfc-normal-text-copy')) return;
+      // Leave native editor cut/copy and controls to their owners. Only a
+      // selection wholly inside rendered chat text uses normal browser copy.
+      const editable = node => {
+        const element = node instanceof Element ? node : node?.parentElement;
+        return element?.isContentEditable || element?.closest('input,textarea,[role="textbox"],button,[contenteditable]:not([contenteditable="false"])');
+      };
+      if ((event.composedPath?.() || [event.target]).some(editable)) return;
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed || !selection.rangeCount || editable(selection.anchorNode) || editable(selection.focusNode)) return;
+      const main = selection.anchorNode?.parentElement?.closest('main,[role="main"]');
+      if (!main?.contains(selection.focusNode)) return;
+      const range = selection.getRangeAt(0);
+      // A selection can cross an editor even when both endpoints are outside it.
+      if (Array.from(main.querySelectorAll('input,textarea,[contenteditable]:not([contenteditable="false"])')).some(node => {
+        try { return range.intersectsNode(node); } catch { return true; }
+      })) return;
+      event.stopImmediatePropagation();
     };
-
-    ['copy', 'cut'].forEach((event) => {
-      document.addEventListener(event, forceNormalCopy, true);
-    });
+    for (const name of ['copy', 'cut']) document.addEventListener(name, forceNormalCopy, true);
   }
 
   function bootTranslatePageTweaks() {
@@ -11023,7 +11355,9 @@
       '[data-testid="stop-button"]',
       'button[aria-label*="stop streaming" i]',
       'button[aria-label*="stop generating" i]',
-      'button[aria-label*="停止" i]'
+      'button[aria-label="停止生成" i]',
+      'button[aria-label="停止回答" i]',
+      'button[aria-label="停止输出" i]'
     ].join(',');
 
     const COMPOSER_SEL = [
@@ -11083,9 +11417,10 @@
         const root = document.documentElement;
         if (!root) return;
         if (value === false || value === null || value === undefined) {
-          root.removeAttribute(name);
+          if (root.hasAttribute(name)) root.removeAttribute(name);
         } else {
-          root.setAttribute(name, String(value));
+          const text = String(value);
+          if (root.getAttribute(name) !== text) root.setAttribute(name, text);
         }
       } catch {}
     }
@@ -11106,7 +11441,9 @@
 
     function hasStopButton() {
       try {
-        return !!document.querySelector(STOP_BTN_SEL);
+        const generation = globalThis.__cgptUnifiedRuntimeV1?.readQueueResponseState;
+        if (generation) return generation({ busyOnly: true }).busy === true;
+        return Array.from(document.querySelectorAll(STOP_BTN_SEL)).some(node => node.isConnected && node.getClientRects().length && getComputedStyle(node).visibility !== 'hidden');
       } catch {
         return false;
       }
@@ -11308,13 +11645,7 @@
           overflow-y: hidden;
         }
 
-        /* During an interaction hot path, spend essentially nothing on animation. */
-        html[${ROOT_FLAG}="1"][${ROOT_HOT}="1"] main *,
-        html[${ROOT_FLAG}="1"][${ROOT_PRESSURE}="3"] main * {
-          animation-duration: 0.001ms !important;
-          transition-duration: 0.001ms !important;
-          scroll-behavior: auto !important;
-        }
+        /* Keep site loading/thinking animations intact while typing. */
       `;
       document.head.appendChild(s);
     }
@@ -12757,6 +13088,9 @@
   const composerKey = suffix => suffix === 'RenderMode' ? 'glassRenderMode' : suffix === 'Finish' ? 'glassOpticalFinish' : 'composerGlass' + suffix;
   defaults.glassOpticalFinish = 'refined'; settingTypes.glassOpticalFinish = 'select'; selectValues.glassOpticalFinish = ['refined', 'classic'];
   defaults.removeTopBarGap = true; settingTypes.removeTopBarGap = 'boolean';
+  defaults.stabilizeScrollBoundary = true; settingTypes.stabilizeScrollBoundary = 'boolean';
+  defaults.normalTextCopy = true; settingTypes.normalTextCopy = 'boolean';
+  defaults.nativeLightBodyColors = true; settingTypes.nativeLightBodyColors = 'boolean';
   defaults.enableComposerToolsLiquidGlass = true; settingTypes.enableComposerToolsLiquidGlass = 'boolean';
   defaults.enableMessageLiquidGlass = defaults.enableAsciiOcean && defaults.asciiOceanCoverage === 'glass'; settingTypes.enableMessageLiquidGlass = 'boolean';
   for (const spec of glassSurfaceSpecs) for (const [suffix, , type, range] of glassFields) {
@@ -12782,6 +13116,10 @@
     const property = (name, value) => { if (root.style.getPropertyValue(name) !== String(value)) root.style.setProperty(name, String(value)); };
     attribute('data-cgfc-glass-finish', settings.glassOpticalFinish);
     flag('data-cgfc-topbar-overlap', settings.removeTopBarGap);
+    flag('data-cgfc-stable-scroll-boundary', settings.stabilizeScrollBoundary);
+    flag('data-cgfc-normal-text-copy', settings.normalTextCopy);
+    flag('data-cgfc-light-native-normal', settings.nativeLightBodyColors && String(settings.normalColor).toLowerCase() === String(defaults.normalColor).toLowerCase());
+    flag('data-cgfc-light-native-bold', settings.nativeLightBodyColors && String(settings.boldColor).toLowerCase() === String(defaults.boldColor).toLowerCase());
     flag('data-cgfc-composer-tools-liquid-glass', settings.enableComposerToolsLiquidGlass);
     flag('data-cgfc-message-glass', settings.enableMessageLiquidGlass);
     for (const spec of glassSurfaceSpecs) {
@@ -13418,7 +13756,7 @@
     const savedPrompts = JSON.parse(JSON.stringify(rt.promptLibrary?.prompts || []));
     const savedQueue = (rt.messageQueue?.items || []).map((item) => ({ ...item,
       metadata: { ...item.metadata }, attachments: [...(item.attachments || [])] }));
-    // Flush values still waiting for a debounce, without changing queue state.
+    // Snapshot current in-memory values, including edits not yet persisted by debounce.
     const labels = Array.from({ length: sessionStorage.length }, (_, i) => sessionStorage.key(i))
       .filter((key) => key?.startsWith(BACKUP_LABEL_PREFIX));
     const queue = [];
@@ -15405,6 +15743,7 @@
     const fontCode = createSettingsGroup(fontGroup, '代码显示');
     const fontLayout = createSettingsGroup(fontGroup, '正文字号、行高与列宽');
     const fontColors = createSettingsGroup(fontGroup, '颜色、粗细与平滑');
+    appendControl(fontColors, { label: '浅色主题默认正文配色跟随站点（自定义颜色保留）', key: 'nativeLightBodyColors', type: 'checkbox' });
     let fontTarget = fontBasics;
     detectKnownLocalFonts();
 
@@ -15631,6 +15970,8 @@
     panel.insertBefore(pageGroup, oceanGroup);
     appendControl(pageGroup, { label: '去掉顶部黑色预留区（保留标题栏按钮）', key: 'removeTopBarGap', type: 'checkbox' });
     appendControl(pageGroup, { label: '防止自动滚动', key: 'stopAutoScrollWhileGenerating', type: 'checkbox' });
+    appendControl(pageGroup, { label: '正文选区使用普通复制（输入框保留原生处理）', key: 'normalTextCopy', type: 'checkbox' });
+    appendControl(pageGroup, { label: '稳定滚动边界（减少触底回弹与浮层错位）', key: 'stabilizeScrollBoundary', type: 'checkbox' });
     appendControl(fontCode, { label: '代码自动换行', key: 'wrapCode', type: 'checkbox' });
 
     createBackupControls(panel);
@@ -15655,7 +15996,7 @@
       next.enableSendLiquidGlass = false;
       next.enableScrollLiquidGlass = false;
       next.enableTokenLiquidGlass = false;
-      next.enableToggleLiquidGlass = false; next.enableMessageLiquidGlass = false; next.enableComposerToolsLiquidGlass = false; next.removeTopBarGap = false;
+      next.enableToggleLiquidGlass = false; next.enableMessageLiquidGlass = false; next.enableComposerToolsLiquidGlass = false; next.removeTopBarGap = false; next.stabilizeScrollBoundary = false; next.normalTextCopy = false; next.nativeLightBodyColors = false;
       settings = next;
       writeStore(STORAGE_KEY, settings);
       applySettings();
@@ -15702,36 +16043,42 @@
     window.__cgptUnifiedRuntimeV1?.surfaceLiquidGlass?.schedule();
   }
 
+  const shellGuardObservers = new Map();
   function ensureShell() {
-    applySettings();
+    // The current settings already own root attributes and variables. Repair
+    // only missing UI/style nodes; do not broadcast a settings change here.
+    installStaticStyles();
     createPanel();
+    const toggle = document.getElementById(TOGGLE_ID), panel = document.getElementById(PANEL_ID);
+    if (toggle instanceof HTMLElement && toggle.parentNode !== document.body) document.body?.appendChild(toggle);
+    if (panel instanceof HTMLElement && panel.parentNode !== document.body) document.body?.appendChild(panel);
+    startShellGuard();
+  }
 
-    const toggle = document.getElementById(TOGGLE_ID);
-    const panel = document.getElementById(PANEL_ID);
-    if (toggle instanceof HTMLElement && toggle.parentNode !== document.body) {
-      document.body?.appendChild(toggle);
-    }
-    if (panel instanceof HTMLElement && panel.parentNode !== document.body) {
-      document.body?.appendChild(panel);
-    }
+  function shellNeedsRepair() {
+    const parent = document.head || document.documentElement;
+    const style = document.getElementById(STYLE_ID), toggle = document.getElementById(TOGGLE_ID), panel = document.getElementById(PANEL_ID);
+    return !style || style.parentNode !== parent || !toggle || toggle.parentNode !== document.body
+      || !panel || panel.parentNode !== document.body
+      || [document.documentElement, document.head, document.body].some(node => node && !shellGuardObservers.has(node));
   }
 
   function queueShellGuard() {
-    clearTimeout(shellGuardTimer);
-    shellGuardTimer = setTimeout(ensureShell, 120);
-  }
-
-  function observeContainer(container) {
-    if (!container) return;
-
-    const observer = new MutationObserver(queueShellGuard);
-    observer.observe(container, { childList: true });
+    // SVG filters, Token chips and other normal body children need no repair.
+    // A removed script panel/style must still be repaired, even though it is ours.
+    if (shellGuardTimer || !shellNeedsRepair()) return;
+    shellGuardTimer = setTimeout(() => { shellGuardTimer = 0; ensureShell(); }, 120);
   }
 
   function startShellGuard() {
-    observeContainer(document.documentElement);
-    observeContainer(document.head);
-    observeContainer(document.body);
+    const targets = new Set([document.documentElement, document.head, document.body].filter(Boolean));
+    for (const [node, observer] of shellGuardObservers) if (!targets.has(node)) {
+      observer.disconnect(); shellGuardObservers.delete(node);
+    }
+    for (const node of targets) if (!shellGuardObservers.has(node)) {
+      const observer = new MutationObserver(queueShellGuard);
+      observer.observe(node, { childList: true }); shellGuardObservers.set(node, observer);
+    }
   }
 
   function normalizeText(value) {
@@ -16267,42 +16614,44 @@
     collectAssistantRoots(scanRoot).forEach((root) => queueResidualRoot(root, true));
   }
 
+  function queueResidualMutations(mutations) {
+    const dirtyRoots = new Set();
+    for (const mutation of mutations) {
+      const target = mutation.target instanceof Element ? mutation.target : mutation.target?.parentElement;
+      if (target && (residualExcludedElement(target) || target.closest?.(`.${RESIDUAL_WRAPPER_CLASS}`))) continue;
+      const selfMutationCount = target && residualSelfMutationCounts.get(target);
+      if (selfMutationCount) {
+        if (selfMutationCount <= 1) residualSelfMutationCounts.delete(target);
+        else residualSelfMutationCounts.set(target, selfMutationCount - 1);
+        continue;
+      }
+      let externalNode = false;
+      mutation.addedNodes?.forEach(node => {
+        if (node.nodeType === Node.ELEMENT_NODE && node.closest?.(`.${RESIDUAL_WRAPPER_CLASS}`)) return;
+        externalNode = true;
+        if (node.nodeType === Node.ELEMENT_NODE) collectAssistantRoots(node).forEach(root => dirtyRoots.add(root));
+        else if (node.nodeType === Node.TEXT_NODE) {
+          const root = assistantContentRoot(node.parentElement);
+          if (root) dirtyRoots.add(root);
+        }
+      });
+      if ((externalNode || mutation.type === 'characterData') && target) {
+        const root = assistantContentRoot(target);
+        if (root) dirtyRoots.add(root);
+      }
+    }
+    // Each root performs the existing full-text gate and invalidates pending
+    // parsing once per delivery, regardless of how many DOM records it owns.
+    dirtyRoots.forEach(root => queueResidualRoot(root, true));
+  }
+
   function startResidualLatexObserver() {
     if (residualLatexObserverStarted) return;
     residualLatexObserverStarted = true;
     onReady(() => {
       installKatexCss();
       scanAssistantRoots();
-      const observer = new MutationObserver((mutations) => {
-        for (const mutation of mutations) {
-          const target = mutation.target instanceof Element ? mutation.target : mutation.target?.parentElement;
-          if (target && (residualExcludedElement(target) || target.closest?.(`.${RESIDUAL_WRAPPER_CLASS}`))) continue;
-          const selfMutationCount = target && residualSelfMutationCounts.get(target);
-          if (selfMutationCount) {
-            if (selfMutationCount <= 1) residualSelfMutationCounts.delete(target);
-            else residualSelfMutationCounts.set(target, selfMutationCount - 1);
-            continue;
-          }
-          let externalNode = false;
-          mutation.addedNodes?.forEach((node) => {
-            if (node.nodeType === Node.ELEMENT_NODE && node.closest?.(`.${RESIDUAL_WRAPPER_CLASS}`)) return;
-            externalNode = true;
-            if (node.nodeType === Node.ELEMENT_NODE) collectAssistantRoots(node).forEach((root) => queueResidualRoot(root, true));
-            else if (node.nodeType === Node.TEXT_NODE) {
-              const root = assistantContentRoot(node.parentElement);
-              if (root) queueResidualRoot(root, true);
-            }
-          });
-          if (externalNode && target) {
-            const root = assistantContentRoot(target);
-            if (root) queueResidualRoot(root, true);
-          }
-          if (mutation.type === 'characterData' && target) {
-            const root = assistantContentRoot(target);
-            if (root) queueResidualRoot(root, true);
-          }
-        }
-      });
+      const observer = new MutationObserver(queueResidualMutations);
       observer.observe(document.documentElement, { childList: true, characterData: true, subtree: true });
     });
   }
@@ -16468,6 +16817,11 @@
   }
 
   const STATIC_CSS = `
+    html[data-cgfc-stable-scroll-boundary],
+    html[data-cgfc-stable-scroll-boundary] :is(main, [role="main"]) .thread-scroll-container {
+      overscroll-behavior-y: none !important;
+    }
+
     /* The current footer paints a full-width solid surface and fade behind
        its composer. Clear only those direct decorative layers; the actual
        rounded input surface, content, controls and scroll container are intact. */
@@ -16731,7 +17085,7 @@
       font-size: var(--cgfc-font-size) !important;
     }
 
-    html[data-cgfc-normal-color] ${dilProseColorSelector} {
+    html[data-cgfc-normal-color]:not([data-cgfc-light-native-normal][data-cgfc-theme="light"]) ${dilProseColorSelector} {
       color: var(--cgfc-normal-color) !important;
     }
     html[data-cgfc-line-height] ${dilBodyTextSelector} {
@@ -16766,7 +17120,7 @@
       box-shadow: none;
     }
 
-    html[data-cgfc-normal-color] ${chatContentSelector} {
+    html[data-cgfc-normal-color]:not([data-cgfc-light-native-normal][data-cgfc-theme="light"]) ${chatContentSelector} {
       color: var(--cgfc-normal-color) !important;
     }
 
@@ -16797,7 +17151,7 @@
       line-height: var(--cgfc-line-height) !important;
     }
 
-    html[data-cgfc-normal-color] ${proseTextSelector} {
+    html[data-cgfc-normal-color]:not([data-cgfc-light-native-normal][data-cgfc-theme="light"]) ${proseTextSelector} {
       color: inherit !important;
     }
 
@@ -16830,7 +17184,7 @@
       font-family: var(--cgfc-bold-latin-font), var(--cgfc-bold-chinese-font), serif !important;
     }
 
-    html[data-cgfc-bold-color] ${boldTextSelector} {
+    html[data-cgfc-bold-color]:not([data-cgfc-light-native-bold][data-cgfc-theme="light"]) ${boldTextSelector} {
       color: var(--cgfc-bold-color) !important;
     }
 
@@ -19306,7 +19660,7 @@
     (document.head || root).appendChild(style);
     const entries = new Map(), parked = new Map();
     const PARK_LIMIT = 8, PARK_BYTES = 2 * 1024 * 1024;
-    let enabled = false, main = null, timer = 0, scanFrame = 0, observer = null, disposed = false, settingsKey = '', scans = 0, reused = 0, evicted = 0;
+    let enabled = false, main = null, timer = 0, scanFrame = 0, observer = null, routeObserver = null, disposed = false, settingsKey = '', scans = 0, reused = 0, evicted = 0;
     const retainedBytes = () => [...parked.values()].reduce((sum, entry) => sum + (entry.controller?.mapUrl?.length || 0) * 2, 0);
     const destroyEntry = (el, entry) => {
       parked.delete(el); entry.controller?.destroy(); entry.controller = null;
@@ -19344,12 +19698,21 @@
       const selector = runtime.dom.message + ',' + runtime.dom.content + ', [data-message-content], .whitespace-pre-wrap';
       if (records.some(r => [...r.addedNodes, ...r.removedNodes].some(n => n instanceof Element && (n.matches(selector) || n.querySelector(selector))))) schedule();
     };
+    function syncRouteWatch() {
+      if ((!enabled || disposed) && routeObserver) { routeObserver.disconnect(); routeObserver = null; }
+      if (enabled && !disposed && !routeObserver) routeObserver = runtime.pageWork.observe(root, { childList: true, subtree: true }, records => {
+        if (!main?.isConnected) { schedule(); return; }
+        if (records.some(record => !main.contains(record.target) && [...record.addedNodes, ...record.removedNodes].some(node =>
+          node instanceof Element && (node.matches('main,[role="main"]') || node.querySelector('main,[role="main"]'))))) schedule();
+      });
+    }
+    function onRoute() { schedule(); }
     function clear() {
       observer?.disconnect(); observer = null; io.disconnect();
       for (const [el, entry] of entries) destroyEntry(el, entry);
       entries.clear(); parked.clear(); main = null;
     }
-    function scan() {
+    function scan(reattachAll = false) {
       scanFrame = 0; timer = 0;
       if (disposed || !enabled || document.hidden) return;
       scans++;
@@ -19376,7 +19739,7 @@
         const turn = el.closest(runtime.dom.turn) || el, r = runtime.pageWork.rect(turn);
         entry.visible = r.width > 0 && r.height > 0 && r.bottom > -80 && r.top < innerHeight + 80;
       }
-      for (const [el, entry] of fresh) if (entry.visible) attach(el, entry);
+      for (const [el, entry] of reattachAll === true ? entries : fresh) if (entry.visible) attach(el, entry);
     }
     function schedule() {
       if (enabled && !timer && !scanFrame && !disposed && !document.hidden) timer = window.setTimeout(() => {
@@ -19386,7 +19749,7 @@
     function refresh() {
       const active = root.hasAttribute('data-cgfc-message-glass');
       if (active !== enabled) {
-        enabled = active;
+        enabled = active; syncRouteWatch();
         if (!enabled) {
           clearTimeout(timer); timer = 0; runtime.pageWork.cancelFrame(scanFrame); scanFrame = 0; clear(); return;
         }
@@ -19394,7 +19757,7 @@
       if (document.hidden) { for (const entry of entries.values()) entry.controller?.pause(); return; }
       if (enabled) {
         clearTimeout(timer); timer = 0; runtime.pageWork.cancelFrame(scanFrame); scanFrame = 0;
-        scan(); for (const [el, entry] of entries) attach(el, entry);
+        scan(true);
       }
     }
     function onSettings() {
@@ -19404,10 +19767,12 @@
     }
     function onResize() { if (enabled) for (const [el, entry] of entries) attach(el, entry); }
     function destroy() {
-      disposed = true; enabled = false; clearTimeout(timer); runtime.pageWork.cancelFrame(scanFrame); clear(); style.remove();
+      disposed = true; enabled = false; syncRouteWatch(); clearTimeout(timer); runtime.pageWork.cancelFrame(scanFrame); clear(); style.remove();
+      window.removeEventListener('popstate', onRoute); window.navigation?.removeEventListener('navigatesuccess', onRoute);
       document.removeEventListener('cgpt-unified-ui-settings-change', onSettings);
       document.removeEventListener('visibilitychange', refresh); window.removeEventListener('resize', onResize);
     }
+    window.addEventListener('popstate', onRoute); window.navigation?.addEventListener('navigatesuccess', onRoute);
     document.addEventListener('cgpt-unified-ui-settings-change', onSettings); onSettings();
     document.addEventListener('visibilitychange', refresh); window.addEventListener('resize', onResize, { passive: true });
     return { refresh, destroy, followMain: next => { if (enabled && next !== main) schedule(); }, getState: () => ({ enabled, observed: entries.size, active: [...entries.values()].filter(e => e.visible && e.controller).length, parked: parked.size, retainedBytes: retainedBytes(), parkLimit: PARK_LIMIT, parkByteLimit: PARK_BYTES, reused, evicted, scans }) };
@@ -19431,7 +19796,7 @@
     let canvas = null, world = null, renderer = null;
     let directCanvas = false, directDisabled = false, pendingSurface = null, bitmapFrames = 0, reducedSurface = false;
     let foreground = /* @__PURE__ */ new Set();
-    let raf = 0, frameTimer = 0, timer = 0, last = 0, layoutAt = -Infinity, busyAt = -Infinity;
+    let raf = 0, frameTimer = 0, layoutRaf = 0, layoutTimer = 0, timer = 0, last = 0, layoutAt = -Infinity, busyAt = -Infinity;
     let oceanWorker = null, workerFailed = false, workerError = '', epoch = 0, layoutVersion = 0, placementVersion = 0, sentLayout = -1, sentPlacement = -1;
     let workerState = null, pendingSplash = null, simulationSteps = 0, droppedFrames = 0;
     let rendererMode = 'canvas', motionMode = 'live', replayStatus = { state: 'live' }, statusText = '';
@@ -19459,6 +19824,7 @@
     let layoutReads = 0, drawnFrames = 0, frameCallbacks = 0, fieldTicks = 0, meanWorkMs = 0;
     const insideMask = (x, y) => masks.some((r) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h);
     function stopFrames() {
+      cancelAnimationFrame(layoutRaf); clearTimeout(layoutTimer); layoutRaf = layoutTimer = 0;
       epoch++;
       cancelAnimationFrame(raf);
       raf = 0;
@@ -19540,6 +19906,7 @@
       renderer.setDetail(quality === 'eco'); renderer.setExternalFieldClock(true);
     }
     function readBusy(editor) {
+      if (runtime.readQueueResponseState) return runtime.readQueueResponseState({ busyOnly: true }).busy === true;
       const visible = (el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== "hidden";
       if ([...document.querySelectorAll('[data-testid="stop-button"], [data-testid="composer-stop-button"], [data-testid*="stop-generating"]')].some(visible)) return true;
       const shell = editor?.closest("form, [data-chatgpt-composer]");
@@ -19825,6 +20192,13 @@
           last = 0;
           return;
         }
+        busy = pauseBusy && readBusy(document.querySelector(EDITOR));
+        busyAt = performance.now();
+        if (busy) {
+          stopFrames(); last = 0;
+          if (canvas) { canvas.hidden = true; canvas.dataset.state = 'generating'; }
+          return;
+        }
         if (canvas && reducedSurface !== motion.matches) release();
         if (!canvas) create();
         updateLayout();
@@ -19932,11 +20306,25 @@
         leave();
       }
     }
+    // Running frames already consume dirty layout at the existing 140ms cadence.
+    // A paused/reduced-motion surface gets at most one deferred layout refresh.
     function layoutChanged() {
-      if (!enabled || disposed || suspended || document.hidden) return;
       layoutDirty = true;
-      if (motion.matches || !raf && !frameTimer) refresh();
+      if (!enabled || disposed || suspended || document.hidden || (pauseBusy && busy)) return;
+      if (raf || frameTimer || layoutRaf || layoutTimer) return;
+      const schedule = () => {
+        layoutTimer = 0;
+        if (!enabled || disposed || suspended || document.hidden || (pauseBusy && busy)) return;
+        layoutRaf = requestAnimationFrame(() => {
+          layoutRaf = 0;
+          if (enabled && !disposed && !suspended && !document.hidden && !(pauseBusy && busy)) refresh();
+        });
+      };
+      const delay = Math.max(0, 140 - (performance.now() - layoutAt));
+      if (delay > 0) layoutTimer = window.setTimeout(schedule, delay);
+      else schedule();
     }
+    const onOceanScroll = runtime.pageWork.onScrollChange(layoutChanged);
     function pageHide() {
       suspended = true;
       release();
@@ -19947,17 +20335,17 @@
     }
     function fail(error) {
       console.warn("[ChatGPT ASCII Ocean] \u88C5\u9970\u5C42\u5DF2\u505C\u6B62\uFF0C\u5DE5\u5177\u7BB1\u7EE7\u7EED\u8FD0\u884C\u3002", error);
-      destroy();
+      destroy({ preserveMessageGlass: true });
     }
     const themeObserver = new MutationObserver(() => {
       layoutDirty = true;
       if (enabled && motion.matches) refresh();
     });
     themeObserver.observe(root, { attributes: true, attributeFilter: ["class", "data-cgfc-theme", "data-theme"] });
-    function destroy() {
+    function destroy({ preserveMessageGlass = false } = {}) {
       disposed = true;
       release();
-      messageGlass.destroy();
+      if (!preserveMessageGlass) messageGlass.destroy();
       clearInterval(timer);
       timer = 0;
       syncPointerListeners();
@@ -19970,7 +20358,7 @@
       window.removeEventListener("resize", layoutChanged);
       window.removeEventListener("pagehide", pageHide);
       window.removeEventListener("pageshow", pageShow);
-      document.removeEventListener("scroll", layoutChanged, true);
+      document.removeEventListener("scroll", onOceanScroll, true);
     }
     runtime.asciiSharks = { destroy, refresh, clearReplayCache: () => oceanWorker ? oceanWorker.clearReplay() : createOceanReplayEngine(World).clear().catch(() => {}), getState: () => ({ enabled, disposed, scene, coverage, homeCoverage, chatCoverage, state: canvas?.dataset.state || "off", fps, quality, density, colorMode, colorSeed, pointerEnabled, pointerBound, pointerActive: world?.pointer.active || false, fish: world?.fish.length || 0, sharks: world?.sharks.map((s) => s.kind) || [], masks, reading, scrollbarMasks, time: workerState?.time ?? world?.time ?? 0, backend: oceanWorker ? (workerState?.gpuCompute ? 'worker-webgl2-compute' : workerState?.gpu ? 'worker-webgl2' : 'worker-offscreen') : 'main', motionMode, presentation: directCanvas ? 'direct' : oceanWorker ? 'bitmap' : 'main', bitmapFrames, gpuCompute: !!workerState?.gpuCompute, computeError: workerState?.computeError || '', replay: replayStatus, workerSimulationMs: workerState?.simulationMs || 0, workerRenderMs: workerState?.renderMs || 0, workerError, simulationSteps: workerState?.simulationSteps ?? simulationSteps, droppedFrames, workerWorkMs: workerState?.workMs || 0, foreground: [...foreground].map((e) => e.tagName), layoutReads, drawnFrames, frameCallbacks, fieldTicks: workerState?.fieldTicks ?? fieldTicks, meanWorkMs, occludedCells: renderer?.getOccludedCells() || 0 }) };
     document.addEventListener("cgpt-unified-ui-settings-change", settingsChanged);
@@ -19979,7 +20367,7 @@
     window.addEventListener("resize", layoutChanged, { passive: true });
     window.addEventListener("pagehide", pageHide);
     window.addEventListener("pageshow", pageShow);
-    document.addEventListener("scroll", layoutChanged, { capture: true, passive: true });
+    document.addEventListener("scroll", onOceanScroll, { capture: true, passive: true });
     if (document.body) settingsChanged();
     else document.addEventListener("DOMContentLoaded", settingsChanged, { once: true });
   })();
