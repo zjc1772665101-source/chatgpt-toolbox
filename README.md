@@ -4,6 +4,35 @@
 
 当前版本：**v1.6.74**。设置分类默认折叠，十处玻璃分别配置；支持 GPU 海洋与轨迹回放，并修复新版输入框灰条及顶栏横向背景。269 项经过校验的界面偏好构成默认预设。
 
+[安装脚本](https://raw.githubusercontent.com/zjc1772665101-source/chatgpt-toolbox/main/chatgpt-toolbox.user.js) · [下载 Release](https://github.com/zjc1772665101-source/chatgpt-toolbox/releases/latest) · [查看演示](#演示)
+
+## 界面预览
+
+真实 ChatGPT 页面：章节导航、公式排版、独立玻璃与 ASCII 海洋。
+
+![ChatGPT 工具箱：真实页面中的章节导航、公式与海洋玻璃](docs/assets/overview.jpg)
+
+## 演示
+
+点击章节定位正文，再打开默认折叠的分类设置。以下为真实页面录制后压缩的循环动图；录制已降帧，不用于性能比较。
+
+![真实操作演示：海洋动画、章节跳转与打开设置](docs/assets/walkthrough.gif)
+
+<details>
+<summary>查看设置截图：分类折叠与各面板独立玻璃</summary>
+
+**分类默认折叠**：先选类别，再展开需要调整的选项。
+
+![默认折叠的设置分类](docs/assets/settings.jpg)
+
+**各面板独立设置**：输入框、导航、队列、主操作按钮等分别保存玻璃参数。
+
+![各面板独立玻璃设置](docs/assets/independent-glass.jpg)
+
+</details>
+
+截图与动图经授权选取真实数学对话正文，已隐藏账号入口，未展示私人提示词、原始会话地址或凭据。界面会随主题、窗口和个人设置变化。
+
 ## 安装
 
 [点击安装 ChatGPT 工具箱](https://raw.githubusercontent.com/zjc1772665101-source/chatgpt-toolbox/main/chatgpt-toolbox.user.js)
@@ -66,6 +95,7 @@
 - Token 估算同样在浏览器本地完成，不向第三方上传消息内容；完整活动分支读取复用脚本已有的 ChatGPT 会话接口与缓存。
 - 脚本不包含遥测或统计上报。
 - KaTeX 运行时和样式由 userscript 元数据中声明的 jsDelivr 地址加载。
+- README 中的截图与动图是经授权手动制作的演示素材；脚本不会自动录屏或上传聊天画面。
 
 ## 兼容性
 
