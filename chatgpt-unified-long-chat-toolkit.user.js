@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 长对话统一工具箱（性能·导航·提示词·导出·排版）
 // @namespace    local.codex.chatgpt.unified
-// @version      1.6.65
-// @description  ChatGPT 长对话工具箱；v1.6.65 为每项设置提供独立恢复默认按钮，回答玻璃仅作用于模型回答，保持画面与运动质量的计算优化；保留海洋和原有功能。
+// @version      1.6.73
+// @description  ChatGPT 长对话工具箱；独立玻璃参数与折叠设置、GPU 海洋与轨迹回放、新版输入框与顶栏适配、269 项界面默认设置。
 // @author       Codex；含 Alex S Hamilton 的 ChatGPT Lazy Chat++（GPL-3.0-or-later）
 // @homepageURL  https://github.com/zjc1772665101-source/chatgpt-unified-long-chat-toolkit
 // @supportURL   https://github.com/zjc1772665101-source/chatgpt-unified-long-chat-toolkit/issues
@@ -51,7 +51,7 @@
   const stampBootstrap = () => {
     const root = document.documentElement;
     if (!root) return;
-    root.setAttribute('data-cgpt-unified-version', '1.6.65');
+    root.setAttribute('data-cgpt-unified-version', '1.6.73');
     root.setAttribute('data-cgpt-unified-surface', isFrame ? (allowedSurface ? 'side-chat' : 'other-frame') : 'tab');
     root.setAttribute('data-cgpt-unified-bootstrap', bootstrapState);
   };
@@ -69,7 +69,112 @@
   const PROMPT_STORAGE_KEY = 'cgpt-unified-prompt-library-v1';
   const runtime = globalThis[RUNTIME_KEY] || (globalThis[RUNTIME_KEY] = {});
 
-  runtime.version = '1.6.65';
+  runtime.version = '1.6.73';
+  // Shared scheduling for navigation and floating UI. Cache only during a
+  // synchronous read phase; never retain DOM snapshots across frames/awaits.
+  runtime.pageWork = (() => {
+    let raf = 0, sequence = 0, cache = null;
+    const jobs = new Map(), roots = new Map();
+    const stats = { batches: 0, callbacks: 0, memoHits: 0, memoReads: 0, observerDeliveries: 0 };
+    const report = error => console.warn('[ChatGPT page work]', error);
+    // Glass surfaces share one ResizeObserver; subscribers still own cleanup.
+    let resizeObserver = null;
+    const sizeClients = new Map();
+    function observeSize(element, callback) {
+      if (typeof ResizeObserver !== 'function') return { disconnect() {} };
+      if (!resizeObserver) resizeObserver = new ResizeObserver(entries => {
+        for (const entry of entries) for (const client of [...(sizeClients.get(entry.target) || [])]) {
+          try { client(entry); } catch (error) { report(error); }
+        }
+      });
+      let clients = sizeClients.get(element);
+      if (!clients) { clients = new Set(); sizeClients.set(element, clients); resizeObserver.observe(element); }
+      clients.add(callback);
+      let disconnected = false;
+      return { disconnect() {
+        if (disconnected) return; disconnected = true;
+        clients.delete(callback);
+        if (!clients.size) { resizeObserver.unobserve(element); sizeClients.delete(element); }
+        if (!sizeClients.size) { resizeObserver.disconnect(); resizeObserver = null; }
+      } };
+    }
+
+    function fresh() { cache = new WeakMap(); }
+    function flush(timestamp) {
+      raf = 0; stats.batches++;
+      const batch = [...jobs.entries()];
+      // Legacy navigation callbacks may write DOM. Give each its own snapshot.
+      for (const [id, job] of batch.filter(([, job]) => !job.layout)) {
+        if (!jobs.delete(id)) continue;
+        fresh(); stats.callbacks++;
+        try { job.callback(timestamp); } catch (error) { report(error); }
+        finally { cache = null; }
+      }
+      const writes = [];
+      fresh();
+      try {
+        for (const [id, job] of batch.filter(([, job]) => job.layout).sort((a, b) => a[1].priority - b[1].priority)) {
+          if (!jobs.delete(id)) continue;
+          stats.callbacks++;
+          try { const write = job.callback(timestamp); if (typeof write === 'function') writes.push(write); }
+          catch (error) { report(error); }
+        }
+      } finally { cache = null; }
+      for (const write of writes) try { write(); } catch (error) { report(error); }
+    }
+    function request(callback, layout = false, priority = 0) {
+      const id = ++sequence; jobs.set(id, { callback, layout, priority });
+      if (!raf) raf = requestAnimationFrame(flush);
+      return id;
+    }
+    function memo(root, key, read) {
+      if (!cache || !root) return read();
+      let values = cache.get(root); if (!values) cache.set(root, values = new Map());
+      if (values.has(key)) { stats.memoHits++; return values.get(key); }
+      stats.memoReads++; const value = read(); values.set(key, value); return value;
+    }
+    function deliver(entry, records) {
+      if (!records.length) return;
+      stats.observerDeliveries++;
+      for (const item of [...entry.clients]) {
+        const selected = records.filter(record => (item.options.subtree || record.target === entry.root) && (record.type !== 'attributes'
+          ? item.options[record.type] === true
+          : item.options.attributes && (!item.options.attributeFilter || item.options.attributeFilter.includes(record.attributeName))));
+        if (selected.length) try { item.callback(selected); } catch (error) { report(error); }
+      }
+    }
+    function reobserve(entry) {
+      deliver(entry, entry.observer.takeRecords()); entry.observer.disconnect();
+      if (!entry.clients.size) { roots.delete(entry.root); return; }
+      const all = [...entry.clients].map(item => item.options);
+      const options = { subtree: true, childList: all.some(o => o.childList), characterData: all.some(o => o.characterData), attributes: all.some(o => o.attributes) };
+      const attrs = all.filter(o => o.attributes);
+      if (attrs.length && attrs.every(o => o.attributeFilter)) options.attributeFilter = [...new Set(attrs.flatMap(o => o.attributeFilter))];
+      entry.observer.observe(entry.root, options);
+    }
+    return {
+      observeSize,
+      requestFrame: callback => request(callback),
+      requestLayout: (callback, priority = 0) => request(callback, true, priority),
+      cancelFrame(id) { jobs.delete(id); if (!jobs.size && raf) { cancelAnimationFrame(raf); raf = 0; } },
+      memo,
+      invalidate() { if (cache) fresh(); },
+      query(root, selector) { return memo(root, 'query:' + selector, () => [...root.querySelectorAll(selector)]).slice(); },
+      rect(element) { return memo(element, 'rect', () => element.getBoundingClientRect()); },
+      planRect(element, rect) { if (!cache) return; let values = cache.get(element); if (!values) cache.set(element, values = new Map()); values.set('rect', rect); },
+      observe(root, options, callback) {
+        let entry = roots.get(root);
+        if (!entry) { entry = { root, clients: new Set() }; entry.observer = new MutationObserver(records => deliver(entry, records)); roots.set(root, entry); }
+        // Deliver old records before adding a new subscriber.
+        deliver(entry, entry.observer.takeRecords());
+        const item = { options, callback }; entry.clients.add(item); reobserve(entry);
+        let disconnected = false;
+        return { disconnect() { if (disconnected) return; disconnected = true; deliver(entry, entry.observer.takeRecords()); entry.clients.delete(item); reobserve(entry); } };
+      },
+      getState: () => ({ ...stats, queued: jobs.size, resizeObservers: resizeObserver ? 1 : 0, resizeTargets: sizeClients.size, observers: roots.size, subscribers: [...roots.values()].reduce((n, entry) => n + entry.clients.size, 0) }),
+    };
+  })();
+
   // Prefer semantic attributes over generated CSS class names. New ChatGPT
   // renders a user/assistant pair under data-turn-key without legacy role nodes.
   const dom = runtime.dom = Object.freeze({
@@ -108,17 +213,21 @@
         ? '' : child.textContent || '').join('');
     },
     main() {
+      return runtime.pageWork.memo(document, 'main', () => {
       const surfaces = [...document.querySelectorAll('main, [role="main"]')];
       const visible = surfaces.filter((node) => !node.closest('[hidden], [inert], [aria-hidden="true"]')
         && node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden');
       return visible.find((node) => node.querySelector('#prompt-textarea, [data-chatgpt-composer]'))
         || visible.find((node) => node.querySelector(this.message)) || visible[0] || null;
+      });
     },
     messages(root = this.main()) {
       if (!root) return [];
+      return runtime.pageWork.memo(root, 'messages', () => {
       const nodes = [...(root.matches?.(this.message) ? [root] : []), ...root.querySelectorAll(this.message)];
       return nodes.filter((node) => ['user', 'assistant'].includes(this.role(node))
         && !node.parentElement?.closest(this.message));
+      }).slice();
     },
     scrollBounds(element) {
       const extent = Math.max(0, element.scrollHeight - element.clientHeight);
@@ -130,6 +239,55 @@
       return Math.min(max, Math.max(min, value));
     },
   });
+  runtime.topBarFix?.destroy?.();
+  runtime.topBarFix = (() => {
+    const style = document.createElement('style'); style.id = 'cgpt-topbar-gap-fix';
+    style.textContent = `html[data-cgfc-topbar-overlap] [data-cgpt-topbar-frame]{margin-top:0!important}
+      html[data-cgfc-topbar-overlap] [data-cgpt-topbar-scroll]{padding-top:calc(var(--thread-content-top-inset,32px) + var(--cgpt-topbar-height,52px))!important}
+      html[data-cgfc-topbar-overlap] [data-cgpt-topbar-strip]{background:transparent!important;background-image:none!important;box-shadow:none!important}`;
+    (document.head || document.documentElement).appendChild(style);
+    let frame = 0, activeFrame = null, activeScroll = null, watchedHeader = null, headerObserver = null;
+    let strips = new Set();
+    function refresh() {
+      if (frame) return;
+      frame = runtime.pageWork.requestLayout(() => {
+        frame = 0;
+        const enabled = document.documentElement.hasAttribute('data-cgfc-topbar-overlap');
+        const target = document.querySelector('main [class*="MainContentViewport-"] > [class*="MainContentFrame-"]');
+        const scroll = target?.querySelector('.thread-scroll-container');
+        const header = document.querySelector('header[class*="fixed"]');
+        if (header !== watchedHeader) {
+          headerObserver?.disconnect(); watchedHeader = header;
+          headerObserver = header ? runtime.pageWork.observe(header, { childList: true, subtree: true }, refresh) : null;
+        }
+        const headerRect = header?.getBoundingClientRect(), height = headerRect?.height || 0;
+        const eligible = enabled && target && scroll && height >= 24 && height <= 120 && (target === activeFrame || parseFloat(getComputedStyle(target).marginTop) >= 24);
+        // Native toolbar gives its breadcrumb wrapper flex:1 and bg-surface.
+        // Only clear that wide, growing wrapper; compact action surfaces stay.
+        const nextStrips = new Set(enabled && header ? [...header.querySelectorAll('div[class~="bg-surface"],div[class~="browser:bg-surface"]')].filter(node => {
+          const rect = node.getBoundingClientRect(), css = getComputedStyle(node);
+          return node.querySelector('nav') && css.visibility !== 'hidden' && parseFloat(css.flexGrow) > 0
+            && rect.width >= Math.max(240, headerRect.width * .35) && rect.height >= 16 && rect.height <= height;
+        }) : []);
+        return () => {
+          for (const node of strips) if (!nextStrips.has(node)) node.removeAttribute('data-cgpt-topbar-strip');
+          for (const node of nextStrips) if (!node.hasAttribute('data-cgpt-topbar-strip')) node.setAttribute('data-cgpt-topbar-strip', '');
+          strips = nextStrips;
+          if (activeFrame && (!eligible || activeFrame !== target)) { activeFrame.removeAttribute('data-cgpt-topbar-frame'); activeScroll?.removeAttribute('data-cgpt-topbar-scroll'); activeScroll?.style.removeProperty('--cgpt-topbar-height'); activeFrame = activeScroll = null; }
+          if (eligible) {
+            activeFrame = target; activeScroll = scroll;
+            if (!target.hasAttribute('data-cgpt-topbar-frame')) target.setAttribute('data-cgpt-topbar-frame', '');
+            if (!scroll.hasAttribute('data-cgpt-topbar-scroll')) scroll.setAttribute('data-cgpt-topbar-scroll', '');
+            if (scroll.style.getPropertyValue('--cgpt-topbar-height') !== height + 'px') scroll.style.setProperty('--cgpt-topbar-height', height + 'px');
+          }
+        };
+      }, -10);
+    }
+    window.addEventListener('resize', refresh, { passive: true });
+    return { refresh, destroy() { runtime.pageWork.cancelFrame(frame); headerObserver?.disconnect(); window.removeEventListener('resize', refresh); for (const node of strips) node.removeAttribute('data-cgpt-topbar-strip'); activeFrame?.removeAttribute('data-cgpt-topbar-frame'); activeScroll?.removeAttribute('data-cgpt-topbar-scroll'); activeScroll?.style.removeProperty('--cgpt-topbar-height'); style.remove(); } };
+  })();
+
+
   runtime.lazy = runtime.lazy || null;
   // A disappearing stop button is only a pause, not proof that the final answer
   // finished. Thinking summaries can have their own copy button and markdown.
@@ -149,7 +307,7 @@
     const stopLabel = /^(?:stop(?: (?:generating|streaming|response))?|停止(?:生成|回答)?|中止生成)$/i;
     let busy = Array.from(document.querySelectorAll(stopSelector)).some(visible)
       || Array.from(composerShell?.querySelectorAll('button, [role="button"]') || []).some((button) =>
-        visible(button) && stopLabel.test((button.getAttribute('aria-label') || button.getAttribute('title') || button.textContent || '').trim()));
+        stopLabel.test((button.getAttribute('aria-label') || button.getAttribute('title') || button.textContent || '').trim()) && visible(button));
     if (options.busyOnly && busy) return { busy: true };
     if (!main) return { busy, complete: false, signature: 'no-main', hasUser: false };
     const users = Array.from(main.querySelectorAll(dom.user));
@@ -157,7 +315,6 @@
     const after = (left, right) => Boolean(left && right && (left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING));
     const assistants = Array.from(main.querySelectorAll(dom.assistant)).filter((node) => !user || after(user, node));
     const latest = assistants[assistants.length - 1];
-    const turns = Array.from(main.querySelectorAll(dom.turn));
     // Action bars can be siblings of a nested data-turn-key wrapper. Stay in
     // the current response, but include its outer turn instead of that wrapper.
     const responseTurn = (node) => {
@@ -168,24 +325,24 @@
       }
       return scope;
     };
-    const scope = responseTurn(latest) || user?.closest(dom.turn) || turns[turns.length - 1] || main;
+    const scope = responseTurn(latest) || user?.closest(dom.turn) || (() => { const turns = main.querySelectorAll(dom.turn); return turns[turns.length - 1]; })() || main;
     const overviewSelector = '[data-markdown-text-style="assistant-message"][data-markdown-text-tone="tertiary"]';
+    const activeLabel = /^(?:正在思考|思考中|正在搜索|搜索中|正在研究|正在处理|正在生成|正在回答|Thinking|Reasoning|Searching|Working|Generating)(?:\s*[.…]*)$/i;
+    const activeNodes = scope.querySelectorAll('[aria-busy="true"], [data-is-streaming="true"], [data-is-generating="true"], [role="status"], [aria-live], button, [data-testid*="thinking"], [data-testid*="reasoning"]');
+    busy ||= (scope.matches('[aria-busy="true"], [data-is-streaming="true"], [data-is-generating="true"]') && visible(scope))
+      || Array.from(activeNodes).some((node) => (
+        node.matches('[aria-busy="true"], [data-is-streaming="true"], [data-is-generating="true"]')
+        // A retained Thinking disclosure is a history control after completion.
+        || (!node.matches('button, [role="button"], summary, [data-state="closed"], [data-state="open"]')
+          && activeLabel.test((node.getAttribute('aria-label') || node.textContent || '').trim()))
+      ) && visible(node));
+    if (options.busyOnly) return { busy };
     const bodies = assistants.filter((node) => !dom.isThinkingOverview(node)
       && !node.closest(overviewSelector)
       // Legacy role wrappers can contain only a thinking overview.
       && !(node.querySelector(overviewSelector) && !node.matches('[data-markdown-text-style="assistant-message"]')
         && !node.querySelector('.markdown:not([data-markdown-text-tone="tertiary"]), [data-markdown-text-style="assistant-message"]:not([data-markdown-text-tone="tertiary"])')));
     const body = bodies[bodies.length - 1];
-    const activeLabel = /^(?:正在思考|思考中|正在搜索|搜索中|正在研究|正在处理|正在生成|正在回答|Thinking|Reasoning|Searching|Working|Generating)(?:\s*[.…]*)$/i;
-    const activeNodes = scope.querySelectorAll('[aria-busy="true"], [data-is-streaming="true"], [data-is-generating="true"], [role="status"], [aria-live], button, [data-testid*="thinking"], [data-testid*="reasoning"]');
-    busy ||= (scope.matches('[aria-busy="true"], [data-is-streaming="true"], [data-is-generating="true"]') && visible(scope))
-      || Array.from(activeNodes).some((node) => visible(node) && (
-        node.matches('[aria-busy="true"], [data-is-streaming="true"], [data-is-generating="true"]')
-        // A retained Thinking disclosure is a history control after completion.
-        || (!node.matches('button, [role="button"], summary, [data-state="closed"], [data-state="open"]')
-          && activeLabel.test((node.getAttribute('aria-label') || node.textContent || '').trim()))
-      ));
-    if (options.busyOnly) return { busy };
     const text = dom.messageText(body).trim();
     // Completion actions belong to the current final body. They may be hidden
     // until hover or outside a nested message wrapper; layout is not required.
@@ -1002,7 +1159,8 @@
       this.statsConversationId = null;
       clearInterval(this.refreshTimer);
       clearTimeout(this.mutationTimer);
-      if (this.positionRaf) cancelAnimationFrame(this.positionRaf);
+      if (this.positionRaf) runtime.pageWork.cancelFrame(this.positionRaf);
+      runtime.pageWork.cancelFrame(this.refreshFrame); this.refreshFrame = 0;
       this.refreshTimer = 0;
       this.mutationTimer = 0;
       this.positionRaf = 0;
@@ -1036,7 +1194,7 @@
       this.observer?.disconnect();
       this.observationRoot = target;
       this.messageStatsCache = new WeakMap();
-      this.observer = new MutationObserver((records) => {
+      this.observer = runtime.pageWork.observe(target, { childList: true, subtree: true, characterData: true }, (records) => {
         let externalChange = false;
         for (const record of records) {
           if (this.isOwnMutation(record)) continue;
@@ -1049,7 +1207,6 @@
         this.lastGenerating = generating;
         this.scheduleRefresh(justFinished);
       });
-      this.observer.observe(target, { childList: true, subtree: true, characterData: true });
     }
 
     invalidateMessageStats(record) {
@@ -1294,11 +1451,11 @@
       }
       const pill = root.querySelector('.cgpt-token-pill');
       const title = `可见文本 Token 估算：输入 ≈${input}，输出 ≈${output}，可见上下文 ≈${context}。不包含系统指令、记忆、工具定义、隐藏推理等服务端上下文，因此不是官方 usage。`;
-      pill?.setAttribute('title', title);
-      pill?.setAttribute('aria-label', title);
+      if (pill && pill.getAttribute('title') !== title) pill.setAttribute('title', title);
+      if (pill && pill.getAttribute('aria-label') !== title) pill.setAttribute('aria-label', title);
       const compact = this.compactAlways()
         || (this.compactOnNarrow() && (window.visualViewport?.width || window.innerWidth || 0) <= 640);
-      root.dataset.compact = String(compact);
+      if (root.dataset.compact !== String(compact)) root.dataset.compact = String(compact);
       this.schedulePosition();
     }
 
@@ -1355,10 +1512,10 @@
           if (!(node instanceof HTMLElement) || node.hidden || !node.isConnected) return false;
           const style = getComputedStyle(node);
           if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) <= 0) return false;
-          const rect = node.getBoundingClientRect();
+          const rect = runtime.pageWork.rect(node);
           return rect.width > 0 && rect.height > 0;
         })
-        .map((node) => node.getBoundingClientRect());
+        .map((node) => runtime.pageWork.rect(node));
     }
 
     rectsOverlap(a, b, padding = 6) {
@@ -1370,13 +1527,15 @@
 
     schedulePosition() {
       if (!this.active || !this.showSummary() || this.positionRaf) return;
-      this.positionRaf = window.requestAnimationFrame(() => {
+      this.positionRaf = runtime.pageWork.requestLayout(() => {
         this.positionRaf = 0;
-        this.refreshPosition();
-      });
+        return this.preparePosition();
+      }, 20);
     }
 
-    refreshPosition() {
+    refreshPosition() { this.schedulePosition(); }
+
+    preparePosition() {
       const root = document.getElementById(this.rootId);
       if (!(root instanceof HTMLElement) || !this.showSummary()) return;
 
@@ -1390,14 +1549,14 @@
       const edge = 10;
 
       const compact = this.compactAlways() || (this.compactOnNarrow() && viewportWidth <= 640);
-      root.dataset.compact = String(compact);
-      const measured = root.getBoundingClientRect();
+      if (root.dataset.compact !== String(compact)) return () => { root.dataset.compact = String(compact); this.schedulePosition(); };
+      const measured = runtime.pageWork.rect(root);
       const width = Math.max(1, measured.width);
       const height = Math.max(1, measured.height);
 
       const composer = this.findComposerForSummary();
       const shell = this.resolveComposerShellForSummary(composer);
-      const composerRect = shell instanceof Element ? shell.getBoundingClientRect() : null;
+      const composerRect = shell instanceof Element ? runtime.pageWork.rect(shell) : null;
       const offsetX = this.summaryOffset(this.summaryOffsetXAttr);
       const offsetY = this.summaryOffset(this.summaryOffsetYAttr);
 
@@ -1448,10 +1607,13 @@
         }
       }
 
+      return () => {
+      if (!root.isConnected || !this.active) return;
       root.style.left = `${Math.round(point.left)}px`;
       root.style.top = `${Math.round(point.top)}px`;
       root.style.removeProperty('right');
       root.style.removeProperty('bottom');
+      };
     }
 
     isGenerating() {
@@ -1531,10 +1693,12 @@
       if (!this.active) return;
       this.refreshPending = true;
       this.forceApiPending ||= forceApi;
-      if (this.mutationTimer) return;
+      if (this.mutationTimer || this.refreshFrame) return;
       // Coalesce streaming bursts without postponing the refresh indefinitely.
-      this.mutationTimer = window.setTimeout(async () => {
+      this.mutationTimer = window.setTimeout(() => {
         this.mutationTimer = 0;
+        this.refreshFrame = runtime.pageWork.requestFrame(async () => {
+        this.refreshFrame = 0;
         if (!this.active) return;
         const force = this.forceApiPending;
         this.refreshPending = false;
@@ -1548,6 +1712,7 @@
           this.refreshing = false;
           if (this.active && this.refreshPending) this.scheduleRefresh();
         }
+        });
       }, this.domDebounceMs);
     }
   }
@@ -3993,7 +4158,8 @@
       // The native surface owns attachments and the expanded editor as well.
       // A short draft may occupy only a few lines inside a viewport-sized card;
       // never reject this explicit owner based on the draft's text height.
-      const explicitSurface = composer.closest('[data-composer-surface="true"], [data-composer-surface-variant]');
+      const explicitSurface = composer.closest('[data-composer-surface="true"], [data-composer-surface-variant]')
+        || composer.closest('[class*="ComposerLayoutRoot-"][data-composer-layout]');
       if (explicitSurface instanceof Element) {
         const rect = explicitSurface.getBoundingClientRect();
         if (rect.width > 0 && rect.height > 0) return explicitSurface;
@@ -4075,13 +4241,15 @@
 
     schedulePosition() {
       if (this.positionRaf) return;
-      this.positionRaf = window.requestAnimationFrame(() => {
+      this.positionRaf = this.runtime.pageWork.requestLayout(() => {
         this.positionRaf = 0;
-        this.refreshPosition();
+        return this.preparePosition();
       });
     }
 
-    refreshPosition() {
+    refreshPosition() { this.schedulePosition(); }
+
+    preparePosition() {
       if (!this.ensureRoot()) return;
       const composer = this.runtime.promptLibrary?.findComposer?.();
       if (!composer) {
@@ -4108,7 +4276,8 @@
       }
       this.runtime.composerLiquidGlass?.attach(shell);
       this.runtime.surfaceLiquidGlass?.refresh(shell);
-      const rect = shell.getBoundingClientRect();
+      this.runtime.pageWork.invalidate();
+      const rect = this.runtime.pageWork.rect(shell);
       if (rect.width <= 0 || rect.height <= 0 || rect.bottom < 0 || rect.top > window.innerHeight) {
         this.root.hidden = true;
         return;
@@ -4126,13 +4295,16 @@
       const edge = 10;
       const rootStyles = getComputedStyle(document.documentElement);
       const preferredPanelWidth = Number.parseFloat(rootStyles.getPropertyValue('--cgfc-queue-panel-width')) || 420;
-      const panelWidth = Math.min(Math.max(280, preferredPanelWidth), viewportWidth - edge * 2);
-      this.panel.style.width = `${panelWidth}px`;
+      const panelWidth = Math.round(Math.min(Math.max(280, preferredPanelWidth), viewportWidth - edge * 2) * 100) / 100;
       const availableAbove = Math.max(120, rect.top - viewportTop - edge - 6);
-      this.panel.style.maxHeight = `${Math.min(440, viewportHeight - edge * 2, availableAbove)}px`;
+      const panelHeight = Math.round(Math.min(440, viewportHeight - edge * 2, availableAbove) * 100) / 100;
+      if (this.panel.style.width !== panelWidth + 'px' || this.panel.style.maxHeight !== panelHeight + 'px') return () => {
+        this.panel.style.width = panelWidth + 'px'; this.panel.style.maxHeight = panelHeight + 'px'; this.schedulePosition(); this.runtime.tokenStats?.schedulePosition();
+      };
+      const writes = [];
 
       const positionAboveComposer = (element, width) => {
-        const elementRect = element.getBoundingClientRect();
+        const elementRect = this.runtime.pageWork.rect(element);
         const safeWidth = Math.max(1, width || elementRect.width || 1);
         const safeHeight = Math.max(1, elementRect.height || 1);
         const left = Math.min(
@@ -4143,14 +4315,20 @@
           viewportBottom - edge - safeHeight,
           Math.max(viewportTop + edge, rect.top - safeHeight - 6),
         );
+        this.runtime.pageWork.planRect(element, new DOMRect(left, top, safeWidth, safeHeight));
+        const moved = element.style.left !== left + 'px' || element.style.top !== top + 'px';
+        writes.push(() => {
         element.style.removeProperty('right');
         element.style.removeProperty('bottom');
         element.style.left = `${left}px`;
         element.style.top = `${top}px`;
+        if (moved) this.runtime.tokenStats?.schedulePosition();
+        });
       };
 
-      positionAboveComposer(this.capsule, this.capsule.getBoundingClientRect().width);
+      positionAboveComposer(this.capsule, this.runtime.pageWork.rect(this.capsule).width);
       positionAboveComposer(this.panel, panelWidth);
+      return () => { if (!this.root?.isConnected) return; for (const write of writes) write(); };
     }
   }
 
@@ -4219,11 +4397,17 @@
     :is([data-cgfc-liquid-composer], [data-cgfc-liquid-surface]):focus-within {
       box-shadow: 0 10px 26px -14px rgba(0,0,0,var(--cgfc-glass-shadow)) !important;
     }
-    [data-cgfc-liquid-composer] { z-index: 0; }
+    [data-cgfc-liquid-composer] { z-index: 0; --composer-layout-surface-background: transparent !important; }
+    [data-cgfc-liquid-composer] :is([data-composer-body], [class*="ComposerLayoutBody-"], [class*="ComposerLayoutFooter-"]) {
+      --composer-layout-surface-background: transparent !important;
+    }
     [data-cgfc-liquid-surface] {
       background: rgba(var(--cgfc-glass-tint), var(--cgfc-glass-fill)) !important;
       -webkit-backdrop-filter: blur(var(--cgfc-glass-blur-px, 6px)) saturate(var(--cgfc-glass-saturation)) brightness(var(--cgfc-glass-luminance)) var(--cgfc-glass-filter, blur(0px)) !important;
       backdrop-filter: blur(var(--cgfc-glass-blur-px, 6px)) saturate(var(--cgfc-glass-saturation)) brightness(var(--cgfc-glass-luminance)) var(--cgfc-glass-filter, blur(0px)) !important;
+    }
+    :is([data-cgfc-liquid-composer],[data-cgfc-liquid-surface])[data-cgfc-glass-finish="refined"] {
+      box-shadow:inset 0 .75px 0 rgba(255,255,255,var(--cgfc-glass-edge-light,.22)),inset .5px 0 0 rgba(255,255,255,.07),inset 0 -.75px 0 rgba(0,0,0,var(--cgfc-glass-edge-shade,.15)),0 8px 24px -16px rgba(0,0,0,.28)!important;
     }
     [data-cgfc-liquid-surface="send"] {
       background: radial-gradient(ellipse at 30% 12%, color-mix(in srgb, var(--cgfc-glass-send-color, rgb(32,36,40)) 30%, transparent), transparent 72%),
@@ -4256,7 +4440,7 @@
     html[data-cgfc-liquid-glass] [data-cgfc-liquid-composer] :is([data-composer-body], [data-composer-input], [data-rich-text-layout]) {
       background-color: transparent !important;
     }
-    [data-cgfc-glass-effect], [data-cgfc-glass-tint], [data-cgfc-glass-sheen] {
+    [data-cgfc-glass-effect], [data-cgfc-glass-tint], [data-cgfc-glass-rim], [data-cgfc-glass-sheen] {
       position: absolute !important; inset: 0 !important; display: block !important;
       border-radius: inherit !important; pointer-events: none !important;
       user-select: none !important; box-sizing: border-box !important;
@@ -4273,6 +4457,16 @@
       z-index: -1 !important;
       background: rgba(var(--cgfc-glass-tint), var(--cgfc-glass-fill)) !important;
     }
+    [data-cgfc-glass-rim], [data-cgfc-liquid-surface="tools"]::before {
+      content: ""; position: absolute; inset: 0; pointer-events: none;
+      border-radius: inherit; padding: 1px; box-sizing: border-box;
+      background: conic-gradient(from -45deg,rgba(255,255,255,.95),rgba(255,255,255,.12) 16%,rgba(255,255,255,.02) 35%,rgba(255,255,255,.52) 51%,rgba(255,255,255,.02) 68%,rgba(255,255,255,.16) 85%,rgba(255,255,255,.95));
+      -webkit-mask: linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
+      -webkit-mask-composite: xor; mask-composite: exclude;
+      opacity: var(--cgfc-glass-edge-light,.225); z-index: 2;
+    }
+    [data-cgfc-glass-finish="classic"] > [data-cgfc-glass-rim] { display:none!important; }
+    [data-cgfc-liquid-surface="tools"][data-cgfc-glass-finish="classic"]::before { display:none; }
     [data-cgfc-glass-sheen] {
       z-index: 2 !important;
       background: radial-gradient(ellipse 180px 95px at var(--cgfc-glass-light-x, 26%) var(--cgfc-glass-light-y, -20%),
@@ -4291,7 +4485,7 @@
         -webkit-backdrop-filter: none !important; backdrop-filter: none !important;
         box-shadow: inset 0 0 0 1px CanvasText !important;
       }
-      [data-cgfc-glass-effect], [data-cgfc-glass-tint], [data-cgfc-glass-rim], [data-cgfc-glass-sheen] { display: none !important; }
+      [data-cgfc-glass-effect], [data-cgfc-glass-tint], [data-cgfc-glass-rim], [data-cgfc-glass-sheen], [data-cgfc-liquid-surface="tools"]::before { display: none !important; }
     }
   `;
 
@@ -4319,6 +4513,133 @@
     return profile;
   }
 
+  // Shared, bounded map cache. Geometry is reusable across cards and controllers.
+  function glassMapPixels(width, height, radius, bezel, optics) {
+    const profile = composerGlassProfile(optics.curvature, optics.bend);
+    const full = optics.renderMode === 'full';
+    const resolution = Math.min(optics.dpr || 1, full ? 1.5 : 1, (full ? 1400 : 1000) / width, (full ? 500 : 360) / height);
+    const w = Math.max(2, Math.round(width * resolution)), h = Math.max(2, Math.round(height * resolution));
+    const data = new Uint8ClampedArray(w * h * 4);
+    const neutral = new Uint32Array(new Uint8Array([128, 128, 128, 255]).buffer)[0];
+    new Uint32Array(data.buffer).fill(neutral);
+    const halfWidth = width / 2, halfHeight = height / 2, innerRadius = Math.max(radius, bezel);
+    // Iterate the optical border only, preserving the original pixel formula.
+    const row = y => {
+      const py = (y + .5) / h * height - height / 2;
+      let x = 0;
+      while (x < w) {
+        const px = (x + .5) / w * width - width / 2;
+        if ((Math.abs(px) <= halfWidth - innerRadius && Math.abs(py) <= halfHeight - bezel)
+          || (Math.abs(py) <= halfHeight - innerRadius && Math.abs(px) <= halfWidth - bezel)) {
+          const inner = Math.abs(py) <= halfHeight - innerRadius ? halfWidth - bezel : halfWidth - innerRadius;
+          x = Math.max(x + 1, Math.floor((inner + halfWidth) / width * w - .5) + 1);
+          continue;
+        }
+        const qx = Math.abs(px) - width / 2 + radius, qy = Math.abs(py) - height / 2 + radius;
+        const ax = Math.max(qx, 0), ay = Math.max(qy, 0), length = Math.hypot(ax, ay);
+        const depth = -(length + Math.min(Math.max(qx, qy), 0) - radius);
+        const nx = length > 0 ? ax / length * Math.sign(px) : qx > qy ? Math.sign(px) : 0;
+        const ny = length > 0 ? ay / length * Math.sign(py) : qy >= qx ? Math.sign(py) : 0;
+        let mag = 0;
+        if (depth > 0 && depth < bezel) {
+          const t = depth / bezel * 256, i = Math.floor(t), f = t - i;
+          mag = (profile.table[i] * (1 - f) + profile.table[Math.min(256, i + 1)] * f) / (profile.peak || 1);
+        }
+        const offset = (y * w + x) * 4;
+        data[offset] = Math.round(127.5 - nx * mag * 127.5);
+        data[offset + 1] = Math.round(127.5 - ny * mag * 127.5);
+        x++;
+      }
+    };
+    return { width: w, height: h, data, maxBend: profile.peak * bezel, row };
+  }
+
+  const glassMapService = (() => {
+    const cache = new Map(), pending = new Map();
+    let bytes = 0, worker = null, failed = false, sequence = 0, generation = 0;
+    const requests = new Map();
+    const stats = { hits: 0, builds: 0, workerBuilds: 0, fallbackBuilds: 0 };
+    const stop = (cancel = false) => {
+      if (cancel) generation++;
+      worker?.terminate(); worker = null;
+      for (const item of requests.values()) { clearTimeout(item.timer); item.reject(new Error('Glass worker unavailable')); }
+      requests.clear();
+    };
+    function getWorker() {
+      if (worker || failed) return worker;
+      try {
+        const source = `const glassProfileCache=new Map();${composerGlassProfile.toString()}\n${glassMapPixels.toString()}\nlet chain=Promise.resolve();onmessage=e=>{chain=chain.then(async()=>{const {id,args}=e.data;try{const m=glassMapPixels(...args);for(let y=0;y<m.height;y++)m.row(y);const c=new OffscreenCanvas(m.width,m.height);c.getContext('2d').putImageData(new ImageData(m.data,m.width,m.height),0,0);const blob=await c.convertToBlob({type:'image/png'});postMessage({id,result:{url:new FileReaderSync().readAsDataURL(blob),maxBend:m.maxBend}});}catch(error){postMessage({id,error:String(error)});}});};`;
+        const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+        try { worker = new Worker(url); } finally { URL.revokeObjectURL(url); }
+        worker.onmessage = ({ data }) => {
+          const item = requests.get(data.id); if (!item) return;
+          requests.delete(data.id); clearTimeout(item.timer);
+          if (data.error) item.reject(new Error(data.error)); else item.resolve(data.result);
+        };
+        worker.onerror = event => { event.preventDefault(); failed = true; stop(); };
+      } catch (_) { failed = true; stop(); }
+      return worker;
+    }
+    async function generate(args) {
+      const activeGeneration = generation;
+      const active = getWorker();
+      if (active) {
+        try {
+          const result = await new Promise((resolve, reject) => {
+            const id = ++sequence;
+            const timer = setTimeout(() => { failed = true; stop(); }, 6000);
+            requests.set(id, { resolve, reject, timer });
+            try { active.postMessage({ id, args }); } catch (error) { requests.delete(id); clearTimeout(timer); reject(error); }
+          });
+          stats.workerBuilds++; return result;
+        } catch (_) { /* CSP/unsupported OffscreenCanvas: preserve the same map. */ }
+      }
+      // Page teardown cancels unfinished work instead of spawning fallback work.
+      if (activeGeneration !== generation) throw new Error('Glass generation cancelled');
+      stats.fallbackBuilds++;
+      const map = glassMapPixels(...args);
+      for (let start = 0; start < map.height; start += 16) {
+        if (activeGeneration !== generation) throw new Error('Glass generation cancelled');
+        for (let y = start; y < Math.min(start + 16, map.height); y++) map.row(y);
+        if (start + 16 < map.height) await new Promise(resolve => setTimeout(resolve, 0));
+      }
+      const canvas = document.createElement('canvas'); canvas.width = map.width; canvas.height = map.height;
+      canvas.getContext('2d').putImageData(new ImageData(map.data, map.width, map.height), 0, 0);
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+      if (!blob) throw new Error('Glass PNG encoding failed');
+      const url = await new Promise((resolve, reject) => {
+        const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = () => reject(reader.error); reader.readAsDataURL(blob);
+      });
+      return { url, maxBend: map.maxBend };
+    }
+    return {
+      has(width, height, radius, bezel, optics) {
+        return cache.has(JSON.stringify([width, height, radius, bezel, optics.curvature, optics.bend, optics.renderMode, window.devicePixelRatio || 1]));
+      },
+      async get(width, height, radius, bezel, optics) {
+        const args = [width, height, radius, bezel, { ...optics, dpr: window.devicePixelRatio || 1 }];
+        const key = JSON.stringify([width, height, radius, bezel, optics.curvature, optics.bend, optics.renderMode, args[4].dpr]);
+        if (cache.has(key)) { stats.hits++; const result = cache.get(key); cache.delete(key); cache.set(key, result); return result; }
+        if (pending.has(key)) { stats.hits++; return pending.get(key); }
+        const promise = generate(args).then(result => {
+          stats.builds++;
+          // UTF-16 strings: cap retained maps to 8 MiB and 24 geometries.
+          const size = result.url.length * 2;
+          if (size <= 8 * 1024 * 1024) {
+            cache.set(key, result); bytes += size;
+            while (bytes > 8 * 1024 * 1024 || cache.size > 24) { const oldest = cache.keys().next().value; bytes -= cache.get(oldest).url.length * 2; cache.delete(oldest); }
+          }
+          return result;
+        }).finally(() => pending.delete(key));
+        pending.set(key, promise); return promise;
+      },
+      getState: () => ({ ...stats, entries: cache.size, bytes, pending: pending.size, backend: worker ? 'worker' : failed ? 'fallback' : 'idle' }),
+      stop: () => stop(true),
+    };
+  })();
+  runtime.glassMapService = glassMapService;
+  window.addEventListener('pagehide', () => glassMapService.stop());
+
   let glassOpticsFrameTime = -1;
   let glassOpticsFrameValue = null;
   class ComposerLiquidGlass {
@@ -4329,16 +4650,17 @@
       this.id = `cgpt-composer-glass-${Math.random().toString(36).slice(2, 10)}`;
       this.candidate = null; this.shell = null; this.raf = 0; this.lightRaf = 0;
       this.signature = ''; this.revision = 0; this.pointer = null;
+      this.buildEpoch = 0; this.pendingBuildKey = ''; this.buildTimer = 0;
       this.mapGeometry = ''; this.pendingGeometry = ''; this.readyGeometry = ''; this.resizeTimer = 0;
       this.onSettings = () => { glassOpticsFrameValue = null; this.attach(this.candidate || (!this.options.kind ? this.runtime?.composerQueueDock?.neumorphicShell : null)); };
       this.onPointer = event => {
         if (this.reducedMotion?.matches || !this.shell) return;
         this.pointer = { x: event.clientX, y: event.clientY };
-        if (!this.lightRaf) this.lightRaf = requestAnimationFrame(() => { this.lightRaf = 0; this.paintLight(); });
+        if (!this.lightRaf) this.lightRaf = this.runtime.pageWork.requestLayout(() => { this.lightRaf = 0; return this.prepareLight(); }, 30);
       };
       this.onLeave = () => {
         this.pointer = null;
-        if (this.lightRaf) cancelAnimationFrame(this.lightRaf);
+        if (this.lightRaf) this.runtime.pageWork.cancelFrame(this.lightRaf);
         this.lightRaf = 0;
         this.defaultLight();
       };
@@ -4372,17 +4694,17 @@
             next.addEventListener('pointerleave', this.onLeave, { passive: true });
           }
           if (typeof ResizeObserver === 'function') {
-            this.resizeObserver = new ResizeObserver(() => this.schedule()); this.resizeObserver.observe(next);
+            this.resizeObserver = this.runtime.pageWork.observeSize(next, () => this.schedule());
           }
           if (!this.options.direct) {
             this.surfaceObserver = new MutationObserver(() => {
               if (this.shell !== next || !next.isConnected) return;
-              if (['effect', 'tint', 'sheen'].some(key => this[key]?.parentElement !== next)) this.attach(next);
+              if (['effect', 'tint', 'rim', 'sheen'].some(key => this[key]?.parentElement !== next)) this.attach(next);
               else this.schedule();
             });
             this.surfaceObserver.observe(next, { childList: true, attributes: true, attributeFilter: ['data-composer-layout', 'data-composer-radius-variant', 'data-composer-surface-variant'] });
           }
-          if (typeof IntersectionObserver === 'function') {
+          if (!this.options.visibilityManaged && typeof IntersectionObserver === 'function') {
             this.intersectionObserver = new IntersectionObserver(entries => {
               if (this.shell !== next) return;
               this.offscreen = !entries[0]?.isIntersecting;
@@ -4393,9 +4715,7 @@
         }
       }
       if (!this.shell) return;
-      // Remove legacy rim nodes, including framework clones of older material.
-      for (const child of Array.from(this.shell.children)) if (child.hasAttribute('data-cgfc-glass-rim')) child.remove();
-      for (const key of this.options.direct ? [] : ['effect', 'tint', 'sheen']) {
+      for (const key of this.options.direct ? [] : ['effect', 'tint', 'rim', 'sheen']) {
         const attr = `data-cgfc-glass-${key}`;
         for (const child of Array.from(this.shell.children)) if (child.hasAttribute(attr) && child !== this[key]) child.remove();
         if (!this[key] || this[key].parentElement !== this.shell) {
@@ -4408,35 +4728,44 @@
       this.schedule();
     }
 
+    setSurfaceStyle(name, value) {
+      if (this.shell && this.shell.style.getPropertyValue(name) !== value) this.shell.style.setProperty(name, value);
+    }
+
     defaultLight() {
       if (!this.shell) return;
       this.shell.removeAttribute('data-cgfc-glass-hover');
       this.shell.style.removeProperty('--cgfc-glass-light-x'); this.shell.style.removeProperty('--cgfc-glass-light-y');
     }
 
-    paintLight() {
+    paintLight() { this.prepareLight()?.(); }
+
+    prepareLight() {
       if (!this.shell || !this.pointer) return;
-      const rect = this.shell.getBoundingClientRect();
+      const shell = this.shell, rect = this.runtime.pageWork.rect(shell);
       if (rect.width < 2 || rect.height < 2) return;
       const x = Math.max(0, Math.min(1, (this.pointer.x - rect.left) / rect.width));
       const y = Math.max(0, Math.min(1, (this.pointer.y - rect.top) / rect.height));
-      this.shell.setAttribute('data-cgfc-glass-hover', '');
-      this.shell.style.setProperty('--cgfc-glass-light-x', `${(x * 100).toFixed(1)}%`);
-      this.shell.style.setProperty('--cgfc-glass-light-y', `${(y * 100).toFixed(1)}%`);
+      return () => {
+        if (this.shell !== shell || !this.pointer) return;
+        if (!shell.hasAttribute('data-cgfc-glass-hover')) shell.setAttribute('data-cgfc-glass-hover', '');
+        this.setSurfaceStyle('--cgfc-glass-light-x', `${(x * 100).toFixed(1)}%`);
+        this.setSurfaceStyle('--cgfc-glass-light-y', `${(y * 100).toFixed(1)}%`);
+      };
     }
 
     schedule() {
       if (this.raf || !this.shell) return;
-      if (document.hidden) { this.pause(); return; }
-      this.raf = requestAnimationFrame(frameTime => {
+      if (document.hidden || this.offscreen) { this.pause(); return; }
+      this.raf = this.runtime.pageWork.requestFrame(frameTime => {
         this.raf = 0;
         try { this.render(frameTime); } catch (error) { this.fallback(); this.lastError = String(error?.message || error); }
       });
     }
 
     pause() {
-      if (this.raf) cancelAnimationFrame(this.raf); this.raf = 0;
-      this.clearResizeBuild();
+      if (this.raf) this.runtime.pageWork.cancelFrame(this.raf); this.raf = 0;
+      this.cancelMapBuild(); this.clearResizeBuild();
       if (!this.shell || this.suspended) return;
       this.suspended = true;
       this.shell.setAttribute(this.modeAttribute, 'paused');
@@ -4444,7 +4773,7 @@
     }
 
     fallback() {
-      this.clearResizeBuild(); this.mapGeometry = '';
+      this.cancelMapBuild(); this.clearResizeBuild(); this.mapGeometry = '';
       this.shell?.setAttribute(this.modeAttribute, 'blur');
       this.shell?.style.removeProperty('--cgfc-glass-filter');
       this.svg?.remove(); this.svg = null; this.filter = null; this.displacements = null;
@@ -4457,9 +4786,14 @@
     }
 
     deferResizeBuild(geometry) {
-      if (!this.filter || !this.mapGeometry || geometry === this.mapGeometry || geometry === this.readyGeometry) {
+      if (!this.filter || !this.mapGeometry || geometry === this.mapGeometry) {
         this.clearResizeBuild(); return false;
       }
+      // Keep the settled geometry approved while its async map is queued or
+      // encoding. A second render must not cancel that build and debounce it
+      // again, otherwise busy native layouts can remain frosted indefinitely.
+      if (geometry === this.readyGeometry) return false;
+      if (this.pendingBuildKey) this.cancelMapBuild();
       // Keep the blur/tint layers covering the whole native card while its
       // dimensions animate. Build one exact map after the layout settles,
       // rather than doing pixel generation + PNG encoding on every frame.
@@ -4477,10 +4811,14 @@
     }
 
     readOptics(frameTime) {
-      if (this.options.kind !== 'message' && Number.isFinite(frameTime) && glassOpticsFrameTime === frameTime && glassOpticsFrameValue) return { ...glassOpticsFrameValue };
+      const message = this.options.kind === 'message', group = this.options.kind || 'composer';
+      const frame = Number.isFinite(frameTime);
+      if (frame && (glassOpticsFrameTime !== frameTime || !glassOpticsFrameValue)) {
+        glassOpticsFrameTime = frameTime; glassOpticsFrameValue = {};
+      }
+      if (frame && glassOpticsFrameValue[group]) return { ...glassOpticsFrameValue[group] };
       const style = getComputedStyle(document.documentElement);
-      const message = this.options.kind === 'message';
-      const prefix = message ? '--cgfc-message-glass-' : '--cgfc-glass-';
+      const prefix = this.options.kind ? '--cgfc-' + this.options.kind + '-glass-' : '--cgfc-glass-';
       const number = (key, fallback, min, max) => {
         const value = parseFloat(style.getPropertyValue(prefix + key));
         return Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : fallback;
@@ -4488,9 +4826,11 @@
       const optics = { strength: number('strength', 36, 0, 60), blur: number('blur', 6, 0, 20),
         thickness: number('thickness', 14, 4, 48), glare: number('glare', .45, 0, 1.6),
         curvature: number('curvature', .5, 0, 1), bend: number('bend', .5, 0, 1), chroma: number('chroma', .04, 0, .6),
-        soft: document.documentElement.getAttribute(message ? 'data-cgfc-message-glass-style' : 'data-cgfc-glass-style') !== 'clear',
-        renderMode: document.documentElement.getAttribute(message ? 'data-cgfc-message-glass-render-mode' : 'data-cgfc-glass-render-mode') || 'balanced' };
-      if (!message && Number.isFinite(frameTime)) { glassOpticsFrameTime = frameTime; glassOpticsFrameValue = optics; }
+        opacity: number('opacity', .12, 0, .85),
+        finish: document.documentElement.getAttribute(this.options.kind ? 'data-cgfc-' + this.options.kind + '-glass-finish' : 'data-cgfc-glass-finish') || 'refined',
+        soft: document.documentElement.getAttribute(this.options.kind ? 'data-cgfc-' + this.options.kind + '-glass-style' : 'data-cgfc-glass-style') !== 'clear',
+        renderMode: document.documentElement.getAttribute(this.options.kind ? 'data-cgfc-' + this.options.kind + '-glass-render-mode' : 'data-cgfc-glass-render-mode') || 'balanced' };
+      if (frame) glassOpticsFrameValue[group] = optics;
       return { ...optics };
     }
 
@@ -4500,16 +4840,15 @@
       if (document.hidden || this.offscreen) { this.pause(); return; }
       // Native composer re-layout can remove unmanaged children or SVG defs
       // without changing its final size. A geometry cache alone misses this.
-      if (!this.options.direct && ['effect', 'tint', 'sheen'].some(key => this[key]?.parentElement !== shell)) { this.attach(shell); return; }
+      if (!this.options.direct && ['effect', 'tint', 'rim', 'sheen'].some(key => this[key]?.parentElement !== shell)) { this.attach(shell); return; }
       if (this.filter && (!this.svg?.isConnected || !this.filter.isConnected)) this.fallback();
-      const rect = shell.getBoundingClientRect(); if (rect.width < 2 || rect.height < 2) { this.pause(); return; }
+      const rect = this.runtime.pageWork.rect(shell); if (rect.width < 2 || rect.height < 2) { this.pause(); return; }
       const nativeBody = !this.options.direct ? shell.querySelector('[data-composer-body]') : null;
       const nativeLayout = shell.getAttribute('data-composer-layout') || '';
       const nativeLayoutChanged = this.nativeBody !== nativeBody || this.nativeLayout !== nativeLayout;
       this.nativeBody = nativeBody; this.nativeLayout = nativeLayout;
       const resume = this.suspended || nativeLayoutChanged; this.suspended = false;
       const optics = this.readOptics(frameTime), width = Math.round(rect.width), height = Math.round(rect.height);
-      if (this.options.direct && !['send', 'scroll', 'stats', 'toggle', 'message'].includes(this.options.kind)) optics.blur = Math.max(8, optics.blur);
       let radiusText = getComputedStyle(shell).borderTopLeftRadius, radiusRect = rect;
       if (!this.options.direct && !(parseFloat(radiusText) > 0)) {
         const nativeBody = shell.querySelector('[data-composer-body]');
@@ -4520,64 +4859,72 @@
       const parsedRadius = Math.min(resolveRadius(radii[0], radiusRect.width), resolveRadius(radii[1] || radii[0], radiusRect.height));
       const rawRadius = this.options.kind === 'message' ? parsedRadius : parsedRadius || 26;
       const radius = Math.min(width / 2, height / 2, rawRadius);
-      if (!this.options.direct) for (const key of ['effect', 'tint', 'sheen']) {
+      if (!this.options.direct) for (const key of ['effect', 'tint', 'rim', 'sheen']) {
         if (this[key]?.style.getPropertyValue('border-radius') !== radius + 'px') this[key]?.style.setProperty('border-radius', radius + 'px', 'important');
       }
-      this.blurPx = optics.soft ? Math.max(optics.blur, 6) : optics.blur;
-      shell.style.setProperty('--cgfc-glass-blur-px', `${this.blurPx}px`);
-      shell.style.setProperty('--cgfc-glass-sheen-opacity', '0');
-      shell.style.setProperty('--cgfc-glass-hover-opacity', String(Math.min(.4, optics.glare * .55)));
-      shell.style.setProperty('--cgfc-glass-press-opacity', String(Math.min(.55, optics.glare * .7)));
+      this.blurPx = optics.blur;
+      shell.setAttribute('data-cgfc-glass-finish', optics.finish);
+      const dark = document.documentElement.matches('html.dark:not([data-cgfc-theme="light"]),html[data-cgfc-theme="dark"]');
+      const fill = dark ? (optics.soft ? .12 + optics.opacity * .45 : .10 + optics.opacity * .4) : (optics.soft ? .06 + optics.opacity * .5 : .02 + optics.opacity * .18);
+      this.setSurfaceStyle('--cgfc-glass-fill', String(fill));
+      this.setSurfaceStyle('--cgfc-glass-edge-light', String(Math.min(.65, optics.glare * .5)));
+      this.setSurfaceStyle('--cgfc-glass-edge-shade', String(Math.min(.4, optics.glare * .35)));
+      this.setSurfaceStyle('--cgfc-glass-blur-px', `${this.blurPx}px`);
+      this.setSurfaceStyle('--cgfc-glass-sheen-opacity', '0');
+      this.setSurfaceStyle('--cgfc-glass-hover-opacity', String(Math.min(.4, optics.glare * .55)));
+      this.setSurfaceStyle('--cgfc-glass-press-opacity', String(Math.min(.55, optics.glare * .7)));
       const chromium = /\b(?:HeadlessChrome|Chrome|Chromium|Edg)\//.test(navigator.userAgent) && !/\b(?:CriOS|EdgiOS)\//.test(navigator.userAgent);
       if (!chromium || optics.strength === 0 || optics.renderMode === 'frosted') { this.fallback(); return; }
       // Constant-width optical bezel; never turn a long textbox into a fisheye.
       const bezel = Math.min(optics.thickness, height * .24, width * .2);
       const chromatic = optics.renderMode === 'full' && optics.chroma > 0;
-      const geometry = [width, height, radius].join(':');
-      const signature = [width, height, radius, bezel, optics.curvature, optics.bend, optics.renderMode, chromatic].join(':');
+      const pixelRatio = window.devicePixelRatio || 1;
+      const geometry = [width, height, radius, pixelRatio].join(':');
+      const signature = [width, height, radius, bezel, optics.curvature, optics.bend, optics.renderMode, chromatic, pixelRatio].join(':');
       if (this.deferResizeBuild(geometry)) return;
       if (signature !== this.signature) {
-        this.buildMap(width, height, radius, bezel, optics); this.signature = signature; this.mapGeometry = geometry;
+        this.queueMapBuild(width, height, radius, bezel, optics, signature, geometry);
+        return;
       }
       this.applyOptics(optics);
       if ((resume || !shell.style.getPropertyValue('--cgfc-glass-filter')) && this.filter) this.rekey();
-      shell.setAttribute(this.modeAttribute, 'refraction');
+      if (shell.getAttribute(this.modeAttribute) !== 'refraction') shell.setAttribute(this.modeAttribute, 'refraction');
       this.lastError = '';
     }
 
-    buildMap(width, height, radius, bezel, optics) {
-      const started = performance.now(), profile = composerGlassProfile(optics.curvature, optics.bend);
-      const full = optics.renderMode === 'full';
-      const resolution = Math.min(window.devicePixelRatio || 1, full ? 1.5 : 1, (full ? 1400 : 1000) / width, (full ? 500 : 360) / height);
-      const canvas = document.createElement('canvas'); canvas.width = Math.max(2, Math.round(width * resolution)); canvas.height = Math.max(2, Math.round(height * resolution));
-      const ctx = canvas.getContext('2d'); if (!ctx) throw new Error('Canvas 2D unavailable');
-      const img = ctx.createImageData(canvas.width, canvas.height);
-      const neutral = new Uint32Array(new Uint8Array([128, 128, 128, 255]).buffer)[0];
-      new Uint32Array(img.data.buffer).fill(neutral);
-      const halfWidth = width / 2, halfHeight = height / 2, innerRadius = Math.max(radius, bezel);
-      for (let y = 0; y < canvas.height; y += 1) for (let x = 0; x < canvas.width; x += 1) {
-        const px = (x + .5) / canvas.width * width - width / 2, py = (y + .5) / canvas.height * height - height / 2;
-        // Flat interior pixels have exactly the neutral vector. Skip their
-        // distance/normal calculations without changing any optical pixels.
-        if ((Math.abs(px) <= halfWidth - innerRadius && Math.abs(py) <= halfHeight - bezel)
-          || (Math.abs(py) <= halfHeight - innerRadius && Math.abs(px) <= halfWidth - bezel)) continue;
-        const qx = Math.abs(px) - width / 2 + radius, qy = Math.abs(py) - height / 2 + radius;
-        const ax = Math.max(qx, 0), ay = Math.max(qy, 0), length = Math.hypot(ax, ay);
-        const depth = -(length + Math.min(Math.max(qx, qy), 0) - radius);
-        const nx = length > 0 ? ax / length * Math.sign(px) : qx > qy ? Math.sign(px) : 0;
-        const ny = length > 0 ? ay / length * Math.sign(py) : qy >= qx ? Math.sign(py) : 0;
-        let mag = 0;
-        if (depth > 0 && depth < bezel) {
-          const t = depth / bezel * 256, i = Math.floor(t), f = t - i;
-          mag = (profile.table[i] * (1 - f) + profile.table[Math.min(256, i + 1)] * f) / (profile.peak || 1);
+    cancelMapBuild() {
+      this.buildEpoch++; this.pendingBuildKey = '';
+      clearTimeout(this.buildTimer); this.buildTimer = 0;
+    }
+
+    queueMapBuild(width, height, radius, bezel, optics, signature, geometry) {
+      if (this.pendingBuildKey === signature) return;
+      this.cancelMapBuild();
+      const epoch = this.buildEpoch, shell = this.shell;
+      this.pendingBuildKey = signature;
+      shell.setAttribute(this.modeAttribute, 'blur');
+      shell.style.removeProperty('--cgfc-glass-filter');
+      // Coalesce initial mount/size changes before dispatching expensive work.
+      this.buildTimer = setTimeout(async () => {
+        this.buildTimer = 0;
+        const started = performance.now();
+        try {
+          const map = await glassMapService.get(width, height, radius, bezel, optics);
+          if (epoch !== this.buildEpoch || shell !== this.shell || !shell?.isConnected || this.suspended || this.offscreen || document.hidden) return;
+          this.buildMap(width, height, optics, map);
+          this.signature = signature; this.mapGeometry = geometry;
+          this.pendingBuildKey = '';
+          this.lastBuildMs = Math.round((performance.now() - started) * 10) / 10;
+          this.schedule();
+        } catch (error) {
+          if (epoch !== this.buildEpoch) return;
+          this.fallback(); this.lastError = String(error?.message || error);
         }
-        const offset = (y * canvas.width + x) * 4;
-        img.data[offset] = Math.round(127.5 - nx * mag * 127.5);
-        img.data[offset + 1] = Math.round(127.5 - ny * mag * 127.5);
-        img.data[offset + 2] = 128; img.data[offset + 3] = 255;
-      }
-      ctx.putImageData(img, 0, 0);
-      const url = canvas.toDataURL(), ns = 'http://www.w3.org/2000/svg';
+      }, glassMapService.has(width, height, radius, bezel, optics) ? 0 : 60);
+    }
+
+    buildMap(width, height, optics, map) {
+      const url = map.url, ns = 'http://www.w3.org/2000/svg';
       const make = (tag, attrs = {}) => { const node = document.createElementNS(ns, tag); for (const [k,v] of Object.entries(attrs)) node.setAttribute(k, String(v)); return node; };
       const svg = make('svg', { width: 0, height: 0, 'aria-hidden': 'true', focusable: 'false' });
       svg.style.cssText = 'position:absolute;left:0;top:0;width:0;height:0;pointer-events:none;overflow:hidden';
@@ -4585,7 +4932,7 @@
       filter.appendChild(make('feImage', { href: url, x: 0, y: 0, width, height, preserveAspectRatio: 'none', result: 'map' }));
       const matrices = ['1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0', '0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 1 0', '0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 1 0'];
       this.displacements = [];
-      const chromatic = full && optics.chroma > 0;
+      const chromatic = optics.renderMode === 'full' && optics.chroma > 0;
       for (let c = 0; c < (chromatic ? 3 : 1); c += 1) {
         this.displacements.push(filter.appendChild(make('feDisplacementMap', { in: 'SourceGraphic', in2: 'map', scale: 0, xChannelSelector: 'R', yChannelSelector: 'G', result: `bend${c}` })));
         if (chromatic) filter.appendChild(make('feColorMatrix', { in: `bend${c}`, type: 'matrix', values: matrices[c], result: `channel${c}` }));
@@ -4604,9 +4951,8 @@
         });
         this.defsObserver.observe(svg.parentNode, { childList: true });
       }
-      this.maxBend = profile.peak * bezel; this.opticsSignature = ''; this.mapUrl = url;
+      this.maxBend = map.maxBend; this.opticsSignature = ''; this.mapUrl = url;
       this.shell.setAttribute(this.modeAttribute, 'refraction'); previous?.remove();
-      this.lastBuildMs = Math.round((performance.now() - started) * 10) / 10;
       this.mapBuildCount = (this.mapBuildCount || 0) + 1;
       const probe = new Image(); probe.src = url;
       probe.decode?.().then(() => { if (this.svg === svg) this.rekey(); }).catch(() => {});
@@ -4614,10 +4960,11 @@
 
     applyOptics(optics) {
       if (!this.filter || !this.shell) return;
-      const signature = `${optics.strength}:${this.displacements.length === 3 ? optics.chroma : 0}`;
+      const signature = `${optics.strength}:${this.displacements.length === 3 ? optics.chroma : 0}:${optics.finish}`;
       if (signature === this.opticsSignature) return;
-      const scale = this.maxBend * 2 * optics.strength / 36;
-      const factors = this.displacements.length === 3 ? [1 - optics.chroma * .25, 1, 1 + optics.chroma * .5] : [1];
+      const scale = this.maxBend * 2 * optics.strength / 36 * (optics.finish === 'classic' ? 1 : .85);
+      const dispersion = optics.chroma * 150;
+      const factors = this.displacements.length === 3 ? (optics.finish === 'classic' ? [1 - optics.chroma * .25, 1, 1 + optics.chroma * .5] : [1 + (1.5143 - 1.5168) / .5168 * dispersion, 1, 1 + (1.5224 - 1.5168) / .5168 * dispersion]) : [1];
       this.displacements.forEach((node, i) => node.setAttribute('scale', String(scale * factors[i])));
       this.opticsSignature = signature; this.rekey();
     }
@@ -4629,8 +4976,8 @@
     }
 
     releaseSurface() {
-      if (this.raf) cancelAnimationFrame(this.raf); this.raf = 0; this.onLeave();
-      this.clearResizeBuild(); this.mapGeometry = '';
+      if (this.raf) this.runtime.pageWork.cancelFrame(this.raf); this.raf = 0; this.onLeave();
+      this.cancelMapBuild(); this.clearResizeBuild(); this.mapGeometry = '';
       this.resizeObserver?.disconnect(); this.resizeObserver = null;
       this.surfaceObserver?.disconnect(); this.surfaceObserver = null;
       this.defsObserver?.disconnect(); this.defsObserver = null;
@@ -4647,7 +4994,8 @@
         if (value) this.shell.style.setProperty('position', value, priority); else this.shell.style.removeProperty('position');
       }
       this.originalPosition = null;
-      for (const key of ['filter', 'blur-px', 'rim-opacity', 'sheen-opacity', 'hover-opacity', 'press-opacity']) this.shell?.style.removeProperty(`--cgfc-glass-${key}`);
+      this.shell?.removeAttribute('data-cgfc-glass-finish');
+      for (const key of ['fill', 'edge-light', 'edge-shade', 'filter', 'blur-px', 'rim-opacity', 'sheen-opacity', 'hover-opacity', 'press-opacity']) this.shell?.style.removeProperty(`--cgfc-glass-${key}`);
       this.signature = ''; this.opticsSignature = ''; this.shell = null;
     }
 
@@ -4677,6 +5025,7 @@
         ['queuePanel', 'queue', 'data-cgfc-queue-liquid-glass'],
         ['queueCapsule', 'queue', 'data-cgfc-queue-liquid-glass'],
         ['send', 'send', 'data-cgfc-send-liquid-glass'],
+        ['composerTools', 'tools', 'data-cgfc-composer-tools-liquid-glass'],
         ['stats', 'stats', 'data-cgfc-token-liquid-glass'],
         ['toggle', 'toggle', 'data-cgfc-toggle-liquid-glass'],
       ];
@@ -4692,12 +5041,13 @@
       document.addEventListener('cgpt-unified-ui-settings-change', this.onSettings);
       document.addEventListener('DOMContentLoaded', this.onSettings, { once: true });
       document.addEventListener('visibilitychange', this.onVisibility);
+      window.addEventListener('resize', this.onSettings, { passive: true });
       this.schedule();
     }
 
     schedule() {
       if (this.raf) return;
-      this.raf = requestAnimationFrame(() => { this.raf = 0; this.refresh(); });
+      this.raf = this.runtime.pageWork.requestFrame(() => { this.raf = 0; this.refresh(); });
     }
 
     allControllers() { return [...this.controllers.values(), ...this.scrollControllers.values()]; }
@@ -4766,12 +5116,19 @@
         }
         this.bind('scroll', node, controller);
       }
-      const button = Array.from(this.composerShell?.querySelectorAll([
-        '#composer-submit-button:not([data-testid="stop-button"]):not([data-testid*="speech"]):not([aria-label*="voice" i]):not([aria-label*="语音"])',
-        'button[data-testid="send-button"]', 'button[data-testid="composer-send-button"]',
-        'button[aria-label*="send" i]:not([aria-label*="stop" i])',
-        'button[aria-label*="发送"]:not([aria-label*="停止"])',
-      ].join(',')) || []).find(node => !node.matches('[data-testid="stop-button"], [data-testid*="speech"], [aria-label*="stop" i], [aria-label*="停止"], [aria-label*="voice" i], [aria-label*="语音"]'));
+      // Material applies to the native primary action in every state. The
+      // queue's findSendButton remains send-only: a voice/stop click is never
+      // treated as submitting a queued message.
+      const button = this.composerShell?.querySelector([
+        'button#composer-submit-button', 'button[data-testid="send-button"]',
+        'button[data-testid="composer-send-button"]', 'button[data-testid="stop-button"]',
+        'button[aria-label="开始语音"]', 'button[aria-label="Start voice" i]',
+        'button[aria-label="Use voice mode" i]', 'button[aria-label="停止生成"]',
+        'button[aria-label="Stop generating" i]', 'button[aria-label*="send" i]:not([aria-label*="feedback" i])',
+        'button[aria-label*="发送"]:not([aria-label*="队列"])',
+      ].join(','));
+      const tools = this.composerShell?.querySelector('[class*="ComposerLayoutFooter-"] [class*="bg-(--composer-layout-surface-background)"]');
+      this.bind('composerTools', tools);
       this.bind('send', button);
       const observe = document.documentElement.hasAttribute('data-cgfc-send-liquid-glass') ? this.composerShell : null;
       if (observe !== this.observedShell) {
@@ -4784,11 +5141,12 @@
     }
 
     destroy() {
-      if (this.raf) cancelAnimationFrame(this.raf);
+      if (this.raf) this.runtime.pageWork.cancelFrame(this.raf);
       this.buttonObserver?.disconnect();
       document.removeEventListener('cgpt-unified-ui-settings-change', this.onSettings);
       document.removeEventListener('DOMContentLoaded', this.onSettings);
       document.removeEventListener('visibilitychange', this.onVisibility);
+      window.removeEventListener('resize', this.onSettings);
       for (const controller of this.allControllers()) controller.destroy();
       for (const style of this.shadowStyles.values()) style.remove();
       document.getElementById('cgpt-answer-toc-host')?.removeAttribute('data-cgfc-toolbox-glass');
@@ -7301,15 +7659,14 @@
 
       this.mainObserver?.disconnect();
       this.mainElement = main;
-      this.mainObserver = new MutationObserver(this.onMainMutations);
-      this.mainObserver.observe(main, {
+      this.mainObserver = globalThis.__cgptUnifiedRuntimeV1.pageWork.observe(main, {
         childList: true,
         subtree: true,
         characterData: true,
         attributes: true,
         attributeFilter: ['data-message-id', 'data-turn-key', 'data-chatgpt-search-message-ids',
           'data-chatgpt-selection-message-id', 'data-toc-item-index', 'aria-label', 'title'],
-      });
+      }, this.onMainMutations);
       this.scheduleConversationRebuild(60);
     }
 
@@ -7384,7 +7741,7 @@
       this.forceAnswerDetection ||= Boolean(forceAnswerDetection);
       if (this.frameId) return;
 
-      this.frameId = window.requestAnimationFrame((timestamp) => {
+      this.frameId = globalThis.__cgptUnifiedRuntimeV1.pageWork.requestFrame((timestamp) => {
         this.frameId = 0;
 
         if (!this.isViewportEligible()) {
@@ -8062,6 +8419,7 @@
     }
 
     getUserMessageElements() {
+      return globalThis.__cgptUnifiedRuntimeV1.pageWork.memo(this, 'user-message-elements', () => {
       const bridgedTurns = globalThis.__cgptUnifiedRuntimeV1?.lazy?.getAllTurnNodes?.() || [];
       // A user turn containing only an attachment has no text bubble. Its
       // message wrapper still carries the user role and message ID.
@@ -8107,6 +8465,7 @@
           if (relation & Node.DOCUMENT_POSITION_PRECEDING) return 1;
           return 0;
         });
+      }).slice();
     }
 
     normalizeConversationText(text) {
@@ -8434,7 +8793,7 @@
 
     getOfficialNavButtons() {
       const activeMain = dom.main();
-      return [...document.querySelectorAll('button[data-toc-item-index]')]
+      return globalThis.__cgptUnifiedRuntimeV1.pageWork.query(document, 'button[data-toc-item-index]')
         .filter((button) => button instanceof HTMLButtonElement && button.isConnected
           && !button.closest('[hidden], [inert], [aria-hidden="true"]')
           && (!button.closest('main, [role="main"]') || button.closest('main, [role="main"]') === activeMain))
@@ -8533,9 +8892,13 @@
 
     scheduleConversationRebuild(delay = 120) {
       window.clearTimeout(this.conversationRebuildTimer);
+      globalThis.__cgptUnifiedRuntimeV1.pageWork.cancelFrame(this.conversationRebuildFrame); this.conversationRebuildFrame = 0;
       this.conversationRebuildTimer = window.setTimeout(() => {
         this.conversationRebuildTimer = 0;
-        this.rebuildConversationToc();
+        if (this.conversationRebuildFrame) return;
+        this.conversationRebuildFrame = globalThis.__cgptUnifiedRuntimeV1.pageWork.requestFrame(() => {
+          this.conversationRebuildFrame = 0; this.rebuildConversationToc();
+        });
       }, Math.max(0, Number(delay) || 0));
     }
 
@@ -9211,6 +9574,7 @@
 
     clearConversationToc(clearCache = false) {
       window.clearTimeout(this.conversationRebuildTimer);
+      globalThis.__cgptUnifiedRuntimeV1.pageWork.cancelFrame(this.conversationRebuildFrame); this.conversationRebuildFrame = 0;
       this.conversationRebuildTimer = 0;
       this.conversationItems = [];
       this.conversationItemButtons = [];
@@ -11849,6 +12213,8 @@
     asciiOceanPointer: false,
     asciiOceanDensity: 90,
     asciiOceanQuality: 'balanced',
+    asciiOceanRenderer: 'canvas',
+    asciiOceanMotionMode: 'live',
     asciiOceanColorMode: 'auto',
     asciiOceanColorSeed: 0,
     asciiOceanBodyColor: '#7ed8f0',
@@ -11933,174 +12299,6 @@
     defaults[overrideEnabledKey(key)] = !DEFAULT_DISABLED_OVERRIDE_KEYS.has(key);
   }
 
-  // Public defaults: validated preference fields only. No prompts, queue, session or local records.
-  Object.assign(defaults, {
-    "latinFont": "Lora",
-    "chineseFont": "FZNewShuSong-Z10S",
-    "boldLatinFont": "Lora",
-    "boldChineseFont": "\"Noto Serif SC\", \"Source Han Serif SC\", \"Songti SC\", serif",
-    "mathFont": "Latin Modern Math",
-    "mathFontMode": "native",
-    "codeFont": "\"JetBrains Mono\"",
-    "fontSize": 25,
-    "thinkingOverviewFontSize": 18,
-    "citationFontSize": 13,
-    "webCitationFontSize": 14,
-    "intelligentFont": "\"Times New Roman\", \"Noto Serif SC\", \"Source Han Serif SC\", serif",
-    "intelligentFontSize": 24,
-    "intelligentTitleFontSize": 26,
-    "intelligentControlFontSize": 26,
-    "intelligentLineHeight": 1.6,
-    "formulaFontSize": 25,
-    "lineHeight": 1.9,
-    "codeFontSize": 18,
-    "codeLineHeight": 1.8,
-    "normalColor": "#ffffff",
-    "boldColor": "#e8e2d8",
-    "boldWeight": 750,
-    "stopAutoScrollWhileGenerating": true,
-    "wrapCode": true,
-    "enableFontSmoothing": true,
-    "fontSmoothingMode": "antialiased",
-    "textRenderingMode": "optimizeLegibility",
-    "enableResidualLatex": true,
-    "enableKatexLetterFont": true,
-    "enableFormulaCopy": true,
-    "formulaCopyDelimiters": true,
-    "formulaCopyBorderColor": "#ffffff",
-    "messageCopyIconColor": "#6d5dfc",
-    "toolboxFont": "FZNewShuSong-Z10S",
-    "toolboxFontSize": 13,
-    "toolboxLineHeight": 1.4,
-    "toolboxPanelWidth": 300,
-    "bodyColumnLeftOffset": 0,
-    "bodyColumnRightOffset": 0,
-    "toolboxUseCustomColors": false,
-    "toolboxTextColor": "#f4f4f4",
-    "toolboxBackgroundColor": "#212121",
-    "toolboxAccentColor": "#828282",
-    "toolboxOpacity": 0.82,
-    "queueFont": "FZNewShuSong-Z10S",
-    "queueFontSize": 12,
-    "queueLineHeight": 1.4,
-    "queuePanelWidth": 420,
-    "queueUseCustomColors": false,
-    "queueTextColor": "#afafaf",
-    "queueBackgroundColor": "#000000",
-    "queueAccentColor": "#609e56",
-    "queueOpacity": 0.94,
-    "enableNeumorphicAppearance": false,
-    "enableAsciiOcean": true,
-    "asciiOceanOpacity": 0.65,
-    "asciiOceanFps": 12,
-    "asciiOceanSpecies": "classic",
-    "asciiOceanCoverage": "glass",
-    "asciiOceanHomeCoverage": "full",
-    "asciiOceanPointer": false,
-    "asciiOceanDensity": 90,
-    "asciiOceanQuality": "eco",
-    "asciiOceanColorMode": "original",
-    "asciiOceanColorSeed": 560765584,
-    "asciiOceanBodyColor": "#7ed8f0",
-    "asciiOceanAccentColor": "#c79aff",
-    "asciiOceanFishColor": "#b8e7f7",
-    "asciiOceanWakeColor": "#55d8ea",
-    "asciiOceanPauseWhileGenerating": false,
-    "messageGlassStyle": "clear",
-    "messageGlassRenderMode": "balanced",
-    "messageGlassOpacity": 0.18,
-    "messageGlassBlur": 6,
-    "messageGlassStrength": 28,
-    "messageGlassThickness": 14,
-    "messageGlassCurvature": 0.5,
-    "messageGlassBend": 0.5,
-    "messageGlassChroma": 0.04,
-    "messageGlassGlare": 0.45,
-    "messageGlassRadius": 18,
-    "messageGlassSaturation": 1.12,
-    "messageGlassBrightness": 1,
-    "messageGlassTintMode": "auto",
-    "messageGlassTint": "#15191f",
-    "enableComposerLiquidGlass": true,
-    "enableToolboxLiquidGlass": true,
-    "enableSettingsLiquidGlass": true,
-    "enableQueueLiquidGlass": true,
-    "enableSendLiquidGlass": false,
-    "enableScrollLiquidGlass": true,
-    "enableTokenLiquidGlass": true,
-    "enableToggleLiquidGlass": true,
-    "glassRenderMode": "balanced",
-    "composerGlassStyle": "clear",
-    "composerGlassStrength": 36,
-    "composerGlassBlur": 1,
-    "composerGlassOpacity": 0.12,
-    "composerGlassThickness": 14,
-    "composerGlassGlare": 0.45,
-    "composerGlassChroma": 0.04,
-    "composerGlassCurvature": 0.5,
-    "composerGlassBend": 0.5,
-    "showTokenStats": false,
-    "showTokenMessageChips": true,
-    "showTokenSummary": true,
-    "tokenSummaryPosition": "auto",
-    "tokenSummaryOffsetX": 600,
-    "tokenSummaryOffsetY": 34,
-    "tokenSummaryCompactAlways": true,
-    "tokenSummaryCompactOnNarrow": true,
-    "tokenSummaryAvoidQueue": false,
-    "tokenSummaryTextColor": "#5c5c5c",
-    "tokenSummaryBackgroundColor": "#000000",
-    "tokenSummaryBorderColor": "#000000",
-    "latinFontEnabled": true,
-    "chineseFontEnabled": true,
-    "boldLatinFontEnabled": true,
-    "boldChineseFontEnabled": true,
-    "mathFontEnabled": false,
-    "mathFontModeEnabled": true,
-    "codeFontEnabled": true,
-    "fontSizeEnabled": true,
-    "thinkingOverviewFontSizeEnabled": true,
-    "citationFontSizeEnabled": true,
-    "webCitationFontSizeEnabled": true,
-    "formulaFontSizeEnabled": true,
-    "lineHeightEnabled": true,
-    "codeFontSizeEnabled": true,
-    "codeLineHeightEnabled": true,
-    "intelligentFontEnabled": false,
-    "intelligentFontSizeEnabled": true,
-    "intelligentTitleFontSizeEnabled": true,
-    "intelligentControlFontSizeEnabled": false,
-    "intelligentLineHeightEnabled": false,
-    "normalColorEnabled": true,
-    "boldColorEnabled": true,
-    "boldWeightEnabled": true,
-    "fontSmoothingModeEnabled": true,
-    "textRenderingModeEnabled": true,
-    "formulaCopyBorderColorEnabled": true,
-    "messageCopyIconColorEnabled": false,
-    "toolboxFontEnabled": true,
-    "toolboxFontSizeEnabled": true,
-    "toolboxLineHeightEnabled": true,
-    "toolboxPanelWidthEnabled": true,
-    "bodyColumnLeftOffsetEnabled": false,
-    "bodyColumnRightOffsetEnabled": false,
-    "toolboxTextColorEnabled": false,
-    "toolboxBackgroundColorEnabled": false,
-    "toolboxAccentColorEnabled": false,
-    "toolboxOpacityEnabled": false,
-    "queueFontEnabled": true,
-    "queueFontSizeEnabled": true,
-    "queueLineHeightEnabled": true,
-    "queuePanelWidthEnabled": true,
-    "queueTextColorEnabled": true,
-    "queueBackgroundColorEnabled": true,
-    "queueAccentColorEnabled": true,
-    "queueOpacityEnabled": true,
-    "tokenSummaryTextColorEnabled": true,
-    "tokenSummaryBackgroundColorEnabled": true,
-    "tokenSummaryBorderColorEnabled": true
-});
-
   const settingTypes = {
     latinFont: 'text',
     chineseFont: 'text',
@@ -12166,6 +12364,8 @@
     asciiOceanPointer: 'boolean',
     asciiOceanDensity: 'number',
     asciiOceanQuality: 'select',
+    asciiOceanRenderer: 'select',
+    asciiOceanMotionMode: 'select',
     asciiOceanColorMode: 'select',
     asciiOceanColorSeed: 'number',
     asciiOceanBodyColor: 'color',
@@ -12281,6 +12481,8 @@
     messageGlassTintMode: ['auto', 'custom'],
     asciiOceanHomeCoverage: ['full', 'off'],
     asciiOceanQuality: ['eco', 'balanced', 'fine'],
+    asciiOceanRenderer: ['canvas', 'gpu', 'compute'],
+    asciiOceanMotionMode: ['live', 'replay15', 'replay30'],
     asciiOceanColorMode: ['auto', 'original', 'cyan', 'aurora', 'warm', 'random', 'custom'],
     asciiOceanSpecies: ['classic', 'mixed', 'hammerhead', 'tiger', 'zebra', 'greathammer', 'mako', 'thresher', 'nurse'],
     composerGlassStyle: ['clear', 'soft'],
@@ -12332,8 +12534,8 @@
     'Noto Sans SC', 'Noto Serif CJK SC', 'Noto Serif SC', 'Palatino Linotype', 'Segoe UI',
     'SimHei', 'SimSun', 'Songti SC', 'Source Han Sans CN', 'Source Han Sans SC',
     'Source Han Serif CN', 'Source Han Serif SC', 'STIX Two Math', 'STSong', 'Times New Roman',
-    // Exact CJK family names reported by Windows on this machine. These are
-    // tested at runtime, not assumed to exist on other computers.
+    // Supplemental CJK fallback names are tested at runtime; availability is
+    // never assumed on another computer.
     '等线', '等线 Light', '方正屏显雅宋简体', '方正舒体', '方正宋圆 简', '方正新書宋',
     '方正姚体', '方正悠宋 简 508R', '仿宋', '黑体', '华文彩云', '华文仿宋', '华文琥珀',
     '华文楷体', '华文隶书', '华文宋体', '华文细黑', '华文新魏', '华文行楷', '华文中宋',
@@ -12353,6 +12555,385 @@
   // each family at runtime, and API/extension results are merged without
   // deleting this fallback set.
   const WINDOWS_FONT_FAMILY_SNAPSHOT = KNOWN_LOCAL_FONT_CANDIDATES.slice();
+
+  const glassSurfaceSpecs = [
+    ['toolbox', '导航／提示词浮窗', 'toolboxGlass', 'enableToolboxLiquidGlass'],
+    ['settings', 'Aa 设置面板', 'settingsGlass', 'enableSettingsLiquidGlass'],
+    ['queue', '发送队列', 'queueGlass', 'enableQueueLiquidGlass'],
+    ['send', '发送／语音／停止按钮', 'sendGlass', 'enableSendLiquidGlass'],
+    ['tools', '输入框工具胶囊（模型／麦克风）', 'composerToolsGlass', 'enableComposerToolsLiquidGlass'],
+    ['scroll', '跳转箭头', 'scrollGlass', 'enableScrollLiquidGlass'],
+    ['stats', 'Token 统计贴片', 'statsGlass', 'enableTokenLiquidGlass'],
+    ['toggle', 'Aa 启动按钮', 'toggleGlass', 'enableToggleLiquidGlass'],
+    ['message', '模型回答正文', 'responseGlass', 'enableMessageLiquidGlass'],
+  ].map(([kind, label, prefix, enabled]) => ({ kind, label, prefix, enabled }));
+  const glassFields = [
+    ['RenderMode', '渲染模式', 'select', ['balanced', 'full', 'frosted']],
+    ['Style', '底色质感', 'select', ['clear', 'soft']],
+    ['Finish', '光学风格', 'select', ['refined', 'classic']],
+    ['Strength', '折射强度', 'number', [0, 60, 1]],
+    ['Blur', '背景模糊 px', 'number', [0, 20, .2]],
+    ['Thickness', '边缘厚度 px', 'number', [4, 48, 1]],
+    ['Glare', '边缘高光', 'number', [0, 1.6, .05]],
+    ['Opacity', '底色浓度', 'number', [0, .85, .01]],
+    ['Chroma', '色散强度（完整模式）', 'number', [0, .6, .01]],
+    ['Curvature', '曲面强度', 'number', [0, 1, .02]],
+    ['Bend', '边缘包裹', 'number', [0, 1, .02]],
+  ];
+  const composerKey = suffix => suffix === 'RenderMode' ? 'glassRenderMode' : suffix === 'Finish' ? 'glassOpticalFinish' : 'composerGlass' + suffix;
+  defaults.glassOpticalFinish = 'refined'; settingTypes.glassOpticalFinish = 'select'; selectValues.glassOpticalFinish = ['refined', 'classic'];
+  defaults.removeTopBarGap = true; settingTypes.removeTopBarGap = 'boolean';
+  defaults.enableComposerToolsLiquidGlass = true; settingTypes.enableComposerToolsLiquidGlass = 'boolean';
+  defaults.enableMessageLiquidGlass = defaults.enableAsciiOcean && defaults.asciiOceanCoverage === 'glass'; settingTypes.enableMessageLiquidGlass = 'boolean';
+  for (const spec of glassSurfaceSpecs) for (const [suffix, , type, range] of glassFields) {
+    const key = spec.prefix + suffix;
+    defaults[key] = defaults[composerKey(suffix)]; settingTypes[key] = type;
+    if (type === 'number') numberLimits[key] = range.slice(0, 2); else selectValues[key] = range;
+  }
+  function initializeGlassSurfaces(next, saved, persist = true) {
+    // Fresh installations use the complete shipped preset, including each
+    // surface's distinct values. Only migrate profiles for an existing store.
+    if (!Object.keys(saved).length) return;
+    let changed = false;
+    for (const spec of glassSurfaceSpecs) for (const [suffix] of glassFields) {
+      const key = spec.prefix + suffix;
+      if (!Object.prototype.hasOwnProperty.call(saved, key)) { next[key] = normalizeSetting(key, next[composerKey(suffix)]); changed = true; }
+    }
+    if (!Object.prototype.hasOwnProperty.call(saved, 'enableMessageLiquidGlass')) { next.enableMessageLiquidGlass = Boolean(next.enableAsciiOcean && next.asciiOceanCoverage === 'glass'); changed = true; }
+    if (changed && persist) writeStore(STORAGE_KEY, { ...saved, ...next });
+  }
+  function applyIndependentGlass(root) {
+    const attribute = (name, value) => { if (root.getAttribute(name) !== String(value)) root.setAttribute(name, String(value)); };
+    const flag = (name, value) => { if (root.hasAttribute(name) !== Boolean(value)) root.toggleAttribute(name, Boolean(value)); };
+    const property = (name, value) => { if (root.style.getPropertyValue(name) !== String(value)) root.style.setProperty(name, String(value)); };
+    attribute('data-cgfc-glass-finish', settings.glassOpticalFinish);
+    flag('data-cgfc-topbar-overlap', settings.removeTopBarGap);
+    flag('data-cgfc-composer-tools-liquid-glass', settings.enableComposerToolsLiquidGlass);
+    flag('data-cgfc-message-glass', settings.enableMessageLiquidGlass);
+    for (const spec of glassSurfaceSpecs) {
+      for (const [suffix, , type] of glassFields) {
+        const value = normalizeSetting(spec.prefix + suffix, settings[spec.prefix + suffix]);
+        const slug = suffix === 'RenderMode' ? 'render-mode' : suffix.toLowerCase();
+        if (type === 'select') attribute('data-cgfc-' + spec.kind + '-glass-' + slug, value);
+        else property('--cgfc-' + spec.kind + '-glass-' + slug, value);
+      }
+    }
+    attribute('data-cgfc-message-glass-style', settings.responseGlassStyle);
+    for (const node of document.querySelectorAll('[data-cgfc-glass-settings-status]')) {
+      const prefix = node.getAttribute('data-cgfc-glass-settings-status');
+      const get = suffix => settings[prefix ? prefix + suffix : composerKey(suffix)];
+      const mode = get('RenderMode'), text = mode === 'full' ? '完整折射 · RGB 色散' : mode === 'balanced' ? '单路折射 · 无 RGB 色散' : '仅磨砂 · 无折射／色散';
+      const summary = text + '；模糊 ' + get('Blur') + 'px；高光 ' + get('Glare');
+      if (node.textContent !== summary) node.textContent = summary;
+    }
+    globalThis.__cgptUnifiedRuntimeV1?.topBarFix?.refresh();
+  }
+  function createIndependentGlassControls(panel) {
+    const group = createSettingsGroup(panel, '液态玻璃 · 各面板独立');
+    const hint = document.createElement('p'); hint.className = 'cgfc-hint';
+    hint.textContent = '首次升级时，各面板复制输入框当前参数；之后独立保存。完整模式才显示 RGB 色散。模糊数值按实际设置执行，不再强制至少 8px。'; group.appendChild(hint);
+    const input = { label: '输入框', prefix: '', enabled: 'enableComposerLiquidGlass' };
+    for (const spec of [input, ...glassSurfaceSpecs]) {
+      const target = createSettingsGroup(group, spec.label);
+      target.setAttribute('data-cgfc-glass-settings-panel', spec.prefix || 'composer');
+      appendControl(target, { label: '启用此处液态玻璃', key: spec.enabled, type: 'checkbox' });
+      const status = document.createElement('p'); status.className = 'cgfc-hint'; status.setAttribute('data-cgfc-glass-settings-status', spec.prefix); target.appendChild(status);
+      for (const [suffix, label, type, range] of glassFields) {
+        const key = spec.prefix ? spec.prefix + suffix : composerKey(suffix);
+        const choices = type !== 'select' ? undefined : range.map(value => ({ value, label: ({ balanced: '单路折射（无 RGB 色散）', full: '完整折射 + RGB 色散', frosted: '仅磨砂（无折射／色散）', clear: '清透底色', soft: '柔和底色', refined: '精致 · 柔和边缘与高光', classic: '经典 · 保留原版光学' })[value] }));
+        appendControl(target, { label, key, type, choices, ...(type === 'number' ? { min: range[0], max: range[1], step: range[2] } : {}) });
+      }
+      if (spec.prefix) {
+        const copy = document.createElement('button'); copy.type = 'button'; copy.textContent = '复制输入框当前参数';
+        copy.addEventListener('click', () => {
+          const next = { ...settings }; for (const [suffix] of glassFields) next[spec.prefix + suffix] = settings[composerKey(suffix)];
+          settings = next; writeStore(STORAGE_KEY, settings); applySettings(); syncPanelInputs(panel);
+        }); target.appendChild(copy);
+      }
+      if (spec.kind === 'message') {
+        const appearance = createSettingsGroup(target, '正文圆角与底色');
+        for (const [suffix, label, min, max, step] of [['Radius', '圆角 px', 0, 48, 1], ['Saturation', '背景饱和度', .5, 2, .05], ['Brightness', '背景亮度', .5, 1.5, .05]]) appendControl(appearance, { key: 'messageGlass' + suffix, label, type: 'number', min, max, step });
+        appendControl(appearance, { key: 'messageGlassTintMode', label: '正文底色来源', type: 'select', choices: [{ value: 'auto', label: '自动适配明暗' }, { value: 'custom', label: '自选颜色' }] });
+        appendControl(appearance, { key: 'messageGlassTint', label: '自选正文底色', type: 'color' });
+      }
+    }
+    return group;
+  }
+
+  // Curated defaults contain validated preference fields only. Prompts, usage
+  // history, queue and directory data are excluded.
+  // Apply after all profile schemas exist so per-surface values stay distinct.
+  Object.assign(defaults, {
+  "latinFont": "Lora",
+  "chineseFont": "FZNewShuSong-Z10S",
+  "boldLatinFont": "Lora",
+  "boldChineseFont": "\"Noto Serif SC\", \"Source Han Serif SC\", \"Songti SC\", serif",
+  "mathFont": "Latin Modern Math",
+  "mathFontMode": "native",
+  "codeFont": "\"JetBrains Mono\"",
+  "fontSize": 25,
+  "thinkingOverviewFontSize": 18,
+  "citationFontSize": 13,
+  "webCitationFontSize": 14,
+  "intelligentFont": "\"Times New Roman\", \"Noto Serif SC\", \"Source Han Serif SC\", serif",
+  "intelligentFontSize": 24,
+  "intelligentTitleFontSize": 26,
+  "intelligentControlFontSize": 26,
+  "intelligentLineHeight": 1.6,
+  "formulaFontSize": 25,
+  "lineHeight": 1.9,
+  "codeFontSize": 18,
+  "codeLineHeight": 1.8,
+  "normalColor": "#ffffff",
+  "boldColor": "#e8e2d8",
+  "boldWeight": 750,
+  "stopAutoScrollWhileGenerating": true,
+  "wrapCode": true,
+  "enableFontSmoothing": true,
+  "fontSmoothingMode": "antialiased",
+  "textRenderingMode": "optimizeLegibility",
+  "enableResidualLatex": true,
+  "enableKatexLetterFont": true,
+  "enableFormulaCopy": true,
+  "formulaCopyDelimiters": true,
+  "formulaCopyBorderColor": "#ffffff",
+  "messageCopyIconColor": "#6d5dfc",
+  "toolboxFont": "FZNewShuSong-Z10S",
+  "toolboxFontSize": 13,
+  "toolboxLineHeight": 1.4,
+  "toolboxPanelWidth": 300,
+  "bodyColumnLeftOffset": 0,
+  "bodyColumnRightOffset": 0,
+  "toolboxUseCustomColors": false,
+  "toolboxTextColor": "#f4f4f4",
+  "toolboxBackgroundColor": "#212121",
+  "toolboxAccentColor": "#828282",
+  "toolboxOpacity": 0.82,
+  "queueFont": "FZNewShuSong-Z10S",
+  "queueFontSize": 12,
+  "queueLineHeight": 1.4,
+  "queuePanelWidth": 420,
+  "queueUseCustomColors": false,
+  "queueTextColor": "#afafaf",
+  "queueBackgroundColor": "#000000",
+  "queueAccentColor": "#609e56",
+  "queueOpacity": 0.94,
+  "enableNeumorphicAppearance": false,
+  "enableAsciiOcean": true,
+  "asciiOceanOpacity": 0.65,
+  "asciiOceanFps": 12,
+  "asciiOceanSpecies": "mixed",
+  "asciiOceanCoverage": "glass",
+  "asciiOceanHomeCoverage": "full",
+  "asciiOceanPointer": false,
+  "asciiOceanDensity": 90,
+  "asciiOceanQuality": "eco",
+  "asciiOceanRenderer": "compute",
+  "asciiOceanMotionMode": "replay30",
+  "asciiOceanColorMode": "original",
+  "asciiOceanColorSeed": 560765584,
+  "asciiOceanBodyColor": "#7ed8f0",
+  "asciiOceanAccentColor": "#c79aff",
+  "asciiOceanFishColor": "#b8e7f7",
+  "asciiOceanWakeColor": "#55d8ea",
+  "asciiOceanPauseWhileGenerating": false,
+  "messageGlassStyle": "clear",
+  "messageGlassRenderMode": "frosted",
+  "messageGlassOpacity": 0.18,
+  "messageGlassBlur": 6,
+  "messageGlassStrength": 28,
+  "messageGlassThickness": 14,
+  "messageGlassCurvature": 0.5,
+  "messageGlassBend": 0.5,
+  "messageGlassChroma": 0.04,
+  "messageGlassGlare": 0.45,
+  "messageGlassRadius": 18,
+  "messageGlassSaturation": 1.12,
+  "messageGlassBrightness": 1,
+  "messageGlassTintMode": "auto",
+  "messageGlassTint": "#15191f",
+  "enableComposerLiquidGlass": true,
+  "enableToolboxLiquidGlass": true,
+  "enableSettingsLiquidGlass": true,
+  "enableQueueLiquidGlass": true,
+  "enableSendLiquidGlass": true,
+  "enableScrollLiquidGlass": true,
+  "enableTokenLiquidGlass": true,
+  "enableToggleLiquidGlass": true,
+  "glassRenderMode": "full",
+  "composerGlassStyle": "clear",
+  "composerGlassStrength": 36,
+  "composerGlassBlur": 1,
+  "composerGlassOpacity": 0.12,
+  "composerGlassThickness": 14,
+  "composerGlassGlare": 0.45,
+  "composerGlassChroma": 0.04,
+  "composerGlassCurvature": 0.5,
+  "composerGlassBend": 0.5,
+  "showTokenStats": false,
+  "showTokenMessageChips": true,
+  "showTokenSummary": true,
+  "tokenSummaryPosition": "auto",
+  "tokenSummaryOffsetX": 600,
+  "tokenSummaryOffsetY": 34,
+  "tokenSummaryCompactAlways": true,
+  "tokenSummaryCompactOnNarrow": true,
+  "tokenSummaryAvoidQueue": false,
+  "tokenSummaryTextColor": "#5c5c5c",
+  "tokenSummaryBackgroundColor": "#000000",
+  "tokenSummaryBorderColor": "#000000",
+  "latinFontEnabled": true,
+  "chineseFontEnabled": true,
+  "boldLatinFontEnabled": true,
+  "boldChineseFontEnabled": true,
+  "mathFontEnabled": false,
+  "mathFontModeEnabled": true,
+  "codeFontEnabled": true,
+  "fontSizeEnabled": true,
+  "thinkingOverviewFontSizeEnabled": true,
+  "citationFontSizeEnabled": true,
+  "webCitationFontSizeEnabled": true,
+  "formulaFontSizeEnabled": true,
+  "lineHeightEnabled": true,
+  "codeFontSizeEnabled": true,
+  "codeLineHeightEnabled": true,
+  "intelligentFontEnabled": false,
+  "intelligentFontSizeEnabled": true,
+  "intelligentTitleFontSizeEnabled": true,
+  "intelligentControlFontSizeEnabled": false,
+  "intelligentLineHeightEnabled": false,
+  "normalColorEnabled": true,
+  "boldColorEnabled": true,
+  "boldWeightEnabled": true,
+  "fontSmoothingModeEnabled": true,
+  "textRenderingModeEnabled": true,
+  "formulaCopyBorderColorEnabled": true,
+  "messageCopyIconColorEnabled": false,
+  "toolboxFontEnabled": true,
+  "toolboxFontSizeEnabled": true,
+  "toolboxLineHeightEnabled": true,
+  "toolboxPanelWidthEnabled": true,
+  "bodyColumnLeftOffsetEnabled": false,
+  "bodyColumnRightOffsetEnabled": false,
+  "toolboxTextColorEnabled": false,
+  "toolboxBackgroundColorEnabled": false,
+  "toolboxAccentColorEnabled": false,
+  "toolboxOpacityEnabled": false,
+  "queueFontEnabled": true,
+  "queueFontSizeEnabled": true,
+  "queueLineHeightEnabled": true,
+  "queuePanelWidthEnabled": true,
+  "queueTextColorEnabled": true,
+  "queueBackgroundColorEnabled": true,
+  "queueAccentColorEnabled": true,
+  "queueOpacityEnabled": true,
+  "tokenSummaryTextColorEnabled": true,
+  "tokenSummaryBackgroundColorEnabled": true,
+  "tokenSummaryBorderColorEnabled": true,
+  "glassOpticalFinish": "classic",
+  "removeTopBarGap": true,
+  "enableComposerToolsLiquidGlass": false,
+  "enableMessageLiquidGlass": true,
+  "toolboxGlassRenderMode": "full",
+  "toolboxGlassStyle": "clear",
+  "toolboxGlassFinish": "classic",
+  "toolboxGlassStrength": 36,
+  "toolboxGlassBlur": 2,
+  "toolboxGlassThickness": 14,
+  "toolboxGlassGlare": 0.45,
+  "toolboxGlassOpacity": 0.12,
+  "toolboxGlassChroma": 0.04,
+  "toolboxGlassCurvature": 0.5,
+  "toolboxGlassBend": 0.5,
+  "settingsGlassRenderMode": "full",
+  "settingsGlassStyle": "clear",
+  "settingsGlassFinish": "classic",
+  "settingsGlassStrength": 36,
+  "settingsGlassBlur": 2,
+  "settingsGlassThickness": 14,
+  "settingsGlassGlare": 0.45,
+  "settingsGlassOpacity": 0.12,
+  "settingsGlassChroma": 0.04,
+  "settingsGlassCurvature": 0.5,
+  "settingsGlassBend": 0.5,
+  "queueGlassRenderMode": "full",
+  "queueGlassStyle": "clear",
+  "queueGlassFinish": "classic",
+  "queueGlassStrength": 36,
+  "queueGlassBlur": 1,
+  "queueGlassThickness": 14,
+  "queueGlassGlare": 0.45,
+  "queueGlassOpacity": 0.12,
+  "queueGlassChroma": 0.04,
+  "queueGlassCurvature": 0.5,
+  "queueGlassBend": 0.5,
+  "sendGlassRenderMode": "full",
+  "sendGlassStyle": "clear",
+  "sendGlassFinish": "classic",
+  "sendGlassStrength": 36,
+  "sendGlassBlur": 0,
+  "sendGlassThickness": 14,
+  "sendGlassGlare": 0.45,
+  "sendGlassOpacity": 0.12,
+  "sendGlassChroma": 0.04,
+  "sendGlassCurvature": 0.5,
+  "sendGlassBend": 0.5,
+  "composerToolsGlassRenderMode": "full",
+  "composerToolsGlassStyle": "clear",
+  "composerToolsGlassFinish": "classic",
+  "composerToolsGlassStrength": 36,
+  "composerToolsGlassBlur": 0,
+  "composerToolsGlassThickness": 14,
+  "composerToolsGlassGlare": 0.45,
+  "composerToolsGlassOpacity": 0.12,
+  "composerToolsGlassChroma": 0.04,
+  "composerToolsGlassCurvature": 0.5,
+  "composerToolsGlassBend": 0.5,
+  "scrollGlassRenderMode": "full",
+  "scrollGlassStyle": "clear",
+  "scrollGlassFinish": "classic",
+  "scrollGlassStrength": 36,
+  "scrollGlassBlur": 0.5,
+  "scrollGlassThickness": 14,
+  "scrollGlassGlare": 0.45,
+  "scrollGlassOpacity": 0.12,
+  "scrollGlassChroma": 0.04,
+  "scrollGlassCurvature": 0.5,
+  "scrollGlassBend": 0.5,
+  "statsGlassRenderMode": "full",
+  "statsGlassStyle": "clear",
+  "statsGlassFinish": "classic",
+  "statsGlassStrength": 36,
+  "statsGlassBlur": 1,
+  "statsGlassThickness": 14,
+  "statsGlassGlare": 0.45,
+  "statsGlassOpacity": 0.12,
+  "statsGlassChroma": 0.04,
+  "statsGlassCurvature": 0.5,
+  "statsGlassBend": 0.5,
+  "toggleGlassRenderMode": "full",
+  "toggleGlassStyle": "clear",
+  "toggleGlassFinish": "classic",
+  "toggleGlassStrength": 36,
+  "toggleGlassBlur": 1,
+  "toggleGlassThickness": 14,
+  "toggleGlassGlare": 0.45,
+  "toggleGlassOpacity": 0.12,
+  "toggleGlassChroma": 0.04,
+  "toggleGlassCurvature": 0.5,
+  "toggleGlassBend": 0.5,
+  "responseGlassRenderMode": "full",
+  "responseGlassStyle": "clear",
+  "responseGlassFinish": "classic",
+  "responseGlassStrength": 36,
+  "responseGlassBlur": 1,
+  "responseGlassThickness": 14,
+  "responseGlassGlare": 0.45,
+  "responseGlassOpacity": 0.12,
+  "responseGlassChroma": 0.04,
+  "responseGlassCurvature": 0.5,
+  "responseGlassBend": 0.5
+});
 
   let settings = loadSettings();
   let saveTimer = 0;
@@ -12489,8 +13070,8 @@
     const root = document.documentElement;
     if (!root) return 'light';
     const theme = detectPageTheme();
-    root.dataset.cgfcTheme = theme;
-    root.style.setProperty('--cgfc-color-scheme', theme);
+    if (root.dataset.cgfcTheme !== theme) root.dataset.cgfcTheme = theme;
+    if (root.style.getPropertyValue('--cgfc-color-scheme') !== theme) root.style.setProperty('--cgfc-color-scheme', theme);
     return theme;
   }
 
@@ -12628,8 +13209,8 @@
       const legacyDefaultPair = String(saved.normalColor || '').toLowerCase() === '#ffffff'
         && String(saved.boldColor || '').toLowerCase() === '#e8e2d8';
       if (legacyDefaultPair) {
-        saved[overrideEnabledKey('normalColor')] = false;
-        saved[overrideEnabledKey('boldColor')] = false;
+        if (!Object.hasOwn(saved, overrideEnabledKey('normalColor'))) saved[overrideEnabledKey('normalColor')] = false;
+        if (!Object.hasOwn(saved, overrideEnabledKey('boldColor'))) saved[overrideEnabledKey('boldColor')] = false;
       }
       writeStore(THEME_PALETTE_MIGRATION_KEY, true);
     }
@@ -12640,6 +13221,7 @@
       }
     });
 
+    initializeGlassSurfaces(next, saved);
     return next;
   }
 
@@ -12713,6 +13295,7 @@
     for (const key of Object.keys(defaults)) {
       if (Object.hasOwn(value.settings, key)) nextSettings[key] = normalizeSetting(key, value.settings[key]);
     }
+    initializeGlassSurfaces(nextSettings, value.settings, false);
     for (const item of value.prompts) {
       if (!backupRecord(item) || typeof item.content !== 'string' || !item.content.trim())
         throw new Error('提示词数据无效。');
@@ -13090,6 +13673,8 @@
     root.toggleAttribute('data-cgfc-ascii-pointer', settings.asciiOceanPointer);
     root.setAttribute('data-cgfc-ascii-density', String(normalizeSetting('asciiOceanDensity', settings.asciiOceanDensity)));
     root.setAttribute('data-cgfc-ascii-quality', normalizeSetting('asciiOceanQuality', settings.asciiOceanQuality));
+    root.setAttribute('data-cgfc-ascii-renderer', normalizeSetting('asciiOceanRenderer', settings.asciiOceanRenderer));
+    root.setAttribute('data-cgfc-ascii-motion-mode', normalizeSetting('asciiOceanMotionMode', settings.asciiOceanMotionMode));
     root.setAttribute('data-cgfc-ascii-color-mode', normalizeSetting('asciiOceanColorMode', settings.asciiOceanColorMode));
     root.setAttribute('data-cgfc-ascii-color-seed', String(normalizeSetting('asciiOceanColorSeed', settings.asciiOceanColorSeed)));
     for (const [key, attribute] of [['asciiOceanBodyColor', 'body'], ['asciiOceanAccentColor', 'accent'], ['asciiOceanFishColor', 'fish'], ['asciiOceanWakeColor', 'wake']]) root.setAttribute('data-cgfc-ascii-' + attribute + '-color', normalizeSetting(key, settings[key]));
@@ -13133,6 +13718,7 @@
     setOrRemove('--cgfc-token-summary-text-color', enabled('tokenSummaryTextColor'), normalizeSetting('tokenSummaryTextColor', settings.tokenSummaryTextColor));
     setOrRemove('--cgfc-token-summary-background-color', enabled('tokenSummaryBackgroundColor'), normalizeSetting('tokenSummaryBackgroundColor', settings.tokenSummaryBackgroundColor));
     setOrRemove('--cgfc-token-summary-border-color', enabled('tokenSummaryBorderColor'), normalizeSetting('tokenSummaryBorderColor', settings.tokenSummaryBorderColor));
+    applyIndependentGlass(root);
     document.dispatchEvent(new CustomEvent('cgpt-unified-ui-settings-change'));
     return true;
   }
@@ -14510,7 +15096,7 @@
 
     const title = document.createElement('h2');
     title.id = `${PANEL_ID}-title`;
-    title.textContent = 'ChatGPT 字体与颜色设置';
+    title.textContent = 'ChatGPT 工具箱设置';
     panel.setAttribute('aria-labelledby', title.id);
     panel.appendChild(title);
     const resetStyle = document.createElement('style');
@@ -14541,6 +15127,19 @@
     appendControl(oceanGroup, { label: '画质与负载', key: 'asciiOceanQuality', type: 'select', choices: [
       { value: 'eco', label: '节能 · 较低画质，最多 18 帧' }, { value: 'balanced', label: '均衡 · 保留完整边缘细节' }, { value: 'fine', label: '精细 · 更高屏幕分辨率' },
     ] });
+    appendControl(oceanGroup, { label: '绘制方式', key: 'asciiOceanRenderer', type: 'select', choices: [
+      { value: 'canvas', label: '标准 · 保留原有字形绘制' }, { value: 'gpu', label: 'GPU 批量绘制' }, { value: 'compute', label: 'GPU 计算 + 绘制（实验）' },
+    ] });
+    appendControl(oceanGroup, { label: '运动模式', key: 'asciiOceanMotionMode', type: 'select', choices: [
+      { value: 'live', label: '实时模拟 · 支持鼠标互动' }, { value: 'replay15', label: '预计算回放 · 15 分钟一轮' }, { value: 'replay30', label: '预计算回放 · 30 分钟一轮' },
+    ] });
+    const modesHint = document.createElement('p'); modesHint.className = 'cgfc-hint';
+    modesHint.textContent = '两项可以组合：绘制方式决定每帧如何画；运动模式决定轨迹来自实时模拟还是缓存回放。GPU 计算 + 回放可进一步减少持续的 CPU 工作，但并非纯 GPU。15／30 分钟只改变轨迹循环长度和缓存占用，不改变画质。它们不控制液态玻璃。'; oceanGroup.appendChild(modesHint);
+    const replayHint = document.createElement('p'); replayHint.className = 'cgfc-hint';
+    replayHint.textContent = '回放首次在后台准备，之后复用本地轨迹；轨迹以 12Hz 预演并平滑插值，画面仍按当前帧率、尺寸和画质绘制。回放不响应鼠标扰动，切回实时恢复。默认鱼群下 15/30 分钟约占 26/52 MiB，最多保留两份缓存。精细画质与颜色可独立调整。GPU 模式保留造型、颜色和边缘采样，文字抗锯齿可能略有不同。'; oceanGroup.appendChild(replayHint);
+    const replayStatus = document.createElement('p'); replayStatus.className = 'cgfc-hint'; replayStatus.setAttribute('data-cgpt-ocean-status', ''); replayStatus.textContent = document.documentElement.getAttribute('data-cgfc-ocean-status') || '实时模拟'; oceanGroup.appendChild(replayStatus);
+    const clearReplay = document.createElement('button'); clearReplay.type = 'button'; clearReplay.textContent = '清除回放缓存';
+    clearReplay.addEventListener('click', () => globalThis.__cgptUnifiedRuntimeV1?.asciiSharks?.clearReplayCache()); oceanGroup.appendChild(clearReplay);
     const oceanColors = createSettingsGroup(oceanGroup, '海洋配色');
     appendControl(oceanColors, { label: '配色方案', key: 'asciiOceanColorMode', type: 'select', choices: [
       { value: 'auto', label: '自动适配明暗背景' }, { value: 'original', label: '仓库原版' },
@@ -14558,20 +15157,21 @@
       writeStore(STORAGE_KEY, settings); applySettings(); syncPanelInputs(panel);
     });
     oceanColors.appendChild(randomColors);
-    const messageGlassGroup = createSettingsGroup(oceanGroup, '回答玻璃（仅模型回答，独立设置）');
-    const messageHint = document.createElement('p'); messageHint.className = 'cgfc-hint';
-    messageHint.textContent = '仅在对话页动画选择“回答玻璃”时生效。仅模型回答各自一块，用户消息保留原样；以下参数不影响输入框、导航、队列或其他贴片。只为屏幕附近的消息启用滤镜，滚出屏幕后释放。'; messageGlassGroup.appendChild(messageHint);
-    appendControl(messageGlassGroup, {label:'正文玻璃风格',key:'messageGlassStyle',type:'select',choices:[{value:'soft',label:'柔和玻璃（至少 6px 模糊）'},{value:'clear',label:'通透玻璃（使用所设模糊）'}]});
-    appendControl(messageGlassGroup, {label:'正文玻璃渲染',key:'messageGlassRenderMode',type:'select',choices:[{value:'balanced',label:'均衡折射'},{value:'full',label:'完整折射与色散'},{value:'frosted',label:'磨砂（不计算折射）'}]});
-    for (const [label,key,min,max,step] of [['底色不透明度','Opacity',0,.9,.01],['背景模糊 px','Blur',0,20,1],['折射强度','Strength',0,60,1],['边缘厚度','Thickness',4,48,1],['曲率','Curvature',0,1,.05],['弯折','Bend',0,1,.05],['色散（完整折射模式）','Chroma',0,.6,.01],['边缘高光','Glare',0,1.6,.05],['圆角 px','Radius',0,48,1],['背景饱和度','Saturation',.5,2,.05],['背景亮度','Brightness',.5,1.5,.05]]) appendControl(messageGlassGroup,{label,key:'messageGlass'+key,type:'number',min,max,step});
-    appendControl(messageGlassGroup,{label:'正文玻璃底色',key:'messageGlassTintMode',type:'select',choices:[{value:'auto',label:'自动适配明暗'},{value:'custom',label:'自选颜色'}]});
-    const messageTintInput = appendControl(messageGlassGroup,{label:'自选正文玻璃颜色',key:'messageGlassTint',type:'color'});
-    messageTintInput.addEventListener('input',()=>{if(settings.messageGlassTintMode!=='custom'){updateSetting('messageGlassTintMode','custom');syncPanelInputs(panel);}});
+    const gpuComputeHint = document.createElement('p'); gpuComputeHint.className = 'cgfc-hint';
+    gpuComputeHint.textContent = 'GPU 计算模式把轮廓、阴影、尾迹扩散与字符选色交给显卡，保持原画质和采样数。显卡或浏览器不支持浮点纹理时自动回退；状态栏显示实际运行方式。'; oceanGroup.appendChild(gpuComputeHint);
     const oceanHint = document.createElement('p');
     oceanHint.className = 'cgfc-hint';
     oceanHint.textContent = '主页与对话页独立设置，所有模式都位于文字、输入框和贴片下方，并避开最左侧导航栏和滚动条。避开正文模式从顶部起按实际正文边界避让。滚动时连续游动；鼠标扰动默认关闭，关闭时不监听鼠标事件。被挡住的区域跳过绘制。默认 12 帧，可调至 3–30 帧；3–5 帧更省但跳格更明显，游动速度与尾迹衰减不随帧率减慢。鱼群默认 90 条；可选节能档。正文玻璃为每条消息独立设置，仅处理屏幕附近的消息。随机颜色每次生成后保持稳定，可再次换色。改编自 stackedlol/ascii-sharks。';
     oceanGroup.appendChild(oceanHint);
 
+    const fontGroup = createSettingsGroup(panel, '字体与排版');
+    panel.insertBefore(fontGroup, oceanGroup);
+    const fontBasics = createSettingsGroup(fontGroup, '字体选择与本机扫描');
+    const fontFormula = createSettingsGroup(fontGroup, '公式显示与复制');
+    const fontCode = createSettingsGroup(fontGroup, '代码显示');
+    const fontLayout = createSettingsGroup(fontGroup, '正文字号、行高与列宽');
+    const fontColors = createSettingsGroup(fontGroup, '颜色、粗细与平滑');
+    let fontTarget = fontBasics;
     detectKnownLocalFonts();
 
     const fontScanRow = document.createElement('div');
@@ -14591,25 +15191,26 @@
     fontScanStatus.className = 'cgfc-hint';
     fontScanStatus.textContent = fontDetectionStatusText();
     fontScanRow.append(fontScanButton, fontSearchInput, fontScanStatus);
-    panel.appendChild(fontScanRow);
+    fontTarget.appendChild(fontScanRow);
 
     const overrideHint = document.createElement('p');
     overrideHint.className = 'cgfc-hint cgfc-override-hint';
     overrideHint.textContent = '每项右侧开关只控制脚本是否覆盖该项；关闭后跟随 ChatGPT、浏览器与当前设备的原生样式。关闭不会丢失你已经选好的值。';
-    panel.appendChild(overrideHint);
+    fontTarget.appendChild(overrideHint);
 
-    appendControl(panel, { label: '英文字体（Latin / 数字优先）', key: 'latinFont', type: 'font-select' });
-    appendControl(panel, { label: '中文字体（中文字形回退）', key: 'chineseFont', type: 'font-select' });
-    appendControl(panel, { label: '英文加粗字体', key: 'boldLatinFont', type: 'font-select' });
-    appendControl(panel, { label: '中文加粗字体', key: 'boldChineseFont', type: 'font-select' });
+    appendControl(fontTarget, { label: '英文字体（Latin / 数字优先）', key: 'latinFont', type: 'font-select' });
+    appendControl(fontTarget, { label: '中文字体（中文字形回退）', key: 'chineseFont', type: 'font-select' });
+    appendControl(fontTarget, { label: '英文加粗字体', key: 'boldLatinFont', type: 'font-select' });
+    appendControl(fontTarget, { label: '中文加粗字体', key: 'boldChineseFont', type: 'font-select' });
 
     const fontHint = document.createElement('p');
     fontHint.className = 'cgfc-hint';
     fontHint.textContent = '浏览器先尝试英文字体，再把缺少的中文字形回退到中文字体；若英文字体本身包含完整中文字符，它可能不会触发中文回退。';
-    panel.appendChild(fontHint);
+    fontTarget.appendChild(fontHint);
 
-    appendControl(panel, { label: '公式字母字体（MathML / KaTeX 普通字母）', key: 'mathFont', type: 'font-select' });
-    appendControl(panel, {
+    fontTarget = fontFormula;
+    appendControl(fontTarget, { label: '公式字母字体（MathML / KaTeX 普通字母）', key: 'mathFont', type: 'font-select' });
+    appendControl(fontTarget, {
       label: '公式字体策略',
       key: 'mathFontMode',
       type: 'select',
@@ -14622,9 +15223,9 @@
     const mathHint = document.createElement('p');
     mathHint.className = 'cgfc-hint';
     mathHint.textContent = 'ChatGPT 通常使用 KaTeX，因此仅修改原生 MathML 往往看不出变化。下面的兼容选项只修改 KaTeX 普通字母，不触碰 ≠、∉、根号、运算符和伸缩符号。';
-    panel.appendChild(mathHint);
+    fontTarget.appendChild(mathHint);
 
-    const formulaSizeInput = appendControl(panel, { label: '公式字号 px（行内与块公式）', key: 'formulaFontSize', type: 'number', min: 10, max: 64, step: 1 });
+    const formulaSizeInput = appendControl(fontTarget, { label: '公式字号 px（行内与块公式）', key: 'formulaFontSize', type: 'number', min: 10, max: 64, step: 1 });
     formulaSizeInput.addEventListener('input', () => {
       if (settings.formulaFontSizeEnabled) return;
       updateSetting('formulaFontSizeEnabled', true);
@@ -14633,40 +15234,42 @@
     const formulaSizeHint = document.createElement('p');
     formulaSizeHint.className = 'cgfc-hint';
     formulaSizeHint.textContent = '输入新字号会自动启用覆盖；关闭右侧开关即可恢复网页原有公式大小。';
-    panel.appendChild(formulaSizeHint);
+    fontTarget.appendChild(formulaSizeHint);
 
-    appendControl(panel, { label: '将所选公式字体用于 KaTeX 普通字母', key: 'enableKatexLetterFont', type: 'checkbox' });
+    appendControl(fontTarget, { label: '将所选公式字体用于 KaTeX 普通字母', key: 'enableKatexLetterFont', type: 'checkbox' });
 
-    appendControl(panel, { label: '修复助手消息中未解析的 $...$ 公式', key: 'enableResidualLatex', type: 'checkbox' });
+    appendControl(fontTarget, { label: '修复助手消息中未解析的 $...$ 公式', key: 'enableResidualLatex', type: 'checkbox' });
     const residualHint = document.createElement('p');
     residualHint.className = 'cgfc-hint';
     residualHint.textContent = '仅处理助手消息里仍显示为纯文本的 $...$、\\(...\\)、$$...$$、\\[...\\]；不会扫描你的提问或输入框。';
-    panel.appendChild(residualHint);
+    fontTarget.appendChild(residualHint);
 
-    appendControl(panel, { label: '双击公式复制 LaTeX', key: 'enableFormulaCopy', type: 'checkbox' });
-    appendControl(panel, { label: '复制公式时保留 $ / $$ 定界符', key: 'formulaCopyDelimiters', type: 'checkbox' });
-    appendControl(panel, { label: '公式复制边框颜色', key: 'formulaCopyBorderColor', type: 'color' });
-    appendControl(panel, { label: '回答复制 MD 图标颜色', key: 'messageCopyIconColor', type: 'color' });
+    appendControl(fontTarget, { label: '双击公式复制 LaTeX', key: 'enableFormulaCopy', type: 'checkbox' });
+    appendControl(fontTarget, { label: '复制公式时保留 $ / $$ 定界符', key: 'formulaCopyDelimiters', type: 'checkbox' });
+    appendControl(fontTarget, { label: '公式复制边框颜色', key: 'formulaCopyBorderColor', type: 'color' });
+    appendControl(fontTarget, { label: '回答复制 MD 图标颜色', key: 'messageCopyIconColor', type: 'color' });
     const formulaCopyHint = document.createElement('p');
     formulaCopyHint.className = 'cgfc-hint';
     formulaCopyHint.textContent = '参考 Ophel Atlas：优先读取 KaTeX 内置的 application/x-tex 原始源码；行内公式复制为 $...$，块公式复制为 $$...$$。';
-    panel.appendChild(formulaCopyHint);
+    fontTarget.appendChild(formulaCopyHint);
 
-    appendControl(panel, { label: '代码字体', key: 'codeFont', type: 'font-select' });
+    fontTarget = fontCode;
+    appendControl(fontTarget, { label: '代码字体', key: 'codeFont', type: 'font-select' });
 
-    let row = createRow(panel);
+    fontTarget = fontLayout;
+    let row = createRow(fontTarget);
     appendControl(row, { label: '正文字号 px', key: 'fontSize', type: 'number', min: 10, max: 40, step: 1 });
     appendControl(row, { label: '正文行高', key: 'lineHeight', type: 'number', min: 1, max: 2.8, step: 0.05 });
 
-    appendControl(panel, { label: '模型的思考概览字号 px', key: 'thinkingOverviewFontSize', type: 'number', min: 10, max: 40, step: 1 });
-    appendControl(panel, { label: '文件引用标签字号 px', key: 'citationFontSize', type: 'number', min: 10, max: 40, step: 1 });
-    appendControl(panel, { label: '网络来源胶囊字号 px', key: 'webCitationFontSize', type: 'number', min: 10, max: 40, step: 1 });
+    appendControl(fontTarget, { label: '模型的思考概览字号 px', key: 'thinkingOverviewFontSize', type: 'number', min: 10, max: 40, step: 1 });
+    appendControl(fontTarget, { label: '文件引用标签字号 px', key: 'citationFontSize', type: 'number', min: 10, max: 40, step: 1 });
+    appendControl(fontTarget, { label: '网络来源胶囊字号 px', key: 'webCitationFontSize', type: 'number', min: 10, max: 40, step: 1 });
     const citationHint = document.createElement('p');
     citationHint.className = 'cgfc-hint';
     citationHint.textContent = '网络来源默认 14px，文件引用默认 18px；胶囊高度、内边距和图标随各自字号同步缩小，不随正文或互动卡片放大。关闭对应开关即可恢复原有大小。';
-    panel.appendChild(citationHint);
+    fontTarget.appendChild(citationHint);
 
-    const intelligentGroup = createSettingsGroup(panel, 'Intelligent UI（互动卡片／选择题）');
+    const intelligentGroup = createSettingsGroup(fontGroup, 'Intelligent UI（互动卡片／选择题）');
     appendControl(intelligentGroup, { label: '独立字体', key: 'intelligentFont', type: 'font-select' });
     let intelligentRow = createRow(intelligentGroup);
     appendControl(intelligentRow, { label: '卡片正文字号 px', key: 'intelligentFontSize', type: 'number', min: 10, max: 64, step: 1 });
@@ -14679,26 +15282,27 @@
     intelligentHint.textContent = '默认跟随正文设置。修改某项会自动开启该项独立覆盖；关闭右侧开关后恢复跟随。选项、按钮和标题可分别调节大小。';
     intelligentGroup.appendChild(intelligentHint);
 
-    row = createRow(panel);
+    row = createRow(fontTarget);
     appendControl(row, { label: '正文左边界偏移 px', key: 'bodyColumnLeftOffset', type: 'number', min: -400, max: 400, step: 10 });
     appendControl(row, { label: '正文右边界偏移 px', key: 'bodyColumnRightOffset', type: 'number', min: -400, max: 400, step: 10 });
     const bodyColumnHint = document.createElement('p');
     bodyColumnHint.className = 'cgfc-hint';
     bodyColumnHint.textContent = '以网站当前正文列为基准：正数向内收窄，负数向外扩展；左右可分别设置。超出可用空间时会保留至少 160px 宽度。';
-    panel.appendChild(bodyColumnHint);
+    fontTarget.appendChild(bodyColumnHint);
 
-    row = createRow(panel);
+    row = createRow(fontCode);
     appendControl(row, { label: '代码字号 px', key: 'codeFontSize', type: 'number', min: 10, max: 32, step: 1 });
     appendControl(row, { label: '代码行高', key: 'codeLineHeight', type: 'number', min: 1, max: 2.8, step: 0.05 });
 
-    row = createRow(panel);
+    fontTarget = fontColors;
+    row = createRow(fontTarget);
     appendControl(row, { label: '普通文字颜色', key: 'normalColor', type: 'color' });
     appendControl(row, { label: '加粗文字颜色', key: 'boldColor', type: 'color' });
 
-    appendControl(panel, { label: '加粗粗细', key: 'boldWeight', type: 'number', min: 400, max: 1000, step: 50 });
-    appendControl(panel, { label: '启用字体平滑 Anti-aliasing', key: 'enableFontSmoothing', type: 'checkbox' });
+    appendControl(fontTarget, { label: '加粗粗细', key: 'boldWeight', type: 'number', min: 400, max: 1000, step: 50 });
+    appendControl(fontTarget, { label: '启用字体平滑 Anti-aliasing', key: 'enableFontSmoothing', type: 'checkbox' });
 
-    row = createRow(panel);
+    row = createRow(fontTarget);
     appendControl(row, {
       label: '平滑模式',
       key: 'fontSmoothingMode',
@@ -14737,53 +15341,8 @@
     toolboxHint.textContent = '每个外观项均可独立启停；颜色项关闭后继续跟随 ChatGPT 明暗主题。贴片可缩到 160px；修改宽度设置时会更新当前手动尺寸。';
     toolboxGroup.appendChild(toolboxHint);
 
-    const glassGroup = createSettingsGroup(panel, '液态玻璃（独立开关）');
-    appendControl(glassGroup, { label: '启用输入框液态玻璃', key: 'enableComposerLiquidGlass', type: 'checkbox' });
-    appendControl(glassGroup, { label: '导航／提示词浮窗液态玻璃', key: 'enableToolboxLiquidGlass', type: 'checkbox' });
-    appendControl(glassGroup, { label: 'Aa 设置面板液态玻璃', key: 'enableSettingsLiquidGlass', type: 'checkbox' });
-    appendControl(glassGroup, { label: '发送队列液态玻璃', key: 'enableQueueLiquidGlass', type: 'checkbox' });
-    appendControl(glassGroup, { label: '发送按钮液态玻璃', key: 'enableSendLiquidGlass', type: 'checkbox' });
-    appendControl(glassGroup, { label: '跳转箭头液态玻璃', key: 'enableScrollLiquidGlass', type: 'checkbox' });
-    appendControl(glassGroup, { label: 'Token 统计贴片液态玻璃', key: 'enableTokenLiquidGlass', type: 'checkbox' });
-    appendControl(glassGroup, { label: 'Aa 启动按钮液态玻璃', key: 'enableToggleLiquidGlass', type: 'checkbox' });
-    appendControl(glassGroup, { label: '玻璃渲染', key: 'glassRenderMode', type: 'select', choices: [
-      { value: 'balanced', label: '日常节能 · 单路折射' },
-      { value: 'full', label: '完整效果 · RGB 色散' },
-      { value: 'frosted', label: '最低负载 · 仅磨砂' },
-    ] });
-    appendControl(glassGroup, { label: '玻璃质感', key: 'composerGlassStyle', type: 'select', choices: [
-      { value: 'clear', label: '清透 · 中性无白底' },
-      { value: 'soft', label: '柔和 · 中性磨砂' },
-    ] });
-    row = createRow(glassGroup);
-    appendControl(row, { label: '折射强度', key: 'composerGlassStrength', type: 'number', min: 0, max: 60, step: 1 });
-    appendControl(row, { label: '内部模糊 px', key: 'composerGlassBlur', type: 'number', min: 0, max: 20, step: 0.2 });
-    row = createRow(glassGroup);
-    appendControl(row, { label: '边缘厚度 px', key: 'composerGlassThickness', type: 'number', min: 4, max: 48, step: 1 });
-    appendControl(row, { label: '高光亮度', key: 'composerGlassGlare', type: 'number', min: 0, max: 1.6, step: 0.05 });
-    row = createRow(glassGroup);
-    appendControl(row, { label: '玻璃底色浓度', key: 'composerGlassOpacity', type: 'number', min: 0.05, max: 0.85, step: 0.05 });
-    appendControl(row, { label: '色散强度', key: 'composerGlassChroma', type: 'number', min: 0, max: 0.6, step: 0.02 });
-    row = createRow(glassGroup);
-    appendControl(row, { label: '曲面强度', key: 'composerGlassCurvature', type: 'number', min: 0, max: 1, step: 0.02 });
-    appendControl(row, { label: '边缘包裹', key: 'composerGlassBend', type: 'number', min: 0, max: 1, step: 0.02 });
-    const glassHint = document.createElement('p');
-    glassHint.className = 'cgfc-hint';
-    glassHint.textContent = '各开关独立。日常节能保留边缘折射并减少滤镜通道；仅磨砂关闭折射，负载更低。页面切到后台、表面不可见时暂停；箭头卡片透明，无白底或描边。色散参数仅在完整效果中使用。浮窗至少保留 8px 模糊以维持文字可读。关闭相应开关即恢复原外观。';
-    glassGroup.appendChild(glassHint);
-    const glassPresetButton = document.createElement('button');
-    glassPresetButton.type = 'button';
-    glassPresetButton.textContent = '应用推荐玻璃参数';
-    glassPresetButton.className = 'cgfc-glass-preset';
-    glassPresetButton.addEventListener('click', () => {
-      const keys = ['enableComposerLiquidGlass', 'glassRenderMode', 'composerGlassStyle', 'composerGlassStrength', 'composerGlassBlur', 'composerGlassOpacity', 'composerGlassThickness', 'composerGlassGlare', 'composerGlassChroma', 'composerGlassCurvature', 'composerGlassBend'];
-      settings = { ...settings, ...Object.fromEntries(keys.map(key => [key, defaults[key]])) };
-      writeStore(STORAGE_KEY, settings);
-      applySettings();
-      syncPanelInputs(panel);
-    });
-    glassGroup.appendChild(glassPresetButton);
-
+    const glassGroup = createIndependentGlassControls(panel);
+    panel.insertBefore(glassGroup, oceanGroup);
     const queueGroup = createSettingsGroup(panel, '输入框旁发送队列外观');
     appendControl(queueGroup, { label: '启用精细深色拟态 Soft UI（输入框 + 队列）', key: 'enableNeumorphicAppearance', type: 'checkbox' });
     appendControl(queueGroup, { label: '队列字体', key: 'queueFont', type: 'font-select' });
@@ -14834,8 +15393,11 @@
     tokenStatsHint.textContent = '统计当前活动分支中可见的用户/助手文本。总览依次表示本轮输入、输出和可见上下文；开启“始终紧凑”后宽屏也显示为“输入/输出/上下文”。三个颜色项关闭脚本覆盖时继续跟随 ChatGPT 明暗主题。系统指令、记忆、工具定义、隐藏推理等不可见内容不会计入，因此它只是近似值，不是官方 usage。';
     statsGroup.appendChild(tokenStatsHint);
 
-    appendControl(panel, { label: '防止自动滚动', key: 'stopAutoScrollWhileGenerating', type: 'checkbox' });
-    appendControl(panel, { label: '代码自动换行', key: 'wrapCode', type: 'checkbox' });
+    const pageGroup = createSettingsGroup(panel, '页面布局与滚动');
+    panel.insertBefore(pageGroup, oceanGroup);
+    appendControl(pageGroup, { label: '去掉顶部黑色预留区（保留标题栏按钮）', key: 'removeTopBarGap', type: 'checkbox' });
+    appendControl(pageGroup, { label: '防止自动滚动', key: 'stopAutoScrollWhileGenerating', type: 'checkbox' });
+    appendControl(fontCode, { label: '代码自动换行', key: 'wrapCode', type: 'checkbox' });
 
     createBackupControls(panel);
 
@@ -14859,7 +15421,7 @@
       next.enableSendLiquidGlass = false;
       next.enableScrollLiquidGlass = false;
       next.enableTokenLiquidGlass = false;
-      next.enableToggleLiquidGlass = false;
+      next.enableToggleLiquidGlass = false; next.enableMessageLiquidGlass = false; next.enableComposerToolsLiquidGlass = false; next.removeTopBarGap = false;
       settings = next;
       writeStore(STORAGE_KEY, settings);
       applySettings();
@@ -14888,7 +15450,7 @@
     function setPanelOpen(open, restoreFocus = false) {
       panel.hidden = !open;
       toggle.setAttribute('aria-expanded', String(open));
-      if (open) panel.querySelector('input, select, button')?.focus();
+      if (open) { panel.querySelectorAll('details').forEach(group => { group.open = false; }); panel.scrollTop = 0; panel.querySelector('summary')?.focus(); }
       else if (restoreFocus) toggle.focus();
     }
 
@@ -16485,6 +17047,7 @@
     // Upstream snapshot has no LICENSE; its license is not inferred from this script's GPL header.
     try {
 (() => {
+  function oceanModelFactory() {
   // work/ocean65-src/math.ts
   var TAU = Math.PI * 2;
   var clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
@@ -17324,9 +17887,9 @@
     return !(neg && pos);
   }
   var AsciiRenderer = class {
-    constructor(canvas) {
+    constructor(canvas, context = null) {
       this.canvas = canvas;
-      const ctx = canvas.getContext("2d", { alpha: true });
+      const ctx = context || canvas.getContext("2d", { alpha: true });
       if (!ctx) throw new Error("2D canvas unavailable");
       this.ctx = ctx;
       for (let c = 0; c < DOT_RGB.length; c++) {
@@ -17405,7 +17968,7 @@
     }
     advanceFields(world, dt) {
       this.consumeEvents(world);
-      this.depositWake(world);
+      this.depositWake(world, dt);
       this.diffuse(dt);
     }
     dotStarts = new Int32Array(DOT_RGB.length * ALPHA_LEVELS + 1);
@@ -17520,27 +18083,28 @@
       }
       world.events.length = 0;
     }
-    depositWake(world) {
+    depositWake(world, dt = 1 / 24) {
+      const scale = dt * 24;
       const { energy } = this;
       for (const f of world.fish) {
         if (!f.alive) continue;
         const i = this.cellIndex(f.x, f.y);
-        if (i >= 0) energy[i] = Math.min(1.6, energy[i] + 0.012 + f.alarm * 0.03);
+        if (i >= 0) energy[i] = Math.min(1.6, energy[i] + (0.012 + f.alarm * 0.03) * scale);
       }
       for (const sh of world.sharks) {
         for (let k = SHARK_NODES - 6; k < SHARK_NODES; k++) {
           const i = this.cellIndex(sh.nodes[k * 2], sh.nodes[k * 2 + 1]);
-          if (i >= 0) energy[i] = Math.min(1.6, energy[i] + 0.05 + sh.speed * 12e-4);
+          if (i >= 0) energy[i] = Math.min(1.6, energy[i] + (0.05 + sh.speed * 12e-4) * scale);
         }
       }
       if (world.pointer.active) {
-        this.stamp(energy, world.pointer.x, world.pointer.y, 1, 0.08);
+        this.stamp(energy, world.pointer.x, world.pointer.y, 1, 0.08 * scale);
       }
     }
     /** Blur + decay so wakes spread out like ripples and fade. */
     diffuse(dt) {
       const { cols, rows, energy, energyTmp: tmp, heat } = this;
-      const decay = Math.exp(-dt * 1.5);
+      const decay = Math.exp(-dt * 1.5), mix = .25 * (1 - Math.pow(.5, dt * 24));
       for (let r = 0; r < rows; r++) {
         for (let c = 0; c < cols; c++) {
           const i = r * cols + c;
@@ -17548,7 +18112,7 @@
           const rt = c < cols - 1 ? energy[i + 1] : energy[i];
           const u = r > 0 ? energy[i - cols] : energy[i];
           const d = r < rows - 1 ? energy[i + cols] : energy[i];
-          tmp[i] = (energy[i] * 4 + l + rt + u + d) * 0.125 * decay;
+          tmp[i] = (energy[i] * (1 - 4 * mix) + (l + rt + u + d) * mix) * decay;
         }
       }
       this.energy = tmp;
@@ -17976,6 +18540,515 @@
     }
   };
 
+
+    return { World, AsciiRenderer, SHAPES, KINDS, ACCENTS };
+  }
+  const { World, AsciiRenderer } = oceanModelFactory();
+  // Canvas-compatible drawing batch: identical glyphs/colors, one GPU draw batch.
+  // Geometry classification remains in the shared renderer, preserving species.
+  // All grid classification, wake diffusion and composition stay on the GPU.
+  // The CPU only uploads the small skeleton, sparse impulses and fish cells.
+  function createOceanComputeRenderer(canvas, renderer, model) {
+    const gl = canvas.getContext('webgl2', { alpha: true, premultipliedAlpha: true, antialias: false, preserveDrawingBuffer: true });
+    if (!gl || !gl.getExtension('EXT_color_buffer_float')) throw new Error('Floating-point GPU render targets unavailable');
+    const COMMON = "precision highp float;\nprecision highp int;\nprecision highp usampler2D;\nuniform sampler2D segmentsTex;\nuniform vec4 meta[40];\nuniform ivec2 grid;\nuniform vec2 cellSize;\nuniform int sharkCount;\nuniform float time;\nuniform int flickerTick;\nconst float PI=3.141592653589793;\nuint hash32(uint x,uint y,uint z){uint h=x*374761393u^y*668265263u^z*1442695041u;h=(h^(h>>13u))*1274126177u;return h^(h>>16u);}\nfloat hash3(int x,int y,int z){return float(hash32(uint(x),uint(y),uint(z)))*(1./4294967296.);}\nfloat classicWidth(float s){if(s<.13)return .09*pow(sin(s/.13*PI*.5),.95);if(s<.3)return .09+.016*smoothstep(.13,.3,s);if(s<.84)return .019+.087*pow(max(0.,1.-(s-.3)/.54),1.25);float k=(s-.84)/.16;return .019*(1.-k)+.012*sin(k*PI);}\nfloat halfWidth(int kind,float s){\n if(kind==0)return classicWidth(s);\n if(kind==1){if(s<.06)return .045;if(s<.3)return .045+.061*smoothstep(.06,.3,s);return classicWidth(s)*.92;}\n if(kind==2){if(s<.13)return .1*pow(sin(s/.13*PI*.5),.45);if(s<.3)return .1+.014*smoothstep(.13,.3,s);if(s<.84)return .019+.095*pow(max(0.,1.-(s-.3)/.54),1.2);float k=(s-.84)/.16;return .019*(1.-k)+.012*sin(k*PI);}\n if(kind==3){if(s<.1)return .075*pow(sin(s/.1*PI*.5),.7);if(s<.28)return .075+.025*smoothstep(.1,.28,s);if(s<.55)return .022+.078*pow(max(0.,1.-(s-.28)/.27),1.1);float k=(s-.55)/.45;return .022*(1.-k*k)+.012*sin(k*PI);}\n if(kind==4){if(s<.05)return .04;if(s<.3)return .04+.07*smoothstep(.05,.3,s);return classicWidth(s)*.95;}\n if(kind==5){if(s<.17)return .088*pow(sin(s/.17*PI*.5),1.5);if(s<.32)return .088+.012*smoothstep(.17,.32,s);if(s<.86)return .014+.086*pow(max(0.,1.-(s-.32)/.54),1.45);float k=(s-.86)/.14;return .014*(1.-k)+.01*sin(k*PI);}\n if(kind==6){if(s<.08)return .07*pow(sin(s/.08*PI*.5),.75);if(s<.2)return .07+.02*smoothstep(.08,.2,s);if(s<.48)return .012+.078*pow(max(0.,1.-(s-.2)/.28),1.3);float k=(s-.48)/.52;return .012*(1.-k)+.006*sin(k*PI*.9)+.002;}\n if(s<.08)return .085*pow(sin(s/.08*PI*.5),.4);if(s<.3)return .085+.02*smoothstep(.08,.3,s);if(s<.72)return .022+.083*pow(max(0.,1.-(s-.3)/.42),1.1);float k=(s-.72)/.28;return .022*(1.-k*k)+.014*sin(k*PI);\n}\nbool triangle(vec2 p,vec2 a,vec2 b,vec2 c){float d1=(p.x-b.x)*(a.y-b.y)-(a.x-b.x)*(p.y-b.y),d2=(p.x-c.x)*(b.y-c.y)-(b.x-c.x)*(p.y-c.y),d3=(p.x-a.x)*(c.y-a.y)-(c.x-a.x)*(p.y-a.y);return !((d1<0.||d2<0.||d3<0.)&&(d1>0.||d2>0.||d3>0.));}\nbool marked(int kind,int id,float s,float v,float L,float across){\n if(kind==2){if(s<.2||s>.9||across>.85)return false;float wobble=.35*sin(v/L*25.+s*5.),bar=sin(s*PI*2.*9.+wobble);return bar>.65-.5*smoothstep(.2,.42,s)+.4*smoothstep(.8,.9,s);}\n if(kind==3){if(s<.07)return false;float gu=s/.06,gv=v/(L*.045);ivec2 c=ivec2(floor(vec2(gu,gv)));float jx=hash3(c.x,c.y,id)*.5+.25,jy=hash3(c.x,c.y,id+11)*.5+.25;vec2 q=vec2(gu,gv)-vec2(c)-vec2(jx,jy);return dot(q,q)<.08;}return false;\n}\n// x=flag, y=shade, z=longitudinal coordinate, w=signed distance.\nvec4 sampleShark(vec2 p,int sh){\n int base=sh*10,kind=int(meta[base].y),id=int(meta[base].z),bestK=0;float L=meta[base].x,best=1e30,bestU=0.;\n vec4 selected=vec4(0.),selectedLength=vec4(0.);\n for(int k=0;k<19;k++){\n  vec4 a=texelFetch(segmentsTex,ivec2(k,sh*2),0),b=texelFetch(segmentsTex,ivec2(k,sh*2+1),0);\n  float f=clamp(dot(p-a.xy,a.zw)/b.z,0.,1.);vec2 q=a.xy+a.zw*f;float d2=dot(p-q,p-q);\n  if(d2<best){best=d2;bestK=k;bestU=f;selected=a;selectedLength=b;}\n }\n float s=(selectedLength.x+bestU*selectedLength.y)/meta[base+6].z;\n float signV=selected.z*(p.y-selected.y)-selected.w*(p.x-selected.x)>=0.?1.:-1.;\n vec2 normal=vec2(-selected.w,selected.z)/selectedLength.y*signV;\n float a=sqrt(best),u=s*L,w=halfWidth(kind,s)*L;vec4 head=meta[base+5];\n if(head.x>0.&&u<L*(head.y+head.z+head.w)){\n  float r=a/(L*head.x),front=L*head.y*r*r+L*head.w*max(0.,1.-r/.14),depth=L*head.z*(1.-.2*r*r*r*r);\n  if(r<=1.&&u>=front&&u<=front+depth)return vec4(r>.84?5.:1.,r>.84?0.:.62-.2*r+(u<front+L*.012?.1:0.),s,a*signV);\n }\n if(a<=w){float across=a/(w==0.?1.:w),facing=dot(normal,vec2(-.6,-.8))*across,shade=.58-across*across*.42+facing*.26;float flag=1.;vec4 dorsal=meta[base+3],eyeGill=meta[base+4];\n  if(s>dorsal.x&&s<dorsal.y&&across<.3){flag=4.;shade=1.;}\n  else if(s>dorsal.z&&s<dorsal.w&&across<.4)shade=max(shade,.82);\n  else if(eyeGill.x>=0.&&s>eyeGill.x&&s<eyeGill.y&&across>.6){flag=5.;shade=0.;}\n  else if(s>eyeGill.z&&s<eyeGill.w&&across>.58){if(int(floor((s-eyeGill.z)/(eyeGill.w-eyeGill.z)*5.))%2==0)shade*=.45;}\n  else if(s<.05)shade=max(shade,.7);\n  else if(kind==3&&s>.08&&s<.55&&(across<.1||abs(across-.6)<.08))shade=max(shade,.8);\n  else if(marked(kind,id,s,a*signV,L,across))flag=6.;\n  return vec4(flag,shade,s,a*signV);\n }\n float tip=signV>0.?meta[base+6].y:meta[base+6].x;vec4 fin=meta[base+1],pelvic=meta[base+2];\n if(triangle(vec2(u,a),vec2(L*fin.x,0),vec2(L*fin.y,0),vec2(L*fin.z,tip))&&!(meta[base+8].w>.5&&triangle(vec2(u,a),vec2(L*fin.y,0),vec2(L*(fin.y+(fin.z-fin.y)*.33),tip*.55),vec2(L*fin.z,tip))))return vec4(marked(kind,id,s,a*signV,L,0.)?6.:3.,.38+.22*(1.-clamp(a/tip,0.,1.)),s,a*signV);\n if(triangle(vec2(u,a),vec2(L*pelvic.x,0),vec2(L*pelvic.y,0),vec2(L*pelvic.z,L*pelvic.w))||(meta[base+6].w>0.&&triangle(vec2(u,a),vec2(L*.86,0),vec2(L*.95,0),vec2(L,L*meta[base+6].w))))return vec4(3.,.36,s,a*signV);\n return vec4(0.,0.,s,a*signV);\n}\n";
+    const CLASSIFY = "uniform usampler2D occlusionTex;\nuniform int edgeSamples;\nlayout(location=0) out uvec4 classified;\nvoid main(){\n ivec2 c=ivec2(gl_FragCoord.xy);classified=uvec4(0);if(texelFetch(occlusionTex,c,0).r!=0u)return;\n uint bodyFlags=0u;vec2 offsets[4]=vec2[4](vec2(.25,.3),vec2(.75,.3),vec2(.25,.72),vec2(.75,.72));\n for(int sh=0;sh<4;sh++){\n  if(sh>=sharkCount)break;vec4 bounds=meta[sh*10+7];if(float(c.x)<bounds.x||float(c.x)>bounds.y||float(c.y)<bounds.z||float(c.y)>bounds.w)continue;\n  vec2 origin=vec2(c)*cellSize;vec4 center=sampleShark(origin+cellSize*.5,sh);\n  bool centerHit=center.x>0.;if(!centerHit&&abs(center.w)>meta[sh*10].x*.36+length(cellSize))continue;\n  int hits=centerHit?1:0;for(int i=0;i<4;i++){if(i>=edgeSamples)break;if(sampleShark(origin+offsets[i]*cellSize,sh).x>0.)hits++;}\n  if(hits==0)continue;float coverage=float(hits)/float(edgeSamples+1);\n  uint h=hash32(uint(int(floor(center.z*52.+.5))),uint(int(floor(center.w/(cellSize.x*.9)+.5))),uint(meta[sh*10].z));uint key=h==0u?0u:h-1u;\n  uint flag=2u;float shade=coverage;\n  if(centerHit&&coverage>=.6){flag=uint(center.x);shade=clamp(center.y+(hash3(c.x,c.y,flickerTick)-.5)*.06,0.,1.);bodyFlags|=1u<<uint(sh);}\n  classified=uvec4(flag,key,floatBitsToUint(shade),uint(sh+1));\n }\n classified.r|=bodyFlags<<8u;\n}\n";
+    const FIELDS = "uniform sampler2D previousTex;\nuniform sampler2D depositTex;\nuniform float dt;\nlayout(location=0) out vec2 field;\nvec2 added(ivec2 p){p=clamp(p,ivec2(0),grid-1);return min(vec2(1.6),texelFetch(previousTex,p,0).rg+texelFetch(depositTex,p,0).rg);}\nvoid main(){ivec2 p=ivec2(gl_FragCoord.xy);vec2 center=added(p);float mixAmount=.25*(1.-pow(.5,dt*24.));float neighbors=added(p+ivec2(-1,0)).r+added(p+ivec2(1,0)).r+added(p+ivec2(0,-1)).r+added(p+ivec2(0,1)).r;field=vec2((center.r*(1.-4.*mixAmount)+neighbors*mixAmount)*exp(-dt*1.5),center.g*exp(-dt*2.2));}\n";
+    let DRAW = "uniform usampler2D classifiedTex;\nuniform usampler2D fishTex;\nuniform usampler2D occlusionTex;\nuniform sampler2D fieldTex;\nuniform sampler2D dotsTex;\nuniform sampler2D atlasTex;\nuniform vec2 viewport;\nuniform float dpr;\nuniform float atlasCell;\nuniform ivec2 atlasSize;\nuniform vec4 fishColors[5];\nuniform vec4 dotColors[30];\nuniform vec4 accentColors[7];\nuniform int accentCount;\nout vec4 pixel;\n// __GLYPH_CONSTANTS__\nfloat rectCoverage(vec2 p,vec4 rect){vec2 v=clamp(min(p+.5,rect.xy+rect.zw)-max(p-.5,rect.xy),0.,1.);return v.x*v.y;}\nfloat glyphMask(int glyph,vec2 p,vec2 anchor){\n ivec2 point=ivec2(floor(anchor*8.+.5)),phase=(point%8+8)%8;int index=glyph*64+phase.y*8+phase.x;\n vec2 center=floor(vec2(atlasCell*.5))+vec2(phase)/8.,top=vec2(point)/8.-center,local=p-top;\n if(any(lessThan(local,vec2(0.)))||any(greaterThanEqual(local,vec2(atlasCell))))return 0.;\n ivec2 origin=ivec2(index%32,index/32)*int(atlasCell);return texelFetch(atlasTex,origin+ivec2(floor(local)),0).a;\n}\nvec4 over(vec4 back,vec4 color,float coverage){float a=clamp(color.a,0.,1.)*coverage;return vec4(color.rgb*a,a)+back*(1.-a);}\n// Antialiased rectangles can cover a fraction of the next cell's first pixel.\n// Keep those contributions; dropping them would thin the original cell edges.\nvec4 neighborBackground(vec4 back,ivec2 c,vec2 p){\n if(any(lessThan(c,ivec2(0)))||any(greaterThanEqual(c,grid))||texelFetch(occlusionTex,c,0).r!=0u)return back;\n uvec4 data=texelFetch(classifiedTex,c,0);uint flag=data.r&255u;if(flag==0u||flag==2u)return back;\n float shade=uintBitsToFloat(data.b),dim=.7+.3*meta[(int(data.a)-1)*10].w,level=flag==4u?226.:flag==5u?12.:flag==6u?24.+shade*22.:flag==3u?40.+shade*120.:46.+shade*160.;\n vec3 tint=meta[(int(data.a)-1)*10+8].rgb,col=min(vec3(255.),floor(level*dim*tint+vec3(0,0,4)+.5))/255.;\n return over(back,vec4(col,1.),rectCoverage(p,vec4((vec2(c)*cellSize+1.)*dpr,(cellSize-1.)*dpr)));\n}\nvoid main(){\n vec2 p=vec2(gl_FragCoord.x,viewport.y-gl_FragCoord.y),css=p/dpr;ivec2 c=ivec2(floor(css/cellSize));pixel=vec4(0.);\n if(any(greaterThanEqual(c,grid))||texelFetch(occlusionTex,c,0).r!=0u)return;\n vec2 origin=vec2(c)*cellSize,anchor=(origin+cellSize*.5+vec2(0,1))*dpr;\n uvec4 cell=texelFetch(classifiedTex,c,0);uint flag=cell.r&255u;float energy=texelFetch(fieldTex,c,0).r,heat=texelFetch(fieldTex,c,0).g;uint fish=flag==0u?texelFetch(fishTex,c,0).r:0u;\n vec3 dots=texelFetch(dotsTex,c,0).rgb;\n if(flag==0u&&fish==0u&&!(dots.z==0.&&energy<=.45)){\n  int bucket;\n  if(energy>.45)bucket=24+clamp(int(floor((energy-.45)*5.)),0,5);\n  else{float twinkle=.5+.5*sin(time*dots.y+dots.x),caustic=.85+.15*sin(float(c.x)*.11+time*.35)*sin(float(c.y)*.17-time*.27);float v=clamp((.55+.45*twinkle)*caustic+energy*2.,0.,1.);bool shadow=false;\n   for(int sh=0;sh<4;sh++){if(sh>=sharkCount)break;ivec2 q=c-ivec2(meta[sh*10+9].xy);if(all(greaterThanEqual(q,ivec2(0)))&&all(lessThan(q,grid))&&((texelFetch(classifiedTex,q,0).r>>(8u+uint(sh)))&1u)!=0u)shadow=true;}\n   if(shadow)v*=.2;bucket=(int(dots.z)-1)*6+clamp(int(floor(v*6.)),0,5);\n  }\n  if(bucket>=0&&bucket<30){float side=max(2.,floor(cellSize.x*.19+.5))+(bucket>=24?1.:0.);vec2 xy=floor(origin+cellSize*vec2(.66,.64)-side*.5+.5);pixel=over(pixel,dotColors[bucket],rectCoverage(p,vec4(xy*dpr,vec2(side*dpr))));}\n }\n if(heat>=.08){float a=floor((heat>.5?heat:heat*1.6)*100.+.5)/100.;pixel=over(pixel,vec4(heat>.5?vec3(1.,120./255.,60./255.):vec3(220./255.,40./255.,40./255.),a),glyphMask(heat>.6?G_STAR:G_MIDDOT,p,anchor));}\n if(fish>0u)pixel=over(pixel,fishColors[int(fish)-1],glyphMask(G_DASH,p,anchor));\n bool fromLeft=css.x-origin.x<.5/dpr,fromAbove=css.y-origin.y<.5/dpr;\n if(fromLeft&&fromAbove)pixel=neighborBackground(pixel,c-ivec2(1,1),p);\n if(fromAbove)pixel=neighborBackground(pixel,c-ivec2(0,1),p);\n if(fromLeft)pixel=neighborBackground(pixel,c-ivec2(1,0),p);\n if(flag==0u)return;\n int sh=int(cell.a)-1;float shade=uintBitsToFloat(cell.b),dim=.7+.3*meta[sh*10].w;vec3 tint=meta[sh*10+8].rgb;uint key=cell.g;\n int tick=int(floor(time*2.4+float(key%997u)/97.));float roll=float(hash32(key,uint(tick),7u))*(1./4294967296.);int accent=int(key%uint(accentCount));\n if(flag==2u){float g=(70.+shade*80.)*dim;vec3 col=roll<.07?accentColors[accent].rgb:vec3(floor(g*tint.r+.5),floor(g*tint.g+.5),min(255.,floor(g*tint.b+6.+.5)))/255.;int glyph=shade>=.5?EDGE_HEAVY[int((key>>8u)%2u)]:EDGE_LIGHT[int((key>>8u)%4u)];pixel=over(pixel,vec4(col,1.),glyphMask(glyph,p,anchor));return;}\n float level;int glyph;\n if(flag==4u){level=226.;glyph=RIDGE[int((key>>8u)%3u)];}\n else if(flag==5u){level=12.;glyph=G_EYE;}\n else if(flag==6u){level=24.+shade*22.;glyph=MARK[int((key>>8u)%3u)];}\n else if(flag==3u){level=40.+shade*120.;glyph=FIN[int((key>>8u)%5u)];}\n else{level=46.+shade*160.;int jitter=int((key>>4u)%3u)-1;glyph=RAMP[clamp(int(floor((1.-shade)*8.99))+jitter,0,8)];}\n level*=dim;vec3 background=min(vec3(255.),floor(level*tint+vec3(0,0,4)+.5))/255.;pixel=over(pixel,vec4(background,1.),rectCoverage(p,vec4((origin+1.)*dpr,(cellSize-1.)*dpr)));\n vec3 color;\n if(flag==5u)color=vec3(154.,160.,173.)/255.;else if(flag==6u)color=floor(70.*tint+.5)/255.;else if(roll<.09)color=accentColors[accent].rgb;else if(roll<.13)color=vec3(1.);else color=shade>.55?vec3(14.,15.,19.)/255.:vec3(27.,29.,36.)/255.;\n pixel=over(pixel,vec4(color,1.),glyphMask(glyph,p,anchor));\n}\n";
+    const chars = [...new Set(":;t%SX8#@o.',`-*·?")];
+    const array = (name, value) => `const int ${name}[${value.length}]=int[${value.length}](${[...value].map(c => chars.indexOf(c)).join(',')});`;
+    DRAW = DRAW.replace('// __GLYPH_CONSTANTS__', [array('RAMP', ':;t%SX8#@'), array('FIN', '%;tS:'), array('RIDGE', '@8%'), array('MARK', '#%@'), array('EDGE_HEAVY', ':;'), array('EDGE_LIGHT', ".',`"), ...[['G_STAR', '*'], ['G_MIDDOT', '·'], ['G_DASH', '-'], ['G_EYE', 'o']].map(([name, glyph]) => `const int ${name}=${chars.indexOf(glyph)};`)].join('\n'));
+    const shader = (type, source) => {
+      const s = gl.createShader(type); gl.shaderSource(s, source); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    };
+    const vertex = shader(gl.VERTEX_SHADER, '#version 300 es\nvoid main(){vec2 p=vec2(float(gl_VertexID&1),float(gl_VertexID>>1));gl_Position=vec4(p*2.-1.,0,1);}');
+    function program(fragment) {
+      const value = gl.createProgram(), fs = shader(gl.FRAGMENT_SHADER, '#version 300 es\n' + COMMON + '\n' + fragment);
+      gl.attachShader(value, vertex); gl.attachShader(value, fs); gl.linkProgram(value); gl.deleteShader(fs);
+      if (!gl.getProgramParameter(value, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(value));
+      const uniforms = new Map();
+      return { value, location(name) { if (!uniforms.has(name)) uniforms.set(name, gl.getUniformLocation(value, name)); return uniforms.get(name); } };
+    }
+    const classify = program(CLASSIFY), fields = program(FIELDS), draw = program(DRAW); gl.deleteShader(vertex);
+    const vao = gl.createVertexArray();
+    const segments = new Float32Array(19 * 8 * 4), metadata = new Float32Array(160), spine = new Float32Array(40), arc = new Float32Array(20);
+    const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+    const segmentTexture = texture(gl.RGBA32F, 19, 8, gl.RGBA, gl.FLOAT, segments);
+    let cols = 0, rows = 0, classTexture, classFbo, occlusion, fishTexture, dotTexture, depositTexture, fieldTextures = [], fieldFbos = [], current = 0;
+    let deposits, fishCells, dotData, occlusionVersion = null, atlas = null, atlasCell = 0, atlasWidth = 0, atlasHeight = 0, atlasKey = '';
+    let frameCount = 0, cpuMs = 0;
+    function texture(internal, width, height, format, type, data = null) {
+      const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, internal, width, height, 0, format, type, data);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      return tex;
+    }
+    function framebuffer(tex) {
+      const fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fbo); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('GPU framebuffer incomplete');
+      return fbo;
+    }
+    function bind(p, name, tex, unit) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(p.location(name), unit); }
+    function common(p, world) {
+      gl.useProgram(p.value); gl.bindVertexArray(vao); gl.disable(gl.BLEND); gl.disable(gl.SCISSOR_TEST);
+      gl.uniform2i(p.location('grid'), cols, rows); gl.uniform2f(p.location('cellSize'), renderer.cw, renderer.ch);
+      gl.uniform4fv(p.location('meta[0]'), metadata); gl.uniform1i(p.location('sharkCount'), Math.min(4, world.sharks.length));
+      gl.uniform1f(p.location('time'), world.time); gl.uniform1i(p.location('flickerTick'), Math.floor(world.time * 6));
+    }
+    function ensureSize() {
+      if (cols === renderer.cols && rows === renderer.rows) return;
+      for (const tex of [classTexture, occlusion, fishTexture, dotTexture, depositTexture, ...fieldTextures]) if (tex) gl.deleteTexture(tex);
+      for (const fbo of [classFbo, ...fieldFbos]) if (fbo) gl.deleteFramebuffer(fbo);
+      cols = renderer.cols; rows = renderer.rows; const n = cols * rows;
+      deposits = new Float32Array(n * 2); fishCells = new Uint8Array(n); dotData = new Float32Array(n * 4);
+      classTexture = texture(gl.RGBA32UI, cols, rows, gl.RGBA_INTEGER, gl.UNSIGNED_INT); classFbo = framebuffer(classTexture);
+      occlusion = texture(gl.R8UI, cols, rows, gl.RED_INTEGER, gl.UNSIGNED_BYTE);
+      fishTexture = texture(gl.R8UI, cols, rows, gl.RED_INTEGER, gl.UNSIGNED_BYTE);
+      for (let i = 0; i < n; i++) { dotData[i * 4] = renderer.dotPhase[i]; dotData[i * 4 + 1] = renderer.dotFreq[i]; dotData[i * 4 + 2] = renderer.dotKind[i]; }
+      dotTexture = texture(gl.RGBA32F, cols, rows, gl.RGBA, gl.FLOAT, dotData);
+      depositTexture = texture(gl.RG32F, cols, rows, gl.RG, gl.FLOAT);
+      fieldTextures = [0, 1].map(() => texture(gl.RG32F, cols, rows, gl.RG, gl.FLOAT)); fieldFbos = fieldTextures.map(framebuffer); current = 0; occlusionVersion = null;
+    }
+    function ensureAtlas() {
+      const dpr = renderer.dpr, size = Math.round(renderer.ch * .74), key = `${size}:${dpr}:${renderer.fontFamily}`;
+      if (key === atlasKey) return; atlasKey = key;
+      atlasCell = Math.ceil(size * dpr * 2 + 8); atlasWidth = atlasCell * 32; atlasHeight = atlasCell * Math.ceil(chars.length * 64 / 32);
+      const image = new OffscreenCanvas(atlasWidth, atlasHeight), ctx = image.getContext('2d');
+      ctx.font = `600 ${size}px ${renderer.fontFamily}`; ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      for (let ch = 0; ch < chars.length; ch++) for (let phase = 0; phase < 64; phase++) {
+        const i = ch * 64 + phase, x = i % 32 * atlasCell, y = Math.floor(i / 32) * atlasCell;
+        ctx.fillText(chars[ch], (x + Math.floor(atlasCell / 2) + phase % 8 / 8) / dpr, (y + Math.floor(atlasCell / 2) + Math.floor(phase / 8) / 8) / dpr);
+      }
+      if (atlas) gl.deleteTexture(atlas); atlas = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, atlas);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    }
+    const colors = new Map();
+    function color(value) {
+      if (colors.has(value)) return colors.get(value); let out;
+      if (/^#[\da-f]{6}$/i.test(value)) out = [parseInt(value.slice(1, 3), 16) / 255, parseInt(value.slice(3, 5), 16) / 255, parseInt(value.slice(5, 7), 16) / 255, 1];
+      else { const n = value.match(/[\d.]+/g)?.map(Number); out = n?.length >= 3 ? [n[0] / 255, n[1] / 255, n[2] / 255, n[3] ?? 1] : [1, 1, 1, 1]; }
+      if (colors.size > 128) colors.clear(); colors.set(value, out); return out;
+    }
+    function skeleton(world) {
+      metadata.fill(0);
+      for (let sh = 0; sh < Math.min(4, world.sharks.length); sh++) {
+        const s = world.sharks[sh], n = s.nodes, L = s.length, shape = model.SHAPES[s.kind], base = sh * 40;
+        for (let k = 0; k < 20; k++) {
+          const a = Math.max(0, k - 1), b = Math.min(19, k + 1), tx = n[a * 2] - n[b * 2], ty = n[a * 2 + 1] - n[b * 2 + 1], length = Math.hypot(tx, ty) || 1;
+          const amp = L * .05 * (.1 + .9 * Math.pow(k / 19, 1.8)) * clamp(s.speed / 60, .4, 1.4), offset = amp * Math.sin(s.phase - k / 19 * 5.2);
+          spine[k * 2] = n[k * 2] - ty / length * offset; spine[k * 2 + 1] = n[k * 2 + 1] + tx / length * offset;
+        }
+        arc[0] = 0; for (let k = 1; k < 20; k++) arc[k] = arc[k - 1] + Math.hypot(spine[k * 2] - spine[k * 2 - 2], spine[k * 2 + 1] - spine[k * 2 - 1]);
+        for (let k = 0; k < 19; k++) {
+          const a = (sh * 2 * 19 + k) * 4, b = a + 19 * 4, x = spine[k * 2], y = spine[k * 2 + 1], dx = spine[k * 2 + 2] - x, dy = spine[k * 2 + 3] - y;
+          segments.set([x, y, dx, dy], a); segments.set([arc[k], Math.sqrt(dx * dx + dy * dy || 1), dx * dx + dy * dy || 1, 0], b);
+        }
+        const bank = clamp(s.turn * .45, -.35, .35), flex = 1 + .06 * Math.sin(s.phase * .5), fin = L * shape.pectoral[3] * flex;
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (let k = 0; k < 20; k++) { minX = Math.min(minX, spine[k * 2]); maxX = Math.max(maxX, spine[k * 2]); minY = Math.min(minY, spine[k * 2 + 1]); maxY = Math.max(maxY, spine[k * 2 + 1]); }
+        metadata.set([L, model.KINDS.indexOf(s.kind), s.id, s.depth], base);
+        metadata.set(shape.pectoral, base + 4); metadata.set(shape.pelvic, base + 8); metadata.set([...shape.dorsal, ...shape.secondDorsal], base + 12);
+        metadata.set([...(shape.eye || [-1, -1]), ...shape.gills], base + 16);
+        if (shape.head) metadata.set([shape.head.span, shape.head.sweep, shape.head.depth, shape.head.notch], base + 20);
+        metadata.set([fin * (1 + bank), fin * (1 - bank), arc[19] || 1, shape.caudal], base + 24);
+        metadata.set([Math.max(0, Math.floor((minX - L * .36) / renderer.cw)), Math.min(cols - 1, Math.floor((maxX + L * .36) / renderer.cw)), Math.max(0, Math.floor((minY - L * .36) / renderer.ch)), Math.min(rows - 1, Math.floor((maxY + L * .36) / renderer.ch))], base + 28);
+        metadata.set([...(renderer.bodyTint || shape.tint), shape.falcate ? 1 : 0], base + 32);
+        metadata.set([Math.round(L * .035 / renderer.cw) + 1, Math.round(L * .02 / renderer.ch) + 1, 0, 0], base + 36);
+      }
+      gl.bindTexture(gl.TEXTURE_2D, segmentTexture); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 19, 8, gl.RGBA, gl.FLOAT, segments);
+    }
+    function index(x, y) { const c = Math.floor(x / renderer.cw), r = Math.floor(y / renderer.ch); return c >= 0 && c < cols && r >= 0 && r < rows ? r * cols + c : -1; }
+    function stamp(channel, x, y, radius, amount) {
+      const c0 = Math.floor(x / renderer.cw), r0 = Math.floor(y / renderer.ch);
+      for (let r = Math.max(0, r0 - radius); r <= Math.min(rows - 1, r0 + radius); r++) for (let c = Math.max(0, c0 - radius); c <= Math.min(cols - 1, c0 + radius); c++) {
+        const d = Math.hypot(c - c0, (r - r0) * 1.4); if (d <= radius + .5) { const i = (r * cols + c) * 2 + channel; deposits[i] = Math.min(1.6, deposits[i] + amount * (1 - d / (radius + 1))); }
+      }
+    }
+    function impulses(world, dt) {
+      deposits.fill(0);
+      for (const e of world.events) if (e.kind === 'eat') { stamp(1, e.x, e.y, 2, 1); stamp(0, e.x, e.y, 3, .9); } else stamp(0, e.x, e.y, 6, 1.4);
+      world.events.length = 0; const scale = dt * 24;
+      for (const f of world.fish) if (f.alive) { const i = index(f.x, f.y); if (i >= 0) deposits[i * 2] = Math.min(1.6, deposits[i * 2] + (.012 + f.alarm * .03) * scale); }
+      for (const s of world.sharks) for (let k = 14; k < 20; k++) { const i = index(s.nodes[k * 2], s.nodes[k * 2 + 1]); if (i >= 0) deposits[i * 2] = Math.min(1.6, deposits[i * 2] + (.05 + s.speed * .0012) * scale); }
+      if (world.pointer.active) stamp(0, world.pointer.x, world.pointer.y, 1, .08 * scale);
+      gl.bindTexture(gl.TEXTURE_2D, depositTexture); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, cols, rows, gl.RG, gl.FLOAT, deposits);
+    }
+    function fish(world) {
+      fishCells.fill(0);
+      for (let pass = 0; pass < 2; pass++) for (const f of world.fish) {
+        if (!f.alive || (f.depth > .78 ? 0 : 1) !== pass) continue; const i = index(f.x, f.y); if (i < 0 || fishCells[i]) continue;
+        const glint = clamp(Math.abs(f.turn) / 3.5, 0, 1), v = .3 + .4 * (f.depth - .55) / .45 + .3 * Math.max(glint, f.alarm);
+        fishCells[i] = clamp(Math.floor(v * 5), 0, 4) + 1;
+      }
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1); gl.bindTexture(gl.TEXTURE_2D, fishTexture); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, cols, rows, gl.RED_INTEGER, gl.UNSIGNED_BYTE, fishCells);
+    }
+    return {
+      render(world, dt, masks = []) {
+        const started = performance.now(); if (gl.isContextLost()) throw new Error('GPU compute context lost');
+        ensureSize(); ensureAtlas(); skeleton(world); fish(world);
+        if (occlusionVersion !== renderer.occlusionKey) { gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1); gl.bindTexture(gl.TEXTURE_2D, occlusion); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, cols, rows, gl.RED_INTEGER, gl.UNSIGNED_BYTE, renderer.occluded); occlusionVersion = renderer.occlusionKey; }
+        if (dt > 0) {
+          impulses(world, dt); common(fields, world); gl.bindFramebuffer(gl.FRAMEBUFFER, fieldFbos[1 - current]); gl.viewport(0, 0, cols, rows);
+          bind(fields, 'previousTex', fieldTextures[current], 0); bind(fields, 'depositTex', depositTexture, 1); gl.uniform1f(fields.location('dt'), dt); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); current = 1 - current;
+        }
+        common(classify, world); gl.bindFramebuffer(gl.FRAMEBUFFER, classFbo); gl.viewport(0, 0, cols, rows); bind(classify, 'segmentsTex', segmentTexture, 0); bind(classify, 'occlusionTex', occlusion, 1); gl.uniform1i(classify.location('edgeSamples'), renderer.edgeSamples); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        common(draw, world); gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, canvas.width, canvas.height);
+        bind(draw, 'classifiedTex', classTexture, 0); bind(draw, 'fieldTex', fieldTextures[current], 1); bind(draw, 'fishTex', fishTexture, 2); bind(draw, 'occlusionTex', occlusion, 3); bind(draw, 'dotsTex', dotTexture, 4); bind(draw, 'atlasTex', atlas, 5);
+        gl.uniform2f(draw.location('viewport'), canvas.width, canvas.height); gl.uniform1f(draw.location('dpr'), renderer.dpr); gl.uniform1f(draw.location('atlasCell'), atlasCell); gl.uniform2i(draw.location('atlasSize'), atlasWidth, atlasHeight);
+        gl.uniform4fv(draw.location('fishColors[0]'), renderer.fishStyles.flatMap(color)); gl.uniform4fv(draw.location('dotColors[0]'), renderer.dotStyles.flatMap(color));
+        const accents = renderer.paletteAccents || model.ACCENTS; gl.uniform1i(draw.location('accentCount'), accents.length); gl.uniform4fv(draw.location('accentColors[0]'), [...accents, ...Array(7 - accents.length).fill('#000000')].flatMap(color));
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        for (const r of masks) { const d = renderer.dpr; gl.enable(gl.SCISSOR_TEST); gl.scissor(Math.floor(r.x * d), Math.floor(canvas.height - (r.y + r.h) * d), Math.ceil(r.w * d), Math.ceil(r.h * d)); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT); }
+        gl.disable(gl.SCISSOR_TEST); frameCount++; cpuMs = performance.now() - started;
+      },
+      clearFields() { for (const fbo of fieldFbos) { gl.bindFramebuffer(gl.FRAMEBUFFER, fbo); gl.clearBufferfv(gl.COLOR, 0, new Float32Array(4)); } },
+      getState: () => ({ frameCount, cpuMs }),
+      // QA only: never called by the production rendering path.
+      inspectCells() { const result = new Uint32Array(cols * rows * 4); gl.bindFramebuffer(gl.FRAMEBUFFER, classFbo); gl.readPixels(0, 0, cols, rows, gl.RGBA_INTEGER, gl.UNSIGNED_INT, result); gl.bindFramebuffer(gl.FRAMEBUFFER, null); return result; },
+      inspectFields() { const result = new Float32Array(cols * rows * 4); gl.bindFramebuffer(gl.FRAMEBUFFER, fieldFbos[current]); gl.readPixels(0, 0, cols, rows, gl.RGBA, gl.FLOAT, result); gl.bindFramebuffer(gl.FRAMEBUFFER, null); return result; },
+    };
+  }
+
+  function createOceanGpuContext(canvas) {
+    const gl = canvas.getContext('webgl2', { alpha: true, premultipliedAlpha: true, antialias: false, preserveDrawingBuffer: true });
+    if (!gl) return null;
+    const shader = (type, source) => {
+      const s = gl.createShader(type); gl.shaderSource(s, source); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    };
+    const program = gl.createProgram();
+    const vertex = shader(gl.VERTEX_SHADER, `#version 300 es
+      precision highp float;
+      layout(location=0) in vec4 box;
+      layout(location=1) in vec4 color;
+      layout(location=2) in vec4 uvbox;
+      layout(location=3) in float glyph;
+      uniform vec2 size;out vec4 tint;out vec2 uv;flat out float isGlyph;flat out vec4 bounds;
+      void main(){vec2 p=vec2(float(gl_VertexID&1),float(gl_VertexID>>1));
+      vec2 lo=glyph>.5?box.xy:floor(box.xy),hi=glyph>.5?box.xy+box.zw:ceil(box.xy+box.zw);
+      vec2 xy=mix(lo,hi,p)/size;gl_Position=vec4(xy.x*2.-1.,1.-xy.y*2.,0,1);
+      tint=color;uv=uvbox.xy+p*uvbox.zw;isGlyph=glyph;bounds=box;}`);
+    const fragment = shader(gl.FRAGMENT_SHADER, `#version 300 es
+      precision highp float;uniform sampler2D atlas;uniform vec2 size;in vec4 tint;in vec2 uv;flat in float isGlyph;flat in vec4 bounds;out vec4 pixel;
+      void main(){vec2 p=vec2(gl_FragCoord.x,size.y-gl_FragCoord.y);
+      vec2 coverage=clamp(min(p+.5,bounds.xy+bounds.zw)-max(p-.5,bounds.xy),0.,1.);
+      float a=tint.a*(isGlyph>.5?texture(atlas,uv).a:coverage.x*coverage.y);pixel=vec4(tint.rgb*a,a);}`);
+    gl.attachShader(program, vertex); gl.attachShader(program, fragment); gl.linkProgram(program);
+    gl.deleteShader(vertex); gl.deleteShader(fragment);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+    const buffer = gl.createBuffer(), texture = gl.createTexture(), vao = gl.createVertexArray();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    let values = new Float32Array(13 * 4096), count = 0, sx = 1, sy = 1;
+    let color = [0, 0, 0, 1], fillStyle = '#000', font = '600 12px monospace', atlasKey = '', glyphs = null, atlasCanvas = null;
+    const colors = new Map(), chars = [...new Set(":;t%SX8#@o.',`-*·?")];
+    const parse = value => {
+      if (colors.has(value)) return colors.get(value);
+      let c;
+      if (/^#[\da-f]{6}$/i.test(value)) c = [parseInt(value.slice(1, 3), 16) / 255, parseInt(value.slice(3, 5), 16) / 255, parseInt(value.slice(5, 7), 16) / 255, 1];
+      else if (/^#[\da-f]{3}$/i.test(value)) c = [...value.slice(1)].map(v => parseInt(v + v, 16) / 255).concat(1);
+      else { const n = value.match(/[\d.]+/g)?.map(Number); c = n?.length >= 3 ? [n[0] / 255, n[1] / 255, n[2] / 255, n[3] ?? 1] : [1, 1, 1, 1]; }
+      if (colors.size >= 1024) colors.clear(); colors.set(value, c); return c;
+    };
+    function atlas() {
+      const key = font + ':' + sx + ':' + sy;
+      if (key === atlasKey) return;
+      flush(); atlasKey = key;
+      const fontSize = parseFloat(font.match(/([\d.]+)px/)?.[1]) || 12;
+      // Eight subpixel phases prevent atlas resampling from blurring glyphs.
+      const cell = Math.ceil(fontSize * Math.max(sx, sy) * 2 + 8), columns = 32, rows = Math.ceil(chars.length * 64 / columns);
+      atlasCanvas = new OffscreenCanvas(cell * columns, cell * rows);
+      const ctx = atlasCanvas.getContext('2d');
+      ctx.font = font; ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.setTransform(sx, 0, 0, sy, 0, 0); glyphs = new Map();
+      chars.forEach((char, charIndex) => {
+        const variants = [];
+        for (let phase = 0; phase < 64; phase++) {
+          const i = charIndex * 64 + phase, x = i % columns * cell, y = Math.floor(i / columns) * cell;
+          const cx = Math.floor(cell / 2) + (phase % 8) / 8, cy = Math.floor(cell / 2) + Math.floor(phase / 8) / 8;
+          ctx.fillText(char, (x + cx) / sx, (y + cy) / sy);
+          variants.push({ cell, cx, cy, u: x / atlasCanvas.width, v: y / atlasCanvas.height, uw: cell / atlasCanvas.width, vh: cell / atlasCanvas.height });
+        }
+        glyphs.set(char, variants);
+      });
+      gl.bindTexture(gl.TEXTURE_2D, texture); gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, atlasCanvas);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    }
+    function push(x, y, w, h, uv = [0, 0, 0, 0], glyph = 0) {
+      if ((count + 1) * 13 > values.length) { const next = new Float32Array(values.length * 2); next.set(values); values = next; }
+      const i = count++ * 13;
+      values[i] = x; values[i + 1] = y; values[i + 2] = w; values[i + 3] = h;
+      values[i + 4] = color[0]; values[i + 5] = color[1]; values[i + 6] = color[2]; values[i + 7] = color[3];
+      values[i + 8] = uv[0]; values[i + 9] = uv[1]; values[i + 10] = uv[2]; values[i + 11] = uv[3]; values[i + 12] = glyph;
+    }
+    function flush() {
+      if (!count) return;
+      if (gl.isContextLost()) throw new Error('Ocean WebGL context lost');
+      gl.viewport(0, 0, canvas.width, canvas.height); gl.useProgram(program); gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer); gl.bufferData(gl.ARRAY_BUFFER, values.subarray(0, count * 13), gl.DYNAMIC_DRAW);
+      for (const [location, length, offset] of [[0, 4, 0], [1, 4, 4], [2, 4, 8], [3, 1, 12]]) {
+        gl.enableVertexAttribArray(location); gl.vertexAttribPointer(location, length, gl.FLOAT, false, 52, offset * 4); gl.vertexAttribDivisor(location, 1);
+      }
+      gl.uniform2f(gl.getUniformLocation(program, 'size'), canvas.width, canvas.height);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texture); gl.uniform1i(gl.getUniformLocation(program, 'atlas'), 0);
+      gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count); count = 0;
+    }
+    return {
+      get fillStyle() { return fillStyle; }, set fillStyle(value) { fillStyle = value; color = parse(value); },
+      get font() { return font; }, set font(value) { font = value; },
+      textAlign: 'center', textBaseline: 'middle',
+      setTransform(a, b, c, d) { sx = a; sy = d; },
+      fillRect(x, y, w, h) { push(x * sx, y * sy, w * sx, h * sy); },
+      fillText(text, x, y) {
+        atlas();
+        const px = Math.round(x * sx * 8), py = Math.round(y * sy * 8);
+        const phase = ((py % 8 + 8) % 8) * 8 + (px % 8 + 8) % 8, g = (glyphs.get(text) || glyphs.get('?'))[phase];
+        push(px / 8 - g.cx, py / 8 - g.cy, g.cell, g.cell, [g.u, g.v, g.uw, g.vh], 1);
+      },
+      clearRect(x, y, w, h) {
+        if (x === 0 && y === 0 && w * sx >= canvas.width && h * sy >= canvas.height) { count = 0; gl.disable(gl.SCISSOR_TEST); }
+        else { flush(); gl.enable(gl.SCISSOR_TEST); gl.scissor(Math.floor(x * sx), Math.floor(canvas.height - (y + h) * sy), Math.ceil(w * sx), Math.ceil(h * sy)); }
+        gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT); gl.disable(gl.SCISSOR_TEST);
+      },
+      flush,
+    };
+  }
+
+  // Precompute motion, not pixels: full-resolution rendering remains live.
+  // 12 Hz Float32 keyframes preserve all render-relevant motion fields.
+  function createOceanReplayEngine(World, notify = () => {}) {
+    let generation = 0, requestedKey = '', clip = null, cursor = 0, previousFrame = -1, eventCursor = 0, active = false;
+    let status = { state: 'live', progress: 0, bytes: 0, cached: false };
+    const emit = value => { status = { ...status, ...value }; notify(status); };
+    async function database() {
+      return new Promise((resolve, reject) => {
+        const request = indexedDB.open('cgpt-unified-ocean-replay-v1', 2);
+        request.onupgradeneeded = () => {
+          if (!request.result.objectStoreNames.contains('clips')) request.result.createObjectStore('clips', { keyPath: 'key' });
+          if (!request.result.objectStoreNames.contains('meta')) request.result.createObjectStore('meta', { keyPath: 'key' });
+        };
+        request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
+        request.onblocked = () => reject(new Error('Replay cache blocked'));
+      });
+    }
+    async function load(key) {
+      const db = await database();
+      try { return await new Promise((resolve, reject) => { const r = db.transaction('clips').objectStore('clips').get(key); r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); }); }
+      finally { db.close(); }
+    }
+    async function save(value) {
+      const db = await database();
+      try {
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction(['clips', 'meta'], 'readwrite'), store = tx.objectStore('clips'), meta = tx.objectStore('meta');
+          // Retain at most two geometries and 128 MiB across all replay clips.
+          const request = meta.getAll();
+          request.onsuccess = () => {
+            const old = request.result.filter(c => c.key !== value.key).sort((a, b) => b.created - a.created);
+            let total = value.data.byteLength;
+            old.forEach((entry, i) => { total += entry.bytes; if (i >= 1 || total > 128 * 1024 * 1024) { store.delete(entry.key); meta.delete(entry.key); } });
+            store.put(value);
+            meta.put({ key: value.key, created: value.created, bytes: value.data.byteLength });
+          };
+          tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error);
+        });
+      } finally { db.close(); }
+    }
+    const capture = (world, array, offset) => {
+      for (const f of world.fish) { array[offset++] = f.x; array[offset++] = f.y; array[offset++] = f.alarm; array[offset++] = f.turn; array[offset++] = f.alive ? 1 : 0; }
+      for (const s of world.sharks) { array.set(s.nodes, offset); offset += s.nodes.length; array[offset++] = s.phase; array[offset++] = s.turn; array[offset++] = s.speed; }
+    };
+    async function prepare(config, world) {
+      if (!config.replaySeconds) {
+        if (requestedKey) { generation++; requestedKey = ''; clip = null; active = false; emit({ state: 'live', progress: 0, bytes: 0 }); }
+        return;
+      }
+      const key = JSON.stringify(['motion-v1', config.width, config.height, config.density, config.kinds, config.placementKey, config.replaySeconds]);
+      if (key === requestedKey) return;
+      const ticket = ++generation; requestedKey = key; clip = null; active = false; cursor = 0; previousFrame = -1; eventCursor = 0;
+      emit({ state: 'preparing', progress: 0, bytes: 0, cached: false });
+      try {
+        let cached = null;
+        try { cached = await load(key); } catch (_) { /* Private mode/quota: memory-only replay still works. */ }
+        if (ticket !== generation) return;
+        if (cached?.data instanceof Float32Array && cached.stride > 0 && cached.data.length === cached.stride * cached.frames && cached.duration === config.replaySeconds && cached.fps === 12) {
+          clip = cached; emit({ state: 'ready', progress: 1, bytes: clip.data.byteLength, cached: true }); return;
+        }
+        const model = Object.assign(new World(), structuredClone(world));
+        model.pointer = { x: 0, y: 0, active: false }; model.events = [];
+        const fps = 12, frames = config.replaySeconds * fps + 1, stride = model.fish.length * 5 + model.sharks.reduce((n, s) => n + s.nodes.length + 3, 0);
+        if (stride * frames * 4 > 120 * 1024 * 1024) throw new Error('Replay exceeds memory budget');
+        const result = { key, created: Date.now(), duration: config.replaySeconds, fps, frames, stride,
+          data: new Float32Array(stride * frames), base: structuredClone({ fish: model.fish, sharks: model.sharks, time: model.time }), events: [] };
+        capture(model, result.data, 0);
+        let frame = 1, reported = 0;
+        while (frame < frames) {
+          const end = performance.now() + 3;
+          do {
+            model.step(1 / fps); capture(model, result.data, frame * stride);
+            for (const event of model.events) result.events.push({ frame, ...event });
+            model.events.length = 0; frame++;
+          } while (frame < frames && performance.now() < end);
+          if (ticket !== generation) return;
+          if (performance.now() - reported > 500) { emit({ progress: frame / frames, bytes: result.data.byteLength }); reported = performance.now(); }
+          await new Promise(resolve => setTimeout(resolve, 12));
+        }
+        if (ticket !== generation) return;
+        clip = result; emit({ state: 'ready', progress: 1, bytes: result.data.byteLength, cached: false });
+        try { await save(result); if (ticket === generation) emit({ cached: true }); } catch (_) { /* Do not interrupt a working memory replay. */ }
+      } catch (error) { if (ticket === generation) emit({ state: 'error', message: String(error), progress: 0 }); }
+    }
+    function sample(world, dt) {
+      if (!clip) return null;
+      if (!active) {
+        const base = structuredClone(clip.base); world.fish = base.fish; world.sharks = base.sharks; world.events = []; active = true;
+      }
+      cursor = (cursor + dt) % clip.duration;
+      const frame = Math.min(clip.frames - 2, Math.floor(cursor * clip.fps)), fraction = cursor * clip.fps - frame;
+      let offset = frame * clip.stride, next = offset + clip.stride;
+      const mix = i => clip.data[offset + i] * (1 - fraction) + clip.data[next + i] * fraction;
+      for (const f of world.fish) {
+        const continuous = clip.data[offset + 4] === clip.data[next + 4]
+          && Math.abs(clip.data[offset] - clip.data[next]) + Math.abs(clip.data[offset + 1] - clip.data[next + 1]) < 200;
+        f.x = continuous ? mix(0) : clip.data[offset]; f.y = continuous ? mix(1) : clip.data[offset + 1];
+        f.alarm = mix(2); f.turn = mix(3); f.alive = clip.data[offset + 4] > .5; offset += 5; next += 5;
+      }
+      for (const s of world.sharks) {
+        for (let i = 0; i < s.nodes.length; i++) s.nodes[i] = mix(i);
+        const n = s.nodes.length; s.phase = mix(n); s.turn = mix(n + 1); s.speed = mix(n + 2); offset += n + 3; next += n + 3;
+      }
+      if (frame < previousFrame) { previousFrame = -1; eventCursor = 0; }
+      while (eventCursor < clip.events.length && clip.events[eventCursor].frame <= frame) {
+        const event = clip.events[eventCursor++]; if (event.frame > previousFrame) world.events.push(event);
+      }
+      previousFrame = frame;
+      world.time = clip.base.time + cursor; world.pointer = { x: 0, y: 0, active: false };
+      return Math.max(0, Math.min(1, cursor / .45, (clip.duration - cursor) / .45));
+    }
+    async function clear() {
+      generation++;
+      const db = await database();
+      try { await new Promise((resolve, reject) => { const tx = db.transaction(['clips', 'meta'], 'readwrite'); tx.objectStore('clips').clear(); tx.objectStore('meta').clear(); tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); }); emit({ cached: false, state: clip ? 'ready' : 'cancelled' }); }
+      finally { db.close(); }
+    }
+    return { prepare, sample, clear, cancel: () => { generation++; }, getState: () => ({ ...status }) };
+  }
+
+  function oceanWorkerProgram(factory) {
+    const model = factory(), { World, AsciiRenderer } = model;
+    let world, renderer, canvas, currentConfig, layoutVersion = -1, placementVersion = -1, direct = false;
+    let simulationSteps = 0, fieldTicks = 0, frames = 0, gpu = false, compute = null, computeError = '';
+    const replay = createOceanReplayEngine(World, status => self.postMessage({ type: 'replay-status', status }));
+    self.onmessage = ({ data }) => {
+      if (data.type === 'clear-replay') { replay.clear().catch(() => {}); return; }
+      try {
+        const started = performance.now();
+        if (data.config) currentConfig = data.config;
+        const config = currentConfig;
+        if (!world) {
+          world = new World(config.kinds.map((kind, i) => ({ kind, size: [1, .7, .84, .77][i] })), config.density);
+          direct = !!data.surface; canvas = data.surface || new OffscreenCanvas(1, 1);
+          let ctx = null;
+          if (config.rendererMode === 'compute') {
+            try { renderer = new AsciiRenderer(canvas, {}); compute = createOceanComputeRenderer(canvas, renderer, model); gpu = true; }
+            catch (error) { if (direct) throw error; computeError = String(error); compute = null; canvas = new OffscreenCanvas(1, 1); }
+          }
+          if (!compute) {
+            if (config.rendererMode === 'gpu' || config.rendererMode === 'compute') {
+              try { ctx = createOceanGpuContext(canvas); gpu = !!ctx; } catch (_) { /* Keep Canvas if WebGL is unavailable. */ }
+              if (!ctx) { if (direct) throw Error('Direct WebGL context unavailable'); canvas = new OffscreenCanvas(1, 1); }
+            }
+            renderer = new AsciiRenderer(canvas, ctx);
+          }
+          renderer.setFontFamily('Consolas,"Courier New",monospace');
+          renderer.setDetail(config.quality === 'eco');
+          renderer.setExternalFieldClock(true);
+        }
+        if (config.layoutVersion !== layoutVersion) {
+          if (renderer.width !== config.width || renderer.height !== config.height || renderer.dpr !== config.dpr) {
+            renderer.resize(config.width, config.height, config.dpr);
+            world.resize(config.width, config.height, renderer.cellWidth, renderer.cellHeight);
+          }
+          renderer.setOcclusion(config.masks);
+          renderer.bodyTint = config.palette.bodyTint;
+          renderer.paletteAccents = config.palette.paletteAccents;
+          renderer.fishStyles = config.palette.fishStyles;
+          renderer.dotStyles = config.palette.dotStyles;
+          layoutVersion = config.layoutVersion;
+        }
+        if (config.placementVersion !== placementVersion) {
+          // Main thread chooses placement from DOM bounds once; all motion stays here.
+          world.fish = config.fish;
+          world.sharks = config.sharks;
+          placementVersion = config.placementVersion;
+        }
+        world.pointer = data.pointer;
+        replay.prepare(config, world);
+        const dt = data.dt;
+        const previousTime = world.time, simulationStart = performance.now(), replayFade = replay.sample(world, dt);
+        if (replayFade !== null && world.time < previousTime) { renderer.energy.fill(0); renderer.heat.fill(0); compute?.clearFields(); }
+        if (replayFade === null && data.splash) world.splash(data.splash.x, data.splash.y);
+        if (dt > 0) {
+          if (replayFade === null) { world.step(dt); simulationSteps++; }
+          if (!compute) renderer.advanceFields(world, dt);
+          fieldTicks++;
+        }
+        const simulationMs = performance.now() - simulationStart, renderStart = performance.now();
+        if (compute) compute.render(world, dt, config.masks);
+        else {
+          renderer.render(world, dt);
+          const ctx = renderer.ctx; ctx.setTransform(config.dpr, 0, 0, config.dpr, 0, 0);
+          for (const r of config.masks) ctx.clearRect(r.x, r.y, r.w, r.h);
+          ctx.flush?.();
+        }
+        const bitmap = direct ? null : canvas.transferToImageBitmap(); frames++;
+        self.postMessage({ bitmap, direct, epoch: data.epoch, layoutVersion, time: world.time, simulationSteps, fieldTicks, frames, gpu, gpuCompute: !!compute, computeError, replay: replay.getState(), replayFade: replayFade ?? 1, simulationMs, renderMs: performance.now() - renderStart, workMs: performance.now() - started }, bitmap ? [bitmap] : []);
+      } catch (error) { self.postMessage({ error: String(error) }); }
+    };
+  }
+
+  function createOceanWorker(onFrame, onFailure, onStatus = () => {}) {
+    if (typeof Worker !== 'function' || typeof OffscreenCanvas !== 'function') return null;
+    let worker, busy = false, stopped = false, timer = 0;
+    try {
+      const source = `${createOceanComputeRenderer.toString()}\n${createOceanGpuContext.toString()}\n${createOceanReplayEngine.toString()}\n(${oceanWorkerProgram.toString()})(${oceanModelFactory.toString()});`;
+      const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+      try { worker = new Worker(url); } finally { URL.revokeObjectURL(url); }
+    } catch (_) { return null; }
+    const stop = () => { stopped = true; clearTimeout(timer); worker.terminate(); };
+    const fail = error => { if (stopped) return; stop(); onFailure(error); };
+    worker.onerror = event => { event.preventDefault(); fail('worker blocked or failed'); };
+    worker.onmessage = ({ data }) => {
+      if (data.type === 'replay-status') { onStatus(data.status); return; }
+      clearTimeout(timer); busy = false;
+      if (stopped) { data.bitmap?.close(); return; }
+      if (data.error) { fail(data.error); return; }
+      try { onFrame(data); } catch (error) { fail(String(error)); } finally { data.bitmap?.close(); }
+    };
+    return {
+      send(data) {
+        if (busy || stopped) return false;
+        busy = true;
+        timer = setTimeout(() => fail('worker timed out'), 5000);
+        try { worker.postMessage(data, data.surface ? [data.surface] : []); return true; } catch (error) { fail(String(error)); return false; }
+      },
+      stop,
+      clearReplay() { if (!stopped) worker.postMessage({ type: 'clear-replay' }); },
+      get busy() { return busy; },
+    };
+  }
+
   // work/message-glass-v65.ts
   function createMessageGlass(runtime) {
     const root = document.documentElement;
@@ -17997,115 +19070,113 @@
     html[data-cgfc-message-glass-custom-tint] [data-cgfc-liquid-surface="message"] { --cgfc-glass-tint:var(--cgfc-message-glass-custom-rgb); }
   `;
     (document.head || root).appendChild(style);
-    const entries = /* @__PURE__ */ new Map();
-    let enabled = false, main = null, timer = 0, disposed = false, settingsKey = "", scans = 0;
+    const entries = new Map(), parked = new Map();
+    const PARK_LIMIT = 8, PARK_BYTES = 2 * 1024 * 1024;
+    let enabled = false, main = null, timer = 0, scanFrame = 0, observer = null, disposed = false, settingsKey = '', scans = 0, reused = 0, evicted = 0;
+    const retainedBytes = () => [...parked.values()].reduce((sum, entry) => sum + (entry.controller?.mapUrl?.length || 0) * 2, 0);
     const destroyEntry = (el, entry) => {
-      entry.controller?.destroy();
-      entry.controller = null;
+      parked.delete(el); entry.controller?.destroy(); entry.controller = null;
+    };
+    const park = (el, entry) => {
+      const controller = entry.controller;
+      if (!controller) return;
+      controller.offscreen = true; controller.pause();
+      // Keep only completed surfaces. Pending work may populate the shared map
+      // cache, but must never revive a hidden/destroyed controller.
+      if (!controller.filter?.isConnected || !controller.signature || !controller.mapUrl) { destroyEntry(el, entry); return; }
+      parked.delete(el); parked.set(el, entry);
+      while (parked.size > PARK_LIMIT || retainedBytes() > PARK_BYTES) {
+        const [oldElement, oldEntry] = parked.entries().next().value;
+        destroyEntry(oldElement, oldEntry); evicted++;
+      }
     };
     const attach = (el, entry) => {
-      if (!enabled || !entry.visible || !el.isConnected) return;
+      if (!enabled || !entry.visible || !el.isConnected || document.hidden) return;
       const Glass = runtime.composerLiquidGlass?.constructor;
       if (!Glass) return;
-      if (!entry.controller) entry.controller = new Glass(runtime, { kind: "message", direct: true, managed: true, sharedStyle: true, enabledAttribute: "data-cgfc-message-glass" });
-      entry.controller.attach(el);
+      if (parked.delete(el)) reused++;
+      if (!entry.controller) entry.controller = new Glass(runtime, { kind: 'message', direct: true, managed: true, sharedStyle: true, visibilityManaged: true, enabledAttribute: 'data-cgfc-message-glass' });
+      entry.controller.offscreen = false; entry.controller.attach(el);
     };
-    const io = new IntersectionObserver((records) => {
+    const io = new IntersectionObserver(records => {
       for (const record of records) {
         const entry = entries.get(record.target);
         if (!entry) continue;
         entry.visible = record.isIntersecting;
-        if (entry.visible) attach(record.target, entry);
-        else destroyEntry(record.target, entry);
+        if (entry.visible) attach(record.target, entry); else park(record.target, entry);
       }
-    }, { rootMargin: "80px" });
-    const observer = new MutationObserver((records) => {
-      const selector = runtime.dom.message + "," + runtime.dom.content + ", [data-message-content], .whitespace-pre-wrap";
-      if (records.some((r) => [...r.addedNodes, ...r.removedNodes].some((n) => n instanceof Element && (n.matches(selector) || n.querySelector(selector))))) schedule();
-    });
+    }, { rootMargin: '80px' });
+    const onMutations = records => {
+      const selector = runtime.dom.message + ',' + runtime.dom.content + ', [data-message-content], .whitespace-pre-wrap';
+      if (records.some(r => [...r.addedNodes, ...r.removedNodes].some(n => n instanceof Element && (n.matches(selector) || n.querySelector(selector))))) schedule();
+    };
     function clear() {
-      observer.disconnect();
-      io.disconnect();
+      observer?.disconnect(); observer = null; io.disconnect();
       for (const [el, entry] of entries) destroyEntry(el, entry);
-      entries.clear();
-      main = null;
+      entries.clear(); parked.clear(); main = null;
     }
     function scan() {
-      timer = 0;
-      if (disposed || !enabled) return;
+      scanFrame = 0; timer = 0;
+      if (disposed || !enabled || document.hidden) return;
       scans++;
       const next = runtime.dom.main();
       if (main !== next) {
-        clear();
-        main = next;
-        if (main) observer.observe(main, { childList: true, subtree: true });
+        clear(); main = next;
+        if (main) observer = runtime.pageWork.observe(main, { childList: true, subtree: true }, onMutations);
       }
       if (!main) return;
-      const wanted = /* @__PURE__ */ new Set(), fresh = [];
-      for (const message of main.querySelectorAll(runtime.dom.assistant)) {
+      const wanted = new Set(), fresh = [];
+      for (const message of runtime.pageWork.query(main, runtime.dom.assistant)) {
         if (runtime.dom.isThinkingOverview(message)) continue;
         const el = runtime.dom.contentRoot(message) || message;
         wanted.add(el);
         if (!entries.has(el)) {
           const entry = { controller: null, visible: false };
-          entries.set(el, entry);
-          io.observe(el);
-          fresh.push([el, entry]);
+          entries.set(el, entry); io.observe(el); fresh.push([el, entry]);
         }
       }
       for (const [el, entry] of entries) if (!wanted.has(el) || !el.isConnected) {
-        io.unobserve(el);
-        destroyEntry(el, entry);
-        entries.delete(el);
+        io.unobserve(el); destroyEntry(el, entry); entries.delete(el);
       }
       for (const [el, entry] of fresh) {
-        const turn = el.closest(runtime.dom.turn) || el;
-        const r = turn.getBoundingClientRect();
+        const turn = el.closest(runtime.dom.turn) || el, r = runtime.pageWork.rect(turn);
         entry.visible = r.width > 0 && r.height > 0 && r.bottom > -80 && r.top < innerHeight + 80;
       }
       for (const [el, entry] of fresh) if (entry.visible) attach(el, entry);
     }
     function schedule() {
-      if (enabled && !timer && !disposed) timer = window.setTimeout(scan, 160);
+      if (enabled && !timer && !scanFrame && !disposed && !document.hidden) timer = window.setTimeout(() => {
+        timer = 0; scanFrame = runtime.pageWork.requestFrame(scan);
+      }, 160);
     }
     function refresh() {
-      const active = root.hasAttribute("data-cgfc-message-glass");
+      const active = root.hasAttribute('data-cgfc-message-glass');
       if (active !== enabled) {
         enabled = active;
         if (!enabled) {
-          clearTimeout(timer);
-          timer = 0;
-          clear();
-          return;
+          clearTimeout(timer); timer = 0; runtime.pageWork.cancelFrame(scanFrame); scanFrame = 0; clear(); return;
         }
-        scan();
-      } else if (enabled) {
-        scan();
-        for (const [el, entry] of entries) attach(el, entry);
       }
-      if (document.hidden) for (const entry of entries.values()) entry.controller?.pause();
+      if (document.hidden) { for (const entry of entries.values()) entry.controller?.pause(); return; }
+      if (enabled) {
+        clearTimeout(timer); timer = 0; runtime.pageWork.cancelFrame(scanFrame); scanFrame = 0;
+        scan(); for (const [el, entry] of entries) attach(el, entry);
+      }
     }
     function onSettings() {
-      const key = [root.hasAttribute("data-cgfc-message-glass"), root.getAttribute("data-cgfc-message-glass-style"), root.getAttribute("data-cgfc-message-glass-render-mode"), ...["blur", "strength", "thickness", "curvature", "bend", "chroma", "radius"].map((name) => root.style.getPropertyValue("--cgfc-message-glass-" + name))].join("|");
+      const key = [root.hasAttribute('data-cgfc-message-glass'), root.getAttribute('data-cgfc-message-glass-style'), root.getAttribute('data-cgfc-message-glass-render-mode'), root.getAttribute('data-cgfc-message-glass-finish'), ...['opacity', 'blur', 'strength', 'thickness', 'curvature', 'bend', 'chroma', 'radius', 'glare'].map(name => root.style.getPropertyValue('--cgfc-message-glass-' + name))].join('|');
       if (key === settingsKey) return;
-      settingsKey = key;
-      refresh();
+      settingsKey = key; refresh();
     }
+    function onResize() { if (enabled) for (const [el, entry] of entries) attach(el, entry); }
     function destroy() {
-      disposed = true;
-      enabled = false;
-      clearTimeout(timer);
-      clear();
-      style.remove();
-      document.removeEventListener("cgpt-unified-ui-settings-change", onSettings);
-      document.removeEventListener("visibilitychange", refresh);
+      disposed = true; enabled = false; clearTimeout(timer); runtime.pageWork.cancelFrame(scanFrame); clear(); style.remove();
+      document.removeEventListener('cgpt-unified-ui-settings-change', onSettings);
+      document.removeEventListener('visibilitychange', refresh); window.removeEventListener('resize', onResize);
     }
-    document.addEventListener("cgpt-unified-ui-settings-change", onSettings);
-    onSettings();
-    document.addEventListener("visibilitychange", refresh);
-    return { refresh, destroy, followMain: (next) => {
-      if (enabled && next !== main) schedule();
-    }, getState: () => ({ enabled, observed: entries.size, active: [...entries.values()].filter((e) => e.controller).length, scans }) };
+    document.addEventListener('cgpt-unified-ui-settings-change', onSettings); onSettings();
+    document.addEventListener('visibilitychange', refresh); window.addEventListener('resize', onResize, { passive: true });
+    return { refresh, destroy, followMain: next => { if (enabled && next !== main) schedule(); }, getState: () => ({ enabled, observed: entries.size, active: [...entries.values()].filter(e => e.visible && e.controller).length, parked: parked.size, retainedBytes: retainedBytes(), parkLimit: PARK_LIMIT, parkByteLimit: PARK_BYTES, reused, evicted, scans }) };
   }
 
   // work/ocean-controller-v65.ts
@@ -18124,8 +19195,22 @@
     layerStyle.textContent = '[data-cgpt-ascii-foreground="position"]{position:relative!important;z-index:1!important}[data-cgpt-ascii-foreground="stack"]{z-index:1!important}';
     (document.head || root).appendChild(layerStyle);
     let canvas = null, world = null, renderer = null;
+    let directCanvas = false, directDisabled = false, pendingSurface = null, bitmapFrames = 0, reducedSurface = false;
     let foreground = /* @__PURE__ */ new Set();
-    let raf = 0, frameTimer = 0, timer = 0, last = 0, acc = 0, fieldAcc = 0, layoutAt = -Infinity, busyAt = -Infinity;
+    let raf = 0, frameTimer = 0, timer = 0, last = 0, layoutAt = -Infinity, busyAt = -Infinity;
+    let oceanWorker = null, workerFailed = false, workerError = '', epoch = 0, layoutVersion = 0, placementVersion = 0, sentLayout = -1, sentPlacement = -1;
+    let workerState = null, pendingSplash = null, simulationSteps = 0, droppedFrames = 0;
+    let rendererMode = 'canvas', motionMode = 'live', replayStatus = { state: 'live' }, statusText = '';
+    function setOceanStatus(status = replayStatus) {
+      replayStatus = status;
+      const backend = workerState?.gpuCompute ? 'GPU 计算 + 绘制' : workerState?.gpu ? (rendererMode === 'compute' ? 'GPU 绘制（计算兼容）' : 'GPU 绘制') : oceanWorker ? '标准绘制' : '兼容绘制';
+      const motionLabel = motionMode === 'live' ? '实时模拟' : status.state === 'preparing' ? '准备回放 ' + Math.floor((status.progress || 0) * 100) + '%'
+        : status.state === 'ready' ? (motionMode === 'replay30' ? '30' : '15') + ' 分钟回放 · ' + (status.cached ? '已缓存' : '内存中')
+        : status.state === 'error' ? '准备失败，使用实时模拟' : status.state === 'cancelled' ? '已取消准备，使用实时模拟' : '等待准备回放';
+      const text = !enabled ? '海洋已关闭' : (!oceanWorker && motionMode !== 'live' ? '当前环境使用实时模拟（回放需要后台线程）' : backend + ' · ' + motionLabel);
+      if (text === statusText) return; statusText = text; root.setAttribute('data-cgfc-ocean-status', text);
+      for (const node of document.querySelectorAll('[data-cgpt-ocean-status]')) if (node.textContent !== text) node.textContent = text;
+    }
     let width = 0, height = 0, dpr = 1, species = "", density = 90, quality = "balanced";
     let disposed = false, suspended = false, enabled = false, busy = false, pauseBusy = true;
     let opacity = 0.65, fps = 12, homeCoverage = "full", chatCoverage = "gutter", coverage = "gutter";
@@ -18140,6 +19225,7 @@
     let layoutReads = 0, drawnFrames = 0, frameCallbacks = 0, fieldTicks = 0, meanWorkMs = 0;
     const insideMask = (x, y) => masks.some((r) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h);
     function stopFrames() {
+      epoch++;
       cancelAnimationFrame(raf);
       raf = 0;
       clearTimeout(frameTimer);
@@ -18161,13 +19247,15 @@
     }
     function release() {
       stopFrames();
+      oceanWorker?.stop(); oceanWorker = null; workerState = null; sentLayout = sentPlacement = -1; pendingSplash = null;
       canvas?.remove();
+      directCanvas = false; pendingSurface = null;
       canvas = null;
       world = null;
       renderer = null;
       clearForeground();
       width = height = 0;
-      last = acc = fieldAcc = 0;
+      last = 0;
       scenePlaced = false;
       paletteKey = "";
       scrollerKey = null;
@@ -18176,17 +19264,46 @@
     }
     function create() {
       firstFrame = true;
-      canvas = document.createElement("canvas");
-      canvas.id = "cgpt-unified-ascii-ocean";
-      canvas.setAttribute("aria-hidden", "true");
-      canvas.setAttribute("role", "presentation");
+      reducedSurface = motion.matches;
+      canvas = document.createElement('canvas');
+      canvas.id = 'cgpt-unified-ascii-ocean';
+      canvas.setAttribute('aria-hidden', 'true'); canvas.setAttribute('role', 'presentation');
       canvas.style.cssText = 'position:fixed!important;top:0!important;left:0!important;pointer-events:none!important;user-select:none!important;z-index:0!important;background:transparent!important;font-family:Consolas,"Courier New",monospace!important;contain:strict!important;';
-      const kinds = species === "mixed" ? ["hammerhead", "tiger", "mako", "thresher"] : Array(4).fill(species || "classic");
-      world = new World(kinds.map((kind, i) => ({ kind, size: [1, 0.7, 0.84, 0.77][i] })), density);
-      renderer = new AsciiRenderer(canvas);
+      const kinds = species === 'mixed' ? ['hammerhead', 'tiger', 'mako', 'thresher'] : Array(4).fill(species || 'classic');
+      world = new World(kinds.map((kind, i) => ({ kind, size: [1, .7, .84, .77][i] })), density);
+      const activeCanvas = canvas;
+      if (!workerFailed && !motion.matches) {
+        oceanWorker = createOceanWorker(data => {
+          if (canvas !== activeCanvas) return;
+          workerState = data; setOceanStatus(data.replay);
+          if (data.epoch !== epoch || data.layoutVersion !== layoutVersion || !allowed() || motion.matches) return;
+          if (!data.direct) {
+            const ctx = renderer.ctx; ctx.setTransform(1, 0, 0, 1, 0, 0);
+            ctx.clearRect(0, 0, canvas.width, canvas.height); ctx.drawImage(data.bitmap, 0, 0); bitmapFrames++;
+          }
+          canvas.style.opacity = String(opacity * data.replayFade);
+          if (canvas.dataset.state !== 'running') canvas.dataset.state = 'running';
+          drawnFrames++; firstFrame = false;
+        }, error => {
+          if (canvas !== activeCanvas) return;
+          const retryBitmap = directCanvas;
+          if (retryBitmap) directDisabled = true; else workerFailed = true;
+          workerError = String(error);
+          // A transferred HTML canvas cannot get a new main-thread context.
+          // Replace only our decoration surface before trying the fallback.
+          release();
+          queueMicrotask(() => { if (enabled && !disposed && !suspended) { layoutDirty = true; refresh(); setOceanStatus(); } });
+        }, setOceanStatus);
+      }
+      if (oceanWorker && !directDisabled && typeof canvas.transferControlToOffscreen === 'function') {
+        try { pendingSurface = canvas.transferControlToOffscreen(); directCanvas = true; }
+        catch (error) { directDisabled = true; workerError = String(error); }
+      }
+      // Layout/placement metadata stays on the main thread; no rendering
+      // context is ever created on the transferred display canvas here.
+      renderer = new AsciiRenderer(directCanvas ? document.createElement('canvas') : canvas);
       renderer.setFontFamily('Consolas,"Courier New",monospace');
-      renderer.setDetail(quality === "eco");
-      renderer.setExternalFieldClock(true);
+      renderer.setDetail(quality === 'eco'); renderer.setExternalFieldClock(true);
     }
     function readBusy(editor) {
       const visible = (el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== "hidden";
@@ -18346,7 +19463,7 @@
         masks.push(reading);
       }
       if (!scenePlaced && (coverage === "full" || left - mainLeft >= 50 && mainRight - right >= 50)) {
-        scenePlaced = true;
+        scenePlaced = true; placementVersion++;
         if (coverage === "gutter") {
           const centers = [(mainLeft + left) / 2, (right + mainRight) / 2];
           for (const [i, f] of world.fish.entries()) {
@@ -18390,8 +19507,10 @@
       masks.push(...scrollbarMasks);
       renderer.setOcclusion(masks);
       drawable = coverage !== "off" && h > 200 && (coverage === "full" || Math.max(left - mainLeft, mainRight - right) >= 40);
-      if (canvas.style.opacity !== String(opacity)) canvas.style.opacity = String(opacity);
+      const effectiveOpacity = opacity * (workerState?.replayFade ?? 1);
+      if (canvas.style.opacity !== String(effectiveOpacity)) canvas.style.opacity = String(effectiveOpacity);
       applyPalette();
+      layoutVersion++;
       layoutAt = performance.now();
       layoutDirty = false;
       if (performance.now() - busyAt > 600) {
@@ -18400,6 +19519,22 @@
       }
     }
     function draw(dt) {
+      if (oceanWorker && !motion.matches) {
+        if (oceanWorker.busy) { droppedFrames++; return; }
+        let config;
+        if (sentLayout !== layoutVersion) {
+          config = { width, height, dpr, masks, layoutVersion, placementVersion, density, quality, rendererMode, replaySeconds: motionMode === 'replay30' ? 1800 : motionMode === 'replay15' ? 900 : 0, placementKey: [coverage, reading?.x || 0, reading?.w || 0],
+            kinds: species === 'mixed' ? ['hammerhead', 'tiger', 'mako', 'thresher'] : Array(4).fill(species || 'classic'),
+            palette: { bodyTint: renderer.bodyTint, paletteAccents: renderer.paletteAccents, fishStyles: renderer.fishStyles, dotStyles: renderer.dotStyles } };
+          if (sentPlacement !== placementVersion) { config.fish = world.fish; config.sharks = world.sharks; }
+        }
+        if (oceanWorker.send({ config, dt, pointer: world.pointer, splash: pendingSplash, epoch, surface: pendingSurface })) {
+          pendingSurface = null;
+          sentLayout = layoutVersion; sentPlacement = placementVersion; pendingSplash = null;
+        }
+        return;
+      }
+      if (dt > 0) { world.step(dt); simulationSteps++; renderer.advanceFields(world, dt); fieldTicks++; }
       renderer.render(world, dt);
       const g = canvas.getContext("2d");
       g.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -18426,21 +19561,10 @@
             refresh();
             return;
           }
-          const dt = Math.min(0.5, (now - last) / 1e3);
+          // Exactly one simulation step per displayed frame. Drop stalled time;
+          // never replay a backlog after typing, a hidden tab, or a slow worker.
+          const dt = Math.min((now - last) / 1e3, 1.25 / target);
           last = now;
-          acc += dt;
-          let steps = 0;
-          while (acc >= 1 / 60 && steps++ < 30) {
-            world.step(1 / 60);
-            acc -= 1 / 60;
-            fieldAcc += 1 / 60;
-            while (fieldAcc >= 1 / 24) {
-              renderer.advanceFields(world, 1 / 24);
-              fieldAcc -= 1 / 24;
-              fieldTicks++;
-            }
-          }
-          if (steps >= 30) acc = 0;
           draw(dt);
           const work = performance.now() - start;
           meanWorkMs = meanWorkMs ? meanWorkMs * 0.9 + work * 0.1 : work;
@@ -18464,15 +19588,16 @@
             canvas.hidden = true;
             canvas.dataset.state = "hidden";
           }
-          last = acc = 0;
+          last = 0;
           return;
         }
+        if (canvas && reducedSurface !== motion.matches) release();
         if (!canvas) create();
         updateLayout();
         canvas.hidden = !allowed();
         if (!allowed()) {
           stopFrames();
-          last = acc = 0;
+          last = 0;
           canvas.dataset.state = busy ? "generating" : coverage === "off" ? "scene-off" : "no-gutter";
           return;
         }
@@ -18480,10 +19605,10 @@
         if (canvas.dataset.state !== activeState) canvas.dataset.state = activeState;
         if (motion.matches) {
           stopFrames();
-          last = acc = 0;
-          draw(1 / 60);
+          last = 0;
+          draw(0);
         } else {
-          if (firstFrame) draw(1 / 60);
+          if (firstFrame) draw(0);
           queueFrame();
         }
       } catch (error) {
@@ -18499,7 +19624,7 @@
       return /^#[\da-f]{6}$/i.test(value) ? value : fallback;
     }
     function settingsChanged() {
-      const key = JSON.stringify(["ocean", "opacity", "fps", "species", "density", "quality", "pause-busy", "coverage", "home-coverage", "pointer", "color-mode", "color-seed", "body-color", "accent-color", "fish-color", "wake-color"].map((name) => root.getAttribute("data-cgfc-ascii-" + name))) + "|" + root.getAttribute("data-cgfc-theme");
+      const key = JSON.stringify(["ocean", "opacity", "fps", "species", "density", "quality", "pause-busy", "coverage", "home-coverage", "pointer", "color-mode", "color-seed", "body-color", "accent-color", "fish-color", "wake-color", "renderer", "motion-mode"].map((name) => root.getAttribute("data-cgfc-ascii-" + name))) + "|" + root.getAttribute("data-cgfc-theme");
       if (key === settingsKey) {
         if (enabled && !canvas) refresh();
         return;
@@ -18507,11 +19632,14 @@
       settingsKey = key;
       const nextSpecies = root.getAttribute("data-cgfc-ascii-species") || "classic";
       const nextDensity = readNumber("data-cgfc-ascii-density", 90, 40, 160), nextQuality = root.getAttribute("data-cgfc-ascii-quality") || "balanced";
-      if (species !== nextSpecies || density !== nextDensity || quality !== nextQuality) {
+      const requestedRenderer = root.getAttribute('data-cgfc-ascii-renderer');
+      const nextRenderer = ['gpu', 'compute'].includes(requestedRenderer) ? requestedRenderer : 'canvas';
+      const mode = root.getAttribute('data-cgfc-ascii-motion-mode'), nextMotion = ['replay15', 'replay30'].includes(mode) ? mode : 'live';
+      if (species !== nextSpecies || density !== nextDensity || quality !== nextQuality || rendererMode !== nextRenderer || motionMode !== nextMotion) {
         release();
         species = nextSpecies;
         density = nextDensity;
-        quality = nextQuality;
+        quality = nextQuality; rendererMode = nextRenderer; motionMode = nextMotion; replayStatus = { state: 'live' };
       }
       enabled = root.hasAttribute("data-cgfc-ascii-ocean");
       opacity = readNumber("data-cgfc-ascii-opacity", 0.65, 0.15, 0.9);
@@ -18536,7 +19664,7 @@
       if (enabled) timer = window.setInterval(() => {
         if (!document.hidden && !suspended) refresh();
       }, 1e3);
-      refresh();
+      refresh(); setOceanStatus();
     }
     function pointerMove(e) {
       if (!world || !canvas || canvas.hidden || motion.matches) return;
@@ -18545,13 +19673,16 @@
     }
     function pointerDown(e) {
       pointerMove(e);
-      if (e.button === 0 && world?.pointer.active) world.splash(e.clientX, e.clientY);
+      if (e.button === 0 && world?.pointer.active) {
+        if (oceanWorker) pendingSplash = { x: e.clientX, y: e.clientY };
+        else world.splash(e.clientX, e.clientY);
+      }
     }
     function leave() {
       if (world) world.pointer.active = false;
     }
     function syncPointerListeners() {
-      const bind = enabled && pointerEnabled && !disposed;
+      const bind = enabled && pointerEnabled && motionMode === 'live' && !disposed;
       if (bind === pointerBound) return;
       pointerBound = bind;
       if (bind) {
@@ -18607,7 +19738,7 @@
       window.removeEventListener("pageshow", pageShow);
       document.removeEventListener("scroll", layoutChanged, true);
     }
-    runtime.asciiSharks = { destroy, refresh, getState: () => ({ enabled, disposed, scene, coverage, homeCoverage, chatCoverage, state: canvas?.dataset.state || "off", fps, quality, density, colorMode, colorSeed, pointerEnabled, pointerBound, pointerActive: world?.pointer.active || false, fish: world?.fish.length || 0, sharks: world?.sharks.map((s) => s.kind) || [], masks, reading, scrollbarMasks, time: world?.time || 0, foreground: [...foreground].map((e) => e.tagName), layoutReads, drawnFrames, frameCallbacks, fieldTicks, meanWorkMs, occludedCells: renderer?.getOccludedCells() || 0 }) };
+    runtime.asciiSharks = { destroy, refresh, clearReplayCache: () => oceanWorker ? oceanWorker.clearReplay() : createOceanReplayEngine(World).clear().catch(() => {}), getState: () => ({ enabled, disposed, scene, coverage, homeCoverage, chatCoverage, state: canvas?.dataset.state || "off", fps, quality, density, colorMode, colorSeed, pointerEnabled, pointerBound, pointerActive: world?.pointer.active || false, fish: world?.fish.length || 0, sharks: world?.sharks.map((s) => s.kind) || [], masks, reading, scrollbarMasks, time: workerState?.time ?? world?.time ?? 0, backend: oceanWorker ? (workerState?.gpuCompute ? 'worker-webgl2-compute' : workerState?.gpu ? 'worker-webgl2' : 'worker-offscreen') : 'main', motionMode, presentation: directCanvas ? 'direct' : oceanWorker ? 'bitmap' : 'main', bitmapFrames, gpuCompute: !!workerState?.gpuCompute, computeError: workerState?.computeError || '', replay: replayStatus, workerSimulationMs: workerState?.simulationMs || 0, workerRenderMs: workerState?.renderMs || 0, workerError, simulationSteps: workerState?.simulationSteps ?? simulationSteps, droppedFrames, workerWorkMs: workerState?.workMs || 0, foreground: [...foreground].map((e) => e.tagName), layoutReads, drawnFrames, frameCallbacks, fieldTicks: workerState?.fieldTicks ?? fieldTicks, meanWorkMs, occludedCells: renderer?.getOccludedCells() || 0 }) };
     document.addEventListener("cgpt-unified-ui-settings-change", settingsChanged);
     document.addEventListener("visibilitychange", refresh);
     motion.addEventListener("change", refresh);
