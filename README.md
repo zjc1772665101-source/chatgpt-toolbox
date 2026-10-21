@@ -1,14 +1,14 @@
-# ChatGPT 长对话统一工具箱
+# ChatGPT 工具箱
 
 一个面向 `chatgpt.com` 的 Tampermonkey 用户脚本，将长对话性能优化、双层导航、自适应大纲、提示词库、会话导出、字体排版和滚动修复整合在一个脚本中。
 
-当前版本：**v1.6.73**。设置分类默认折叠，十处玻璃分别配置；支持 GPU 海洋与轨迹回放，并修复新版输入框灰条及顶栏横向背景。269 项经过校验的界面偏好构成默认预设。
+当前版本：**v1.6.74**。设置分类默认折叠，十处玻璃分别配置；支持 GPU 海洋与轨迹回放，并修复新版输入框灰条及顶栏横向背景。269 项经过校验的界面偏好构成默认预设。
 
 ## 安装
 
-[点击安装最新版 userscript](https://raw.githubusercontent.com/zjc1772665101-source/chatgpt-unified-long-chat-toolkit/main/chatgpt-unified-long-chat-toolkit.user.js)
+[点击安装 ChatGPT 工具箱](https://raw.githubusercontent.com/zjc1772665101-source/chatgpt-toolbox/main/chatgpt-toolbox.user.js)
 
-也可以下载仓库中的 `chatgpt-unified-long-chat-toolkit.user.js`，在 Tampermonkey 中新建脚本并粘贴完整内容。
+也可以下载仓库中的 `chatgpt-toolbox.user.js`。已有用户请完整更新原脚本条目；旧文件名 `chatgpt-unified-long-chat-toolkit.user.js` 继续作为同内容兼容入口保留。
 
 安装后请停用功能重叠的旧脚本，避免重复目录、滚动钩子或提示词面板互相冲突。
 
@@ -78,7 +78,7 @@
 最终发布文件是：
 
 ```text
-chatgpt-unified-long-chat-toolkit.user.js
+chatgpt-toolbox.user.js
 ```
 
 发布前建议执行 JavaScript 语法检查、原有模块保留检查、导航/提示词/导出静态检查，以及页面运行时冒烟测试。页面结构和本地 Markdown 查看器的实际表现需在对应环境中验证。

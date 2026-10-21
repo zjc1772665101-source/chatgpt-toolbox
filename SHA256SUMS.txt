@@ -1,1 +1,2 @@
-f0327cbd36308b5dbbb49baa2dd949a574d98f1a4aa2b073ec3cbf1c0b0eabe2  chatgpt-unified-long-chat-toolkit.user.js
+810d116a264629ec59a3133a4547ebdf945a2f2c7e6f4be449680d884403e125  chatgpt-toolbox.user.js
+810d116a264629ec59a3133a4547ebdf945a2f2c7e6f4be449680d884403e125  chatgpt-unified-long-chat-toolkit.user.js

@@ -1,13 +1,13 @@
 // ==UserScript==
-// @name         ChatGPT 长对话统一工具箱（性能·导航·提示词·导出·排版）
+// @name         ChatGPT 工具箱
 // @namespace    local.codex.chatgpt.unified
-// @version      1.6.73
+// @version      1.6.74
 // @description  ChatGPT 长对话工具箱；独立玻璃参数与折叠设置、GPU 海洋与轨迹回放、新版输入框与顶栏适配、269 项界面默认设置。
 // @author       Codex；含 Alex S Hamilton 的 ChatGPT Lazy Chat++（GPL-3.0-or-later）
-// @homepageURL  https://github.com/zjc1772665101-source/chatgpt-unified-long-chat-toolkit
-// @supportURL   https://github.com/zjc1772665101-source/chatgpt-unified-long-chat-toolkit/issues
-// @downloadURL  https://raw.githubusercontent.com/zjc1772665101-source/chatgpt-unified-long-chat-toolkit/main/chatgpt-unified-long-chat-toolkit.user.js
-// @updateURL    https://raw.githubusercontent.com/zjc1772665101-source/chatgpt-unified-long-chat-toolkit/main/chatgpt-unified-long-chat-toolkit.user.js
+// @homepageURL  https://github.com/zjc1772665101-source/chatgpt-toolbox
+// @supportURL   https://github.com/zjc1772665101-source/chatgpt-toolbox/issues
+// @downloadURL  https://raw.githubusercontent.com/zjc1772665101-source/chatgpt-toolbox/main/chatgpt-toolbox.user.js
+// @updateURL    https://raw.githubusercontent.com/zjc1772665101-source/chatgpt-toolbox/main/chatgpt-toolbox.user.js
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-start
@@ -51,7 +51,7 @@
   const stampBootstrap = () => {
     const root = document.documentElement;
     if (!root) return;
-    root.setAttribute('data-cgpt-unified-version', '1.6.73');
+    root.setAttribute('data-cgpt-unified-version', '1.6.74');
     root.setAttribute('data-cgpt-unified-surface', isFrame ? (allowedSurface ? 'side-chat' : 'other-frame') : 'tab');
     root.setAttribute('data-cgpt-unified-bootstrap', bootstrapState);
   };
@@ -69,7 +69,7 @@
   const PROMPT_STORAGE_KEY = 'cgpt-unified-prompt-library-v1';
   const runtime = globalThis[RUNTIME_KEY] || (globalThis[RUNTIME_KEY] = {});
 
-  runtime.version = '1.6.73';
+  runtime.version = '1.6.74';
   // Shared scheduling for navigation and floating UI. Cache only during a
   // synchronous read phase; never retain DOM snapshots across frames/awaits.
   runtime.pageWork = (() => {
