@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 工具箱
 // @namespace    local.codex.chatgpt.unified
-// @version      1.6.74
+// @version      1.6.79
 // @description  ChatGPT 长对话工具箱；独立玻璃参数与折叠设置、GPU 海洋与轨迹回放、新版输入框与顶栏适配、269 项界面默认设置。
 // @author       Codex；含 Alex S Hamilton 的 ChatGPT Lazy Chat++（GPL-3.0-or-later）
 // @homepageURL  https://github.com/zjc1772665101-source/chatgpt-toolbox
@@ -51,7 +51,7 @@
   const stampBootstrap = () => {
     const root = document.documentElement;
     if (!root) return;
-    root.setAttribute('data-cgpt-unified-version', '1.6.74');
+    root.setAttribute('data-cgpt-unified-version', '1.6.79');
     root.setAttribute('data-cgpt-unified-surface', isFrame ? (allowedSurface ? 'side-chat' : 'other-frame') : 'tab');
     root.setAttribute('data-cgpt-unified-bootstrap', bootstrapState);
   };
@@ -69,7 +69,7 @@
   const PROMPT_STORAGE_KEY = 'cgpt-unified-prompt-library-v1';
   const runtime = globalThis[RUNTIME_KEY] || (globalThis[RUNTIME_KEY] = {});
 
-  runtime.version = '1.6.74';
+  runtime.version = '1.6.79';
   // Shared scheduling for navigation and floating UI. Cache only during a
   // synchronous read phase; never retain DOM snapshots across frames/awaits.
   runtime.pageWork = (() => {
@@ -301,10 +301,10 @@
         && rect.width > 0 && rect.height > 0;
     };
     const stopSelector = '[data-testid="stop-button"], [data-testid="composer-stop-button"], [data-testid*="stop-generating"]';
-    const composer = main?.querySelector('#prompt-textarea, textarea[name="prompt-textarea"]')
-      || document.querySelector('#prompt-textarea, textarea[name="prompt-textarea"]');
+    const editorSelector = '#prompt-textarea, textarea[name="prompt-textarea"], .ProseMirror[contenteditable="true"], [contenteditable="true"][role="textbox"]';
+    const composer = main?.querySelector(editorSelector) || document.querySelector(editorSelector);
     const composerShell = composer?.closest('form, [data-chatgpt-composer], [data-testid*="composer"]');
-    const stopLabel = /^(?:stop(?: (?:generating|streaming|response))?|停止(?:生成|回答)?|中止生成)$/i;
+    const stopLabel = /^(?:stop(?: (?:generating|streaming|response))?|停止(?:生成|回答|流式传输|输出)?|中止生成)$/i;
     let busy = Array.from(document.querySelectorAll(stopSelector)).some(visible)
       || Array.from(composerShell?.querySelectorAll('button, [role="button"]') || []).some((button) =>
         stopLabel.test((button.getAttribute('aria-label') || button.getAttribute('title') || button.textContent || '').trim()) && visible(button));
@@ -1214,13 +1214,13 @@
         ? record.target
         : record.target?.parentElement;
       const roleNode = target?.closest?.(dom.message);
-      if (roleNode) this.messageStatsCache.delete(roleNode);
+      if (roleNode) this.markMessageStatsDirty(roleNode);
       // Restored/virtualized turns may have changed while outside the observer.
       for (const node of record.addedNodes || []) {
         if (!(node instanceof Element)) continue;
-        if (node.matches(dom.message)) this.messageStatsCache.delete(node);
+        if (node.matches(dom.message)) this.markMessageStatsDirty(node);
         for (const role of node.querySelectorAll(dom.message)) {
-          this.messageStatsCache.delete(role);
+          this.markMessageStatsDirty(role);
         }
       }
     }
@@ -1244,21 +1244,18 @@
       return `${Math.round(n / 1000)}k`;
     }
 
-    estimateTokens(input) {
-      const text = normalizeText(input);
-      if (!text) return 0;
-      let score = 0;
-      let asciiRun = '';
+    countTokenText(text, previous = null, offset = 0) {
+      let score = previous?.score || 0;
+      let asciiRun = previous?.asciiRun || 0;
       const flushAscii = () => {
         if (!asciiRun) return;
-        score += Math.max(1, asciiRun.length / 4.05);
-        asciiRun = '';
+        score += Math.max(1, asciiRun / 4.05);
+        asciiRun = 0;
       };
-
-      for (const ch of text) {
+      for (const ch of text.slice(offset)) {
         const cp = ch.codePointAt(0);
-        if (cp <= 0x7f && /[A-Za-z0-9_]/.test(ch)) {
-          asciiRun += ch;
+        if ((cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122) || (cp >= 48 && cp <= 57) || cp === 95) {
+          asciiRun++;
           continue;
         }
         flushAscii();
@@ -1276,8 +1273,27 @@
         else if (cp >= 0x1f000) score += 1.65;
         else score += 0.95;
       }
-      flushAscii();
-      return Math.max(1, Math.round(score));
+      // Keep the trailing ASCII run uncommitted: a later chunk can extend it.
+      // Rounding still happens once, exactly as in a full estimate.
+      const total = score + (asciiRun ? Math.max(1, asciiRun / 4.05) : 0);
+      return { score, asciiRun, tokens: text ? Math.max(1, Math.round(total)) : 0 };
+    }
+
+    estimateTokens(input) {
+      return this.countTokenText(normalizeText(input)).tokens;
+    }
+
+    markMessageStatsDirty(node) {
+      const stats = node && this.messageStatsCache.get(node);
+      if (stats) stats.dirty = true;
+    }
+
+    canAppendTokenText(previous, content) {
+      if (!previous?.tokenState || !content.startsWith(previous.content)) return false;
+      const offset = previous.content.length;
+      const before = previous.content.charCodeAt(offset - 1), after = content.charCodeAt(offset);
+      // Do not split a newly completed surrogate pair between two chunks.
+      return !(before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff);
     }
 
     withTokenCounts(messages) {
@@ -1314,9 +1330,11 @@
 
     getMessageStats(roleNode) {
       let stats = this.messageStatsCache.get(roleNode);
-      if (!stats) {
+      if (!stats || stats.dirty) {
         const content = this.extractAttachedContent(roleNode);
-        stats = { content, tokens: this.estimateTokens(content) };
+        const append = this.canAppendTokenText(stats, content);
+        const tokenState = this.countTokenText(content, append ? stats.tokenState : null, append ? stats.content.length : 0);
+        stats = { content, tokens: tokenState.tokens, tokenState, dirty: false };
         this.messageStatsCache.set(roleNode, stats);
       }
       return stats;
@@ -1327,7 +1345,8 @@
         const role = dom.role(node);
         const id = dom.messageId(node)
           || `dom-${index}`;
-        return { id, role, ...this.getMessageStats(node) };
+        const stats = this.getMessageStats(node);
+        return { id, role, content: stats.content, tokens: stats.tokens };
       }).filter((message) => message.content);
     }
 
@@ -4274,7 +4293,7 @@
       if (shell.getAttribute('data-cgfc-neumorphic-composer') !== 'true') {
         shell.setAttribute('data-cgfc-neumorphic-composer', 'true');
       }
-      this.runtime.composerLiquidGlass?.attach(shell);
+      if (this.runtime.composerLiquidGlass?.candidate !== shell) this.runtime.composerLiquidGlass?.attach(shell);
       this.runtime.surfaceLiquidGlass?.refresh(shell);
       this.runtime.pageWork.invalidate();
       const rect = this.runtime.pageWork.rect(shell);
@@ -4363,37 +4382,36 @@
   const GLASS_STYLE = `
     html {
       --cgfc-glass-tint: 26,29,33;
-      --cgfc-glass-fill: calc(.04 + var(--cgfc-glass-opacity, .12) * .25);
+      --cgfc-glass-fill: var(--cgfc-glass-opacity, .12);
       --cgfc-glass-luminance: 1;
       --cgfc-glass-saturation: 1.12;
       --cgfc-glass-shadow: .12;
     }
     html[data-cgfc-glass-style="clear"] {
-      --cgfc-glass-fill: calc(.02 + var(--cgfc-glass-opacity, .12) * .18);
+      --cgfc-glass-fill: var(--cgfc-glass-opacity, .12);
       --cgfc-glass-saturation: 1.08;
     }
     html.dark:not([data-cgfc-theme="light"]), html[data-cgfc-theme="dark"] {
       --cgfc-glass-tint: 16,18,22;
-      --cgfc-glass-fill: calc(.12 + var(--cgfc-glass-opacity, .12) * .45);
+      --cgfc-glass-fill: var(--cgfc-glass-opacity, .12);
       --cgfc-glass-luminance: .96;
       --cgfc-glass-saturation: 1.12;
       --cgfc-glass-shadow: .26;
     }
     html.dark[data-cgfc-glass-style="clear"]:not([data-cgfc-theme="light"]),
     html[data-cgfc-theme="dark"][data-cgfc-glass-style="clear"] {
-      --cgfc-glass-fill: calc(.10 + var(--cgfc-glass-opacity, .12) * .4);
+      --cgfc-glass-fill: var(--cgfc-glass-opacity, .12);
       --cgfc-glass-luminance: .98;
       --cgfc-glass-saturation: 1.08;
     }
     :is([data-cgfc-liquid-composer], [data-cgfc-liquid-surface]) {
       background: transparent !important;
       border-color: transparent !important;
-      outline: none !important;
       -webkit-backdrop-filter: none !important;
       backdrop-filter: none !important;
       box-shadow: 0 10px 26px -14px rgba(0,0,0,var(--cgfc-glass-shadow)) !important;
-      transition: box-shadow 260ms cubic-bezier(.32,.72,0,1) !important;
     }
+    [data-cgfc-liquid-surface] { transition: box-shadow 260ms cubic-bezier(.32,.72,0,1) !important; }
     :is([data-cgfc-liquid-composer], [data-cgfc-liquid-surface]):focus-within {
       box-shadow: 0 10px 26px -14px rgba(0,0,0,var(--cgfc-glass-shadow)) !important;
     }
@@ -4407,21 +4425,20 @@
       backdrop-filter: blur(var(--cgfc-glass-blur-px, 6px)) saturate(var(--cgfc-glass-saturation)) brightness(var(--cgfc-glass-luminance)) var(--cgfc-glass-filter, blur(0px)) !important;
     }
     :is([data-cgfc-liquid-composer],[data-cgfc-liquid-surface])[data-cgfc-glass-finish="refined"] {
-      box-shadow:inset 0 .75px 0 rgba(255,255,255,var(--cgfc-glass-edge-light,.22)),inset .5px 0 0 rgba(255,255,255,.07),inset 0 -.75px 0 rgba(0,0,0,var(--cgfc-glass-edge-shade,.15)),0 8px 24px -16px rgba(0,0,0,.28)!important;
+      box-shadow:inset 0 .75px 0 rgba(255,255,255,var(--cgfc-glass-edge-light,0)),inset .5px 0 0 rgba(255,255,255,calc(var(--cgfc-glass-edge-light,0)*.3)),inset 0 -.75px 0 rgba(0,0,0,var(--cgfc-glass-edge-shade,0)),0 8px 24px -16px rgba(0,0,0,.28)!important;
     }
     [data-cgfc-liquid-surface="send"] {
-      background: radial-gradient(ellipse at 30% 12%, color-mix(in srgb, var(--cgfc-glass-send-color, rgb(32,36,40)) 30%, transparent), transparent 72%),
-        color-mix(in srgb, var(--cgfc-glass-send-color, rgb(32,36,40)) 42%, rgba(16,18,22,.22)) !important;
+      background: radial-gradient(ellipse at 30% 12%, color-mix(in srgb, var(--cgfc-glass-send-color, rgb(32,36,40)) calc(var(--cgfc-glass-edge-light, 0) * var(--cgfc-glass-fill, .12) * 60%), transparent), transparent 72%),
+        color-mix(in srgb, var(--cgfc-glass-send-color, rgb(32,36,40)) calc(var(--cgfc-glass-fill, .12) * 100%), transparent) !important;
       color: #f5f6f7 !important;
       box-shadow: 0 4px 12px -6px rgba(0,0,0,.2) !important;
     }
     [data-cgfc-liquid-surface="send"]:disabled,
     [data-cgfc-liquid-surface="send"][aria-disabled="true"] { opacity: .45; }
     [data-cgfc-liquid-surface="scroll"] {
-      background: transparent !important; box-shadow: none !important;
+      box-shadow: none !important;
     }
     [data-cgfc-liquid-surface="stats"], [data-cgfc-liquid-surface="toggle"] {
-      --cgfc-glass-fill: calc(.02 + var(--cgfc-glass-opacity, .12) * .15);
       box-shadow: none !important;
     }
     [data-cgfc-liquid-mode="paused"],
@@ -4463,7 +4480,7 @@
       background: conic-gradient(from -45deg,rgba(255,255,255,.95),rgba(255,255,255,.12) 16%,rgba(255,255,255,.02) 35%,rgba(255,255,255,.52) 51%,rgba(255,255,255,.02) 68%,rgba(255,255,255,.16) 85%,rgba(255,255,255,.95));
       -webkit-mask: linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
       -webkit-mask-composite: xor; mask-composite: exclude;
-      opacity: var(--cgfc-glass-edge-light,.225); z-index: 2;
+      opacity: var(--cgfc-glass-edge-light,0); z-index: 2;
     }
     [data-cgfc-glass-finish="classic"] > [data-cgfc-glass-rim] { display:none!important; }
     [data-cgfc-liquid-surface="tools"][data-cgfc-glass-finish="classic"]::before { display:none; }
@@ -4474,8 +4491,8 @@
       opacity: var(--cgfc-glass-sheen-opacity, 0);
       transition: opacity 300ms cubic-bezier(.32,.72,0,1);
     }
-    [data-cgfc-liquid-composer][data-cgfc-glass-hover] > [data-cgfc-glass-sheen] { opacity: var(--cgfc-glass-hover-opacity, .65); }
-    [data-cgfc-liquid-composer]:active > [data-cgfc-glass-sheen] { opacity: var(--cgfc-glass-press-opacity, .9); }
+    [data-cgfc-liquid-composer][data-cgfc-glass-hover] > [data-cgfc-glass-sheen] { opacity: var(--cgfc-glass-hover-opacity, 0); }
+    [data-cgfc-liquid-composer]:active > [data-cgfc-glass-sheen] { opacity: var(--cgfc-glass-press-opacity, 0); }
     @media (prefers-reduced-motion: reduce) {
       [data-cgfc-liquid-composer], [data-cgfc-glass-sheen] { transition: none !important; }
     }
@@ -4650,11 +4667,18 @@
       this.id = `cgpt-composer-glass-${Math.random().toString(36).slice(2, 10)}`;
       this.candidate = null; this.shell = null; this.raf = 0; this.lightRaf = 0;
       this.signature = ''; this.revision = 0; this.pointer = null;
+      this.lastGlare = 0; this.lightEnabled = false; this.lightTarget = null;
       this.buildEpoch = 0; this.pendingBuildKey = ''; this.buildTimer = 0;
       this.mapGeometry = ''; this.pendingGeometry = ''; this.readyGeometry = ''; this.resizeTimer = 0;
       this.onSettings = () => { glassOpticsFrameValue = null; this.attach(this.candidate || (!this.options.kind ? this.runtime?.composerQueueDock?.neumorphicShell : null)); };
+      this.onComposerPaste = event => {
+        if (/[\r\n]/.test(event.clipboardData?.getData('text/plain') || '')) this.beginResize();
+      };
+      this.onComposerBeforeInput = event => {
+        if (event.inputType === 'insertParagraph' || event.inputType === 'insertLineBreak') this.beginResize();
+      };
       this.onPointer = event => {
-        if (this.reducedMotion?.matches || !this.shell) return;
+        if (!this.lightEnabled || this.reducedMotion?.matches || !this.shell || this.suspended || document.hidden) return;
         this.pointer = { x: event.clientX, y: event.clientY };
         if (!this.lightRaf) this.lightRaf = this.runtime.pageWork.requestLayout(() => { this.lightRaf = 0; return this.prepareLight(); }, 30);
       };
@@ -4665,7 +4689,7 @@
         this.defaultLight();
       };
       this.reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)');
-      this.onMotionChange = () => { if (this.reducedMotion?.matches) this.onLeave(); };
+      this.onMotionChange = () => this.syncLightBinding();
       this.reducedMotion?.addEventListener?.('change', this.onMotionChange);
       if (!options.managed) document.addEventListener('cgpt-unified-ui-settings-change', this.onSettings);
       if (!options.sharedStyle) {
@@ -4689,16 +4713,18 @@
           }
           next.setAttribute(this.modeAttribute, 'blur');
           if (this.options.kind) next.setAttribute('data-cgfc-liquid-surface', this.options.kind);
-          if (!this.options.direct) {
-            next.addEventListener('pointermove', this.onPointer, { passive: true });
-            next.addEventListener('pointerleave', this.onLeave, { passive: true });
-          }
           if (typeof ResizeObserver === 'function') {
-            this.resizeObserver = this.runtime.pageWork.observeSize(next, () => this.schedule());
+            this.resizeObserver = this.runtime.pageWork.observeSize(next, () => {
+              if (!this.options.direct) this.beginResize();
+              this.schedule();
+            });
           }
           if (!this.options.direct) {
-            this.surfaceObserver = new MutationObserver(() => {
+            next.addEventListener('paste', this.onComposerPaste, true);
+            next.addEventListener('beforeinput', this.onComposerBeforeInput, true);
+            this.surfaceObserver = new MutationObserver(records => {
               if (this.shell !== next || !next.isConnected) return;
+              if (records.some(record => record.type === 'attributes')) this.beginResize();
               if (['effect', 'tint', 'rim', 'sheen'].some(key => this[key]?.parentElement !== next)) this.attach(next);
               else this.schedule();
             });
@@ -4732,6 +4758,17 @@
       if (this.shell && this.shell.style.getPropertyValue(name) !== value) this.shell.style.setProperty(name, value);
     }
 
+    syncLightBinding() {
+      const target = !this.options.direct && this.lastGlare > 0 && !this.reducedMotion?.matches && !this.suspended && !document.hidden && this.shell?.isConnected ? this.shell : null;
+      if (target === this.lightTarget) return;
+      this.lightTarget?.removeEventListener('pointermove', this.onPointer);
+      this.lightTarget?.removeEventListener('pointerleave', this.onLeave);
+      this.onLeave();
+      this.lightTarget = target; this.lightEnabled = Boolean(target);
+      target?.addEventListener('pointermove', this.onPointer, { passive: true });
+      target?.addEventListener('pointerleave', this.onLeave, { passive: true });
+    }
+
     defaultLight() {
       if (!this.shell) return;
       this.shell.removeAttribute('data-cgfc-glass-hover');
@@ -4741,13 +4778,13 @@
     paintLight() { this.prepareLight()?.(); }
 
     prepareLight() {
-      if (!this.shell || !this.pointer) return;
+      if (!this.lightEnabled || !this.shell || !this.pointer) return;
       const shell = this.shell, rect = this.runtime.pageWork.rect(shell);
       if (rect.width < 2 || rect.height < 2) return;
       const x = Math.max(0, Math.min(1, (this.pointer.x - rect.left) / rect.width));
       const y = Math.max(0, Math.min(1, (this.pointer.y - rect.top) / rect.height));
       return () => {
-        if (this.shell !== shell || !this.pointer) return;
+        if (!this.lightEnabled || this.shell !== shell || !this.pointer) return;
         if (!shell.hasAttribute('data-cgfc-glass-hover')) shell.setAttribute('data-cgfc-glass-hover', '');
         this.setSurfaceStyle('--cgfc-glass-light-x', `${(x * 100).toFixed(1)}%`);
         this.setSurfaceStyle('--cgfc-glass-light-y', `${(y * 100).toFixed(1)}%`);
@@ -4765,9 +4802,9 @@
 
     pause() {
       if (this.raf) this.runtime.pageWork.cancelFrame(this.raf); this.raf = 0;
-      this.cancelMapBuild(); this.clearResizeBuild();
+      this.cancelMapBuild(); this.clearResizeBuild(); this.onLeave();
       if (!this.shell || this.suspended) return;
-      this.suspended = true;
+      this.suspended = true; this.syncLightBinding();
       this.shell.setAttribute(this.modeAttribute, 'paused');
       this.shell.style.removeProperty('--cgfc-glass-filter');
     }
@@ -4782,10 +4819,27 @@
 
     clearResizeBuild() {
       if (this.resizeTimer) clearTimeout(this.resizeTimer);
-      this.resizeTimer = 0; this.pendingGeometry = ''; this.readyGeometry = '';
+      this.resizeTimer = 0; this.pendingGeometry = ''; this.readyGeometry = ''; this.resizeSettling = false;
+    }
+
+    beginResize() {
+      if (!this.filter || !this.mapGeometry || !this.shell || this.suspended) return;
+      this.cancelMapBuild();
+      if (this.resizeTimer) clearTimeout(this.resizeTimer);
+      this.resizeSettling = true; this.readyGeometry = '';
+      // Remove the RGB backdrop before the browser paints a larger native card.
+      // Keep tint/rim/blur while dimensions animate, then build the final map.
+      if (this.shell.getAttribute(this.modeAttribute) !== 'blur') this.shell.setAttribute(this.modeAttribute, 'blur');
+      this.shell.style.removeProperty('--cgfc-glass-filter');
+      this.resizeTimer = setTimeout(() => {
+        this.resizeTimer = 0; this.resizeSettling = false;
+        this.readyGeometry = this.pendingGeometry; this.pendingGeometry = '';
+        this.schedule();
+      }, 180);
     }
 
     deferResizeBuild(geometry) {
+      if (this.resizeSettling) { this.pendingGeometry = geometry; return true; }
       if (!this.filter || !this.mapGeometry || geometry === this.mapGeometry) {
         this.clearResizeBuild(); return false;
       }
@@ -4863,10 +4917,17 @@
         if (this[key]?.style.getPropertyValue('border-radius') !== radius + 'px') this[key]?.style.setProperty('border-radius', radius + 'px', 'important');
       }
       this.blurPx = optics.blur;
-      shell.setAttribute('data-cgfc-glass-finish', optics.finish);
+      if (shell.getAttribute('data-cgfc-glass-finish') !== optics.finish) shell.setAttribute('data-cgfc-glass-finish', optics.finish);
       const dark = document.documentElement.matches('html.dark:not([data-cgfc-theme="light"]),html[data-cgfc-theme="dark"]');
-      const fill = dark ? (optics.soft ? .12 + optics.opacity * .45 : .10 + optics.opacity * .4) : (optics.soft ? .06 + optics.opacity * .5 : .02 + optics.opacity * .18);
-      this.setSurfaceStyle('--cgfc-glass-fill', String(fill));
+      this.setSurfaceStyle('--cgfc-glass-fill', String(optics.opacity));
+      // Message cards already have their own explicit brightness/saturation
+      // controls. Other surfaces derive these from their own clear/soft style.
+      if (this.options.kind !== 'message') {
+        this.setSurfaceStyle('--cgfc-glass-saturation', optics.soft ? '1.12' : '1.08');
+        this.setSurfaceStyle('--cgfc-glass-luminance', String(dark ? (optics.soft ? .96 : .98) : 1));
+      }
+      this.lastGlare = optics.glare;
+      this.syncLightBinding();
       this.setSurfaceStyle('--cgfc-glass-edge-light', String(Math.min(.65, optics.glare * .5)));
       this.setSurfaceStyle('--cgfc-glass-edge-shade', String(Math.min(.4, optics.glare * .35)));
       this.setSurfaceStyle('--cgfc-glass-blur-px', `${this.blurPx}px`);
@@ -4976,7 +5037,7 @@
     }
 
     releaseSurface() {
-      if (this.raf) this.runtime.pageWork.cancelFrame(this.raf); this.raf = 0; this.onLeave();
+      if (this.raf) this.runtime.pageWork.cancelFrame(this.raf); this.raf = 0; this.lastGlare = 0; this.syncLightBinding(); this.onLeave();
       this.cancelMapBuild(); this.clearResizeBuild(); this.mapGeometry = '';
       this.resizeObserver?.disconnect(); this.resizeObserver = null;
       this.surfaceObserver?.disconnect(); this.surfaceObserver = null;
@@ -4984,6 +5045,8 @@
       this.intersectionObserver?.disconnect(); this.intersectionObserver = null;
       this.offscreen = false; this.suspended = false;
       this.shell?.removeEventListener('pointermove', this.onPointer); this.shell?.removeEventListener('pointerleave', this.onLeave);
+      this.shell?.removeEventListener('paste', this.onComposerPaste, true);
+      this.shell?.removeEventListener('beforeinput', this.onComposerBeforeInput, true);
       this.svg?.remove(); this.svg = null; this.filter = null; this.displacements = null;
       for (const key of ['effect', 'tint', 'rim', 'sheen']) { this[key]?.remove(); this[key] = null; }
       this.shell?.removeAttribute(this.modeAttribute);
@@ -4995,7 +5058,7 @@
       }
       this.originalPosition = null;
       this.shell?.removeAttribute('data-cgfc-glass-finish');
-      for (const key of ['fill', 'edge-light', 'edge-shade', 'filter', 'blur-px', 'rim-opacity', 'sheen-opacity', 'hover-opacity', 'press-opacity']) this.shell?.style.removeProperty(`--cgfc-glass-${key}`);
+      for (const key of ['fill', 'saturation', 'luminance', 'edge-light', 'edge-shade', 'filter', 'blur-px', 'rim-opacity', 'sheen-opacity', 'hover-opacity', 'press-opacity']) this.shell?.style.removeProperty(`--cgfc-glass-${key}`);
       this.signature = ''; this.opticsSignature = ''; this.shell = null;
     }
 
@@ -5014,10 +5077,68 @@
   // Additional surfaces share the material but retain independent enable flags.
   // Direct backdrop painting stays pinned when a settings panel scrolls and
   // does not insert unmanaged children into React-owned native buttons.
+  // The browser may serialize a native color as rgb(), color(srgb), oklch(),
+  // etc. Keep that CSS color intact. Only classification needs an sRGB sample;
+  // normal RGB colors take a fast path, and other colors use one cached pixel
+  // when a native button state changes, never a conversation snapshot/frame loop.
+  const nativeGlassTint = (() => {
+    const cache = new Map(); let context = null;
+    return color => {
+      if (!color || !CSS.supports('color', color)) return null;
+      if (cache.has(color)) return cache.get(color);
+      let channels = null;
+      const rgb = color.match(/^rgba?\(([^)]+)\)$/i);
+      if (rgb && !rgb[1].includes('%')) {
+        const values = rgb[1].trim().split(/[,\s/]+/).map(Number);
+        if (values.length >= 3 && values.every(Number.isFinite)) channels = [...values.slice(0, 3), values[3] ?? 1];
+      }
+      if (!channels) {
+        try {
+          if (!context) { const canvas = document.createElement('canvas'); canvas.width = canvas.height = 1; context = canvas.getContext('2d', { willReadFrequently: true, colorSpace: 'srgb' }); }
+          if (context) {
+            context.clearRect(0, 0, 1, 1); context.fillStyle = 'rgba(0,0,0,0)'; context.fillStyle = color; context.fillRect(0, 0, 1, 1);
+            const pixel = context.getImageData(0, 0, 1, 1).data;
+            channels = [pixel[0], pixel[1], pixel[2], pixel[3] / 255];
+          }
+        } catch (_) { /* A neutral tint remains available when sampling is unavailable. */ }
+      }
+      const result = channels && channels[3] > 0 && Math.max(...channels.slice(0, 3)) - Math.min(...channels.slice(0, 3)) > 12 ? color : null;
+      if (cache.size >= 32) cache.delete(cache.keys().next().value);
+      cache.set(color, result); return result;
+    };
+  })();
+
+  function nativeGlassPaintKey(node) {
+    if (!(node instanceof Element)) return '';
+    const properties = Array.from(node.style).filter(name => /^(?:background(?:-color|-image)?|color)$/.test(name)
+      || (name.startsWith('--') && !/^--cg(?:fc|pt)-/.test(name) && /color|background|surface|accent|primary/.test(name)));
+    return String(node.className) + ';' + properties.sort().map(name => name + ':' + node.style.getPropertyValue(name)).join(';');
+  }
+
+  function nativeGlassButtonState(button, shell) {
+    if (!button) return '';
+    const parts = [button.getAttribute('aria-label'), button.getAttribute('data-testid'), document.documentElement.className, document.documentElement.getAttribute('data-cgfc-theme')];
+    for (let node = button, depth = 0; node instanceof Element && depth < 10; node = node.parentElement, depth++) {
+      parts.push(nativeGlassPaintKey(node));
+      if (node === shell) break;
+    }
+    return parts.join('|');
+  }
+
+  function readNativeGlassTint(button) {
+    const marker = button.getAttribute('data-cgfc-liquid-surface');
+    // Unmask only our paint rule for the native-color read. Keep the SVG/filter
+    // and geometry cache alive across send/voice/stop and native color changes.
+    if (marker !== null) button.removeAttribute('data-cgfc-liquid-surface');
+    try { return nativeGlassTint(getComputedStyle(button).backgroundColor); }
+    finally { if (marker !== null) button.setAttribute('data-cgfc-liquid-surface', marker); }
+  }
+
   class SupplementaryLiquidGlass {
     constructor(runtime) {
       this.runtime = runtime; this.raf = 0; this.composerShell = null;
       this.shadowStyles = new Map(); this.controllers = new Map(); this.scrollControllers = new Map();
+      this.nativePaintStamps = new WeakMap();
       const specs = [
         ['toolboxPanel', 'toolbox', 'data-cgfc-toolbox-liquid-glass'],
         ['toolboxLauncher', 'toolbox', 'data-cgfc-toolbox-liquid-glass'],
@@ -5056,7 +5177,10 @@
       const controller = suppliedController || this.controllers.get(name);
       const next = target instanceof Element && target.isConnected ? target : null;
       const enabled = document.documentElement.hasAttribute(controller.options.enabledAttribute);
-      if (controller.candidate === next && controller.shell === (enabled ? next : null)) return;
+      const nativeState = name === 'send' && next ? nativeGlassButtonState(next, this.composerShell) : '';
+      const sameTarget = controller.candidate === next && controller.shell === (enabled ? next : null);
+      if (sameTarget && (name !== 'send' || controller.nativeState === nativeState)) return;
+      controller.nativeState = nativeState;
       if (next?.hasAttribute('data-cgfc-liquid-surface') && controller.shell !== next) {
         // A framework clone can carry our old marker and filter URL. Read its
         // native colour only after removing those inherited decorations.
@@ -5065,15 +5189,12 @@
         next.style.removeProperty('--cgfc-glass-filter');
         next.style.removeProperty('--cgfc-glass-send-color');
       }
-      let sendColor = null;
-      if (name === 'send' && next && enabled) {
-        const color = getComputedStyle(next).backgroundColor.match(/rgba?\(([^)]+)\)/)?.[1]?.split(/[,\s/]+/).map(Number);
-        if (color?.length >= 3 && Math.max(...color.slice(0, 3)) - Math.min(...color.slice(0, 3)) > 12) {
-          sendColor = `rgb(${color.slice(0, 3).join(',')})`;
-        }
-      }
+      const sendColor = name === 'send' && next && enabled ? readNativeGlassTint(next) : null;
       controller.attach(next);
-      if (sendColor && controller.shell) next.style.setProperty('--cgfc-glass-send-color', sendColor);
+      if (name === 'send' && controller.shell) {
+        if (sendColor) next.style.setProperty('--cgfc-glass-send-color', sendColor);
+        else next.style.removeProperty('--cgfc-glass-send-color');
+      }
     }
 
     refresh(shell) {
@@ -5122,6 +5243,9 @@
       const button = this.composerShell?.querySelector([
         'button#composer-submit-button', 'button[data-testid="send-button"]',
         'button[data-testid="composer-send-button"]', 'button[data-testid="stop-button"]',
+        'button[data-testid="composer-stop-button"]', 'button[data-testid*="stop-generating"]',
+        'button[aria-label="停止流式传输"]', 'button[aria-label="停止回答"]', 'button[aria-label="停止输出"]',
+        'button[aria-label="Stop streaming" i]', 'button[aria-label="Stop response" i]', 'button[aria-label="Stop" i]', 'button[aria-label="停止"]',
         'button[aria-label="开始语音"]', 'button[aria-label="Start voice" i]',
         'button[aria-label="Use voice mode" i]', 'button[aria-label="停止生成"]',
         'button[aria-label="Stop generating" i]', 'button[aria-label*="send" i]:not([aria-label*="feedback" i])',
@@ -5130,12 +5254,22 @@
       const tools = this.composerShell?.querySelector('[class*="ComposerLayoutFooter-"] [class*="bg-(--composer-layout-surface-background)"]');
       this.bind('composerTools', tools);
       this.bind('send', button);
-      const observe = document.documentElement.hasAttribute('data-cgfc-send-liquid-glass') ? this.composerShell : null;
+      const observe = document.documentElement.hasAttribute('data-cgfc-send-liquid-glass') || document.documentElement.hasAttribute('data-cgfc-composer-tools-liquid-glass') ? this.composerShell : null;
       if (observe !== this.observedShell) {
         this.buttonObserver?.disconnect(); this.buttonObserver = null; this.observedShell = observe;
         if (observe) {
-          this.buttonObserver = new MutationObserver(() => this.schedule());
-          this.buttonObserver.observe(observe, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-testid', 'aria-label', 'disabled', 'aria-disabled'] });
+          this.buttonObserver = new MutationObserver(records => {
+            const changed = records.some(record => {
+              if (record.type !== 'attributes' || record.attributeName !== 'style') return true;
+              const node = record.target;
+              // Our --cgfc-* style writes must never drive a refresh feedback loop.
+              const stamp = nativeGlassPaintKey(node), previous = this.nativePaintStamps.get(node);
+              this.nativePaintStamps.set(node, stamp);
+              return previous !== stamp;
+            });
+            if (changed) this.schedule();
+          });
+          this.buttonObserver.observe(observe, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-testid', 'aria-label', 'disabled', 'aria-disabled', 'class', 'style'] });
         }
       }
     }
@@ -7872,6 +8006,7 @@
       this.disconnectCurrentAnswer();
 
       this.currentAnswer = answer;
+      this.outlineTextCache = new WeakMap();
       this.currentContentRoot = answer;
       this.currentScrollRoot = this.findScrollRoot(answer);
       this.lastScrollTop = this.getScrollTop();
@@ -7880,6 +8015,7 @@
       this.answerObserver.observe(answer, {
         childList: true,
         subtree: true,
+        characterData: true,
       });
 
       this.rebuildToc();
@@ -7906,6 +8042,14 @@
     }
 
     onAnswerMutations(records) {
+      this.invalidateOutlineText(records);
+      const ownSelector = '[data-cgpt-token-chip], .cgpt-unified-copy-message-md';
+      records = records.filter(record => {
+        const target = record.target instanceof Element ? record.target : record.target.parentElement;
+        if (target?.closest(ownSelector)) return false;
+        const changed = [...(record.addedNodes || []), ...(record.removedNodes || [])];
+        return !(record.type === 'childList' && changed.length && changed.every(node => node instanceof Element && node.matches(ownSelector)));
+      });
       let touchesHeading = false;
 
       for (const record of records) {
@@ -7933,7 +8077,7 @@
         if (touchesHeading) break;
       }
 
-      if (touchesHeading || records.some((record) => record.type === 'childList')) {
+      if (touchesHeading || (this.config.answerTocDerivedOutline && records.length)) {
         this.scheduleTocRebuild();
       }
     }
@@ -7952,6 +8096,7 @@
         return;
       }
 
+      this.invalidateOutlineText(this.answerObserver?.takeRecords() || []);
       this.headingTextObserver?.disconnect();
 
       const headings = [];
@@ -8066,8 +8211,11 @@
       if (cjk) endpoints.push(cjk.index + cjk[0].length);
 
       // 英文句号保守要求后接空白或文本结束，避免把 3.14 / v1.3.1 切碎。
-      const latin = /[.!?](?=\s|$)/u.exec(source);
-      if (latin) endpoints.push(latin.index + latin[0].length);
+      // A list marker is part of the heading, not an English sentence ending.
+      const marker = /^(?:\d+(?:\.\d+)*|[一二三四五六七八九十百零〇]+)[.)．]\s+/u.exec(source);
+      const offset = marker?.[0].length || 0;
+      const latin = /[.!?](?=\s|$)/u.exec(source.slice(offset));
+      if (latin) endpoints.push(offset + latin.index + latin[0].length);
 
       const end = endpoints.length ? Math.min(...endpoints) : source.length;
       return source.slice(0, end).trim();
@@ -8083,6 +8231,32 @@
         .replace(/[\s\p{P}\p{S}]+/gu, '');
     }
 
+    outlineText(element) {
+      this.outlineTextCache ||= new WeakMap();
+      if (this.outlineTextCache.has(element)) return this.outlineTextCache.get(element);
+      const text = this.normalizeText(element.textContent ?? '');
+      this.outlineTextCache.set(element, text);
+      return text;
+    }
+
+    invalidateOutlineText(records) {
+      if (!this.outlineTextCache) return;
+      for (const record of records) {
+        const target = record.target instanceof Element ? record.target : record.target.parentElement;
+        for (let node = target; node; node = node.parentElement) {
+          this.outlineTextCache.delete(node);
+          if (node === this.currentAnswer) break;
+        }
+        // React can remove a subtree, edit it off-document and insert it again.
+        // Forget its old labels as well as the changed ancestor chain.
+        for (const node of record.addedNodes || []) {
+          if (!(node instanceof Element)) continue;
+          this.outlineTextCache.delete(node);
+          for (const child of node.querySelectorAll('*')) this.outlineTextCache.delete(child);
+        }
+      }
+    }
+
     collectDerivedOutline() {
       const answer = this.currentAnswer;
       if (!(answer instanceof HTMLElement)) return [];
@@ -8094,7 +8268,7 @@
         element.closest(dom.assistant) === answer
         && !element.closest('[hidden], [aria-hidden="true"]');
       const makeItem = (element, level, prefix = '') => {
-        const raw = this.normalizeText(element.textContent ?? '');
+        const raw = this.outlineText(element);
         if (raw.length < minLength) return null;
         const sentence = this.extractOutlineSentence(raw) || raw;
         const fullLabel = prefix + sentence.slice(0, 220);
@@ -8120,7 +8294,7 @@
         .map((element) => {
           const strong = element.querySelector(':scope > strong:first-child, :scope > b:first-child, :scope > [data-d-component="text"][data-d-default-strong]:first-child, :scope > [data-d-component="text"][data-d-weight="bold"]:first-child');
           if (!(strong instanceof HTMLElement)) return null;
-          const label = this.normalizeText(strong.textContent ?? '');
+          const label = this.outlineText(strong);
           if (label.length < 2 || label.length > 100) return null;
           return {
             element,
@@ -8139,7 +8313,7 @@
         blocks = Array.from(root.querySelectorAll('p, blockquote, pre, ul, ol, table'))
           .filter((element) => element instanceof HTMLElement && belongsToAnswer(element));
       }
-      const meaningful = blocks.filter((element) => this.normalizeText(element.textContent ?? '').length >= minLength);
+      const meaningful = blocks.filter((element) => this.outlineText(element).length >= minLength);
       const stride = Math.max(1, Math.ceil(meaningful.length / maxItems));
       return meaningful.filter((_, index) => index === 0 || index % stride === 0)
         .slice(0, maxItems)
@@ -8157,7 +8331,7 @@
       const minLength = Math.max(3, Number(this.config.answerTocDerivedMinTextLength) || 8);
       const maxItems = Math.max(3, Number(this.config.answerTocDerivedMaxItems) || 18);
       const minScore = Math.max(0, Number(this.config.answerTocDerivedMinScore) || 60);
-      const totalTextLength = this.normalizeText(root.textContent ?? '').length;
+      const totalTextLength = this.outlineText(root).length;
       const separatorTarget = Math.min(6, root.querySelectorAll('hr').length + 1);
       const targetCount = Math.min(maxItems, Math.max(
         existing.length,
@@ -8183,7 +8357,7 @@
       const sentenceFrom = (value) => this.extractOutlineSentence(value);
       const makeItem = (element, labelOverride = '', level = 3) => {
         if (!(element instanceof HTMLElement) || existingElements.has(element) || !belongsToAnswer(element)) return null;
-        const raw = this.normalizeText(element.textContent ?? '');
+        const raw = this.outlineText(element);
         const source = this.normalizeText(labelOverride || raw).replace(/\*\*([^*]+)\*\*/g, '$1');
         if (raw.length < minLength || source.length < 2) return null;
         const sentence = sentenceFrom(source);
@@ -8200,7 +8374,7 @@
         };
       };
       const extractLeadingLabel = (element) => {
-        const raw = this.normalizeText(element.textContent ?? '');
+        const raw = this.outlineText(element);
         const markdownBold = raw.match(/^\*\*([^*\n]{2,100})\*\*[:：]?/);
         if (markdownBold) return this.normalizeText(markdownBold[1]);
         const strong = element.querySelector(':scope > strong:first-child, :scope > b:first-child, :scope > [data-d-component="text"][data-d-default-strong]:first-child, :scope > [data-d-component="text"][data-d-weight="bold"]:first-child');
@@ -8211,7 +8385,7 @@
           textBefore += node.textContent ?? '';
         }
         if (this.normalizeText(textBefore)) return '';
-        const label = this.normalizeText(strong.textContent ?? '');
+        const label = this.outlineText(strong);
         return label.length >= 2 && label.length <= 100 ? label : '';
       };
       const looksLikeNumberedTitle = (label) => /^(?:#{0,6}\s*)?(?:\d+(?:\.\d+)*(?:[.)、：:．-]|\s+)|[一二三四五六七八九十百零〇]+[、.．：:)）]|第[一二三四五六七八九十百零〇\d]+(?:章|节|部分|篇|卷|单元)|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳])\s*\S+/.test(label);
@@ -8237,7 +8411,7 @@
           const ancestorBlock = element.parentElement?.closest(blockSelector);
           return !(ancestorBlock instanceof HTMLElement) || !root.contains(ancestorBlock);
         })
-        .filter((element) => this.normalizeText(element.textContent ?? '').length >= minLength)
+        .filter((element) => this.outlineText(element).length >= minLength)
         .sort(compareElements);
       if (!blocks.length) return existing.length ? [] : this.collectDerivedOutline();
 
@@ -12575,10 +12749,10 @@
     ['Blur', '背景模糊 px', 'number', [0, 20, .2]],
     ['Thickness', '边缘厚度 px', 'number', [4, 48, 1]],
     ['Glare', '边缘高光', 'number', [0, 1.6, .05]],
-    ['Opacity', '底色浓度', 'number', [0, .85, .01]],
+    ['Opacity', '底色浓度（0 为透明）', 'number', [0, .85, .01]],
     ['Chroma', '色散强度（完整模式）', 'number', [0, .6, .01]],
-    ['Curvature', '曲面强度', 'number', [0, 1, .02]],
-    ['Bend', '边缘包裹', 'number', [0, 1, .02]],
+    ['Curvature', '曲面强度（0 为基础曲面）', 'number', [0, 1, .02]],
+    ['Bend', '边缘包裹（0 为最弱）', 'number', [0, 1, .02]],
   ];
   const composerKey = suffix => suffix === 'RenderMode' ? 'glassRenderMode' : suffix === 'Finish' ? 'glassOpticalFinish' : 'composerGlass' + suffix;
   defaults.glassOpticalFinish = 'refined'; settingTypes.glassOpticalFinish = 'select'; selectValues.glassOpticalFinish = ['refined', 'classic'];
@@ -12631,7 +12805,7 @@
   function createIndependentGlassControls(panel) {
     const group = createSettingsGroup(panel, '液态玻璃 · 各面板独立');
     const hint = document.createElement('p'); hint.className = 'cgfc-hint';
-    hint.textContent = '首次升级时，各面板复制输入框当前参数；之后独立保存。完整模式才显示 RGB 色散。模糊数值按实际设置执行，不再强制至少 8px。'; group.appendChild(hint);
+    hint.textContent = '首次升级时，各面板复制输入框当前参数；之后独立保存。完整模式才显示 RGB 色散。底色浓度 0 为透明，高光 0 为关闭；模糊和折射仍独立生效，折射强度 0 才关闭折射。'; group.appendChild(hint);
     const input = { label: '输入框', prefix: '', enabled: 'enableComposerLiquidGlass' };
     for (const spec of [input, ...glassSurfaceSpecs]) {
       const target = createSettingsGroup(group, spec.label);
@@ -13774,6 +13948,7 @@
       conversationTop: 0,
       readingAnchor: null,
       generationCheckedAt: 0,
+      generationStopButton: null,
       manualSnapshotFrame: 0,
     };
 
@@ -13797,7 +13972,7 @@
       return state.generating || isSendGuardActive() || isPostGenerationGuardActive();
     }
 
-    function snapshotPositions() {
+    function snapshotPositions(captureAnchor = true) {
       state.revision++;
       state.windowY = win.scrollY || document.documentElement.scrollTop || 0;
       collectScrollableElements().forEach((el) => {
@@ -13809,6 +13984,7 @@
       const viewportBottom = state.conversationRoot
         ? viewportTop + state.conversationRoot.clientHeight : win.innerHeight;
       state.readingAnchor = null;
+      if (!captureAnchor) return;
       // Hit testing is bounded by viewport probes, independent of history size.
       // Avoid reading thousands of offscreen paragraph rects on every wheel tick.
       const top = Math.max(0, viewportTop);
@@ -13838,7 +14014,7 @@
       if (state.manualSnapshotFrame) return;
       state.manualSnapshotFrame = win.requestAnimationFrame(() => {
         state.manualSnapshotFrame = 0;
-        snapshotPositions();
+        snapshotPositions(false);
       });
     }
 
@@ -13865,6 +14041,7 @@
 
     function armSendGuard() {
       if (!isLockEnabled()) return;
+      scrollableCacheAt = 0;
 
       // Capture BEFORE ChatGPT handles the submit. This closes the small gap where
       // the UI scrolls to the newly appended turn before the stop/generating button
@@ -13881,6 +14058,7 @@
     }
 
     function markUserScroll(event) {
+      if (!isLockEnabled() || !isAutoScrollLockActive()) return;
       if (event?.type === 'keydown') {
         const scrollKeys = new Set(['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' ']);
         if (!scrollKeys.has(event.key) || isTypingTarget(event.target)) return;
@@ -13910,6 +14088,7 @@
     }
 
     function shouldProtectViewport() {
+      if (!isLockEnabled()) return false;
       syncRouteState();
       return isLockEnabled()
         && isAutoScrollLockActive()
@@ -13987,7 +14166,12 @@
       return el.scrollHeight > el.clientHeight + 24;
     }
 
+    let scrollableCache = [], scrollableCacheAt = 0;
     function collectScrollableElements() {
+      const time = Date.now();
+      if (time - scrollableCacheAt < 500 && state.conversationRoot?.isConnected
+        && scrollableCache.every(el => el.isConnected)) return scrollableCache;
+      scrollableCacheAt = time;
       const root = document.body || document.documentElement;
       if (!root) return [];
       // Walk actual feed ancestors, including overflow containers which have no
@@ -14016,7 +14200,8 @@
           }
         }
       }
-      return Array.from(elements);
+      scrollableCache = Array.from(elements);
+      return scrollableCache;
     }
 
     function syncRouteState() {
@@ -14027,6 +14212,7 @@
       const promotedNewChat = !/\/c\//.test(state.route) && /\/c\//.test(route)
         && isAutoScrollLockActive();
       state.route = route;
+      scrollableCacheAt = 0;
       state.revision++;
       if (promotedNewChat) return;
       state.generating = false;
@@ -14071,7 +14257,8 @@
       const directStop = document.querySelector(
         '[data-testid="stop-button"], [data-testid="composer-stop-button"], [data-testid*="stop-generating"]'
       );
-      if (directStop && isVisible(directStop)) return true;
+      state.generationStopButton = null;
+      if (directStop && isVisible(directStop)) { state.generationStopButton = directStop; return true; }
 
       const composer = document.querySelector(COMPOSER_EDITOR_SELECTOR)?.closest('form, [data-chatgpt-composer], [data-testid*="composer"], [class*="composer"]');
       const buttons = composer?.querySelectorAll('button, [role="button"]') || [];
@@ -14084,8 +14271,9 @@
           button.textContent || '',
         ].join(' ');
 
-        if (/\b(?:stop (?:generating|streaming|response)|generating)\b|停止(?:生成|回答)|中止生成|生成中/i.test(label)
+        if (/\b(?:stop (?:generating|streaming|response)|generating)\b|停止(?:生成|回答|流式传输|输出)|中止生成|生成中/i.test(label)
           || /^(?:停止|stop)$/i.test((button.getAttribute('aria-label') || '').trim())) {
+          state.generationStopButton = button;
           return true;
         }
       }
@@ -14114,6 +14302,11 @@
     }
 
     function refreshGenerationState() {
+      if (!isLockEnabled()) {
+        state.generating = false; state.sendGuardUntil = 0; state.postGenerationUntil = 0;
+        state.generationStopButton = null;
+        return;
+      }
       state.generationCheckedAt = Date.now();
       syncRouteState();
       const nextGenerating = isGenerating();
@@ -14252,17 +14445,40 @@
       refreshGenerationState();
     };
 
-    let generationRefreshTimer = 0;
-    const queueStateRefresh = () => {
-      win.clearTimeout(generationRefreshTimer);
+    let generationRefreshTimer = 0, pendingGenerationRefresh = false;
+    const lockOwnUI = '#cgfc-panel, #cgfc-toggle, #cgpt-answer-toc-host, #cgpt-unified-queue-dock, #cgfc-formula-copy-toast, [data-cgpt-token-chip], .cgpt-unified-copy-message-md';
+    const queueStateRefresh = (records) => {
+      if (!isLockEnabled()) return;
+      const liveStop = state.generating && state.generationStopButton?.isConnected;
+      let relevant = false, checkGeneration = false;
+      for (const record of records) {
+        const target = record.target instanceof ElementCtor ? record.target : record.target.parentElement;
+        if (target?.closest(lockOwnUI)) continue;
+        const changed = [...(record.addedNodes || []), ...(record.removedNodes || [])];
+        if (record.type === 'childList' && changed.length && changed.every(node => node instanceof ElementCtor && node.matches(lockOwnUI))) continue;
+        relevant = true;
+        // A live stop button already proves that the answer is still busy.
+        // Text/paragraph insertions inside that answer cannot change this fact.
+        // Composer changes, button removal/hiding and routes still check promptly.
+        if (!liveStop || !target?.closest(dom.assistant)) checkGeneration = true;
+      }
+      if (!relevant) return;
+      pendingGenerationRefresh ||= checkGeneration;
+      if (generationRefreshTimer || (!pendingGenerationRefresh && !shouldProtectViewport())) return;
       generationRefreshTimer = win.setTimeout(() => {
+        generationRefreshTimer = 0;
+        const check = pendingGenerationRefresh; pendingGenerationRefresh = false;
+        if (!isLockEnabled()) return;
         syncNavigationState();
-        refreshGenerationState();
+        syncRouteState();
+        if (check) refreshGenerationState();
+        if (!shouldProtectViewport()) return;
         collectScrollableElements();
         if (state.conversationRoot) handleScroll({ target: state.conversationRoot });
       }, 36);
     };
     const observer = new MutationObserver(queueStateRefresh);
+
     const start = () => {
       syncNavigationState();
       refreshGenerationState();
@@ -14275,12 +14491,15 @@
           'data-testid',
           'disabled',
           'data-cgpt-unified-navigation-active',
+          'hidden', 'aria-hidden', 'class', 'aria-busy', 'data-is-streaming', 'data-is-generating',
         ],
       });
       win.setInterval(() => {
         syncNavigationState();
         syncRouteState();
+        if (!isLockEnabled()) return;
         if (Date.now() - state.generationCheckedAt >= GENERATION_CHECK_MS) refreshGenerationState();
+        if (!shouldProtectViewport()) return;
         collectScrollableElements();
         if (state.conversationRoot) handleScroll({ target: state.conversationRoot });
       }, 200);
@@ -14292,15 +14511,15 @@
 
   function startCitationTypography() {
     let scanTimer = 0;
-    const scan = () => {
-      // ChatGPT can keep several main surfaces mounted, with an empty/hidden
-      // surface first. Scan every surface and deduplicate nested main regions.
-      const mains = document.querySelectorAll('main, [role="main"]');
+    const pendingRoots = new Set();
+    const scan = (scope) => {
+      const selector = `${citationCandidateSelector}, [data-cgfc-citation], [data-cgfc-web-citation]`;
+      const roots = scope ? [scope] : document.querySelectorAll('main, [role="main"]');
       const candidates = new Set();
-      for (const main of mains) {
-        for (const element of main.querySelectorAll(`${citationCandidateSelector}, [data-cgfc-citation], [data-cgfc-web-citation]`)) {
-          candidates.add(element);
-        }
+      for (const root of roots) {
+        if (!root.isConnected) continue;
+        if (root.matches(selector)) candidates.add(root);
+        for (const element of root.querySelectorAll(selector)) candidates.add(element);
       }
       for (const element of candidates) {
         const inResponse = Boolean(element.closest(`${dom.assistant}, ${dom.turn}`));
@@ -14324,20 +14543,35 @@
         }
       }
     };
-    const queueScan = () => {
-      // Do not postpone forever while a response streams continuously.
+    const queueScan = (node) => {
+      if (!(node instanceof Element) || !node.isConnected) return;
+      for (const root of pendingRoots) if (root.contains(node)) return;
+      for (const root of pendingRoots) if (node.contains(root)) pendingRoots.delete(root);
+      pendingRoots.add(node);
       if (scanTimer) return;
-      scanTimer = setTimeout(() => { scanTimer = 0; scan(); }, 120);
+      scanTimer = setTimeout(() => {
+        scanTimer = 0;
+        const roots = [...pendingRoots]; pendingRoots.clear();
+        for (const root of roots) scan(root);
+      }, 120);
     };
     onReady(() => {
       scan();
       new MutationObserver((mutations) => {
-        if (mutations.some((mutation) => {
-          const node = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
-          return node?.closest('main, [role="main"]') || (mutation.type === 'childList'
-            && Array.from(mutation.addedNodes).some((added) => added instanceof Element
-              && (added.matches('main, [role="main"]') || added.querySelector('main, [role="main"]'))));
-        })) queueScan();
+        for (const mutation of mutations) {
+          const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
+          if (!target?.closest('main, [role="main"]')) {
+            for (const added of mutation.addedNodes || []) if (added instanceof Element && (added.matches('main, [role="main"]') || added.querySelector('main, [role="main"]'))) queueScan(added);
+            continue;
+          }
+          const citation = target.closest(citationCandidateSelector + ', [data-cgfc-citation], [data-cgfc-web-citation]');
+          if (citation) queueScan(citation);
+          if (mutation.type === 'attributes') {
+            if (target.matches(citationCandidateSelector + ', [data-cgfc-citation], [data-cgfc-web-citation]')) queueScan(target);
+          } else if (mutation.type === 'childList') {
+            for (const added of mutation.addedNodes) if (added instanceof Element) queueScan(added);
+          }
+        }
       }).observe(document.documentElement, {
         childList: true, characterData: true, subtree: true, attributes: true,
         attributeFilter: ['data-testid', 'data-citation', 'data-citation-id', 'data-citation-type', 'data-d-component', 'data-d-inline-text', 'data-pill', 'data-state', 'role', 'class'],
@@ -19309,7 +19543,7 @@
       const visible = (el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== "hidden";
       if ([...document.querySelectorAll('[data-testid="stop-button"], [data-testid="composer-stop-button"], [data-testid*="stop-generating"]')].some(visible)) return true;
       const shell = editor?.closest("form, [data-chatgpt-composer]");
-      return [...shell?.querySelectorAll('button,[role="button"]') || []].some((el) => visible(el) && /^(?:stop(?: (?:generating|streaming|response))?|停止(?:生成|回答)?|中止生成)$/i.test((el.getAttribute("aria-label") || el.getAttribute("title") || el.textContent || "").trim()));
+      return [...shell?.querySelectorAll('button,[role="button"]') || []].some((el) => visible(el) && /^(?:stop(?: (?:generating|streaming|response))?|停止(?:生成|回答|流式传输|输出)?|中止生成)$/i.test((el.getAttribute("aria-label") || el.getAttribute("title") || el.textContent || "").trim()));
     }
     function mount(main, shell, first) {
       if (mountedMain === main && mountedShell === shell && mountedScene === scene && canvas?.isConnected && [...foreground].every((el) => el.isConnected)) return;
