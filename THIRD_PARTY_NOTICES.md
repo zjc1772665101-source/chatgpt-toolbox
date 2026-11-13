@@ -20,7 +20,11 @@ ASCII 海洋的世界模拟与字符绘制改编自 [stackedlol/ascii-sharks](ht
 
 ## KaTeX
 
-userscript 通过 jsDelivr 加载 KaTeX 运行时与样式。KaTeX 由其项目贡献者维护，其许可证和项目信息请参阅：https://github.com/KaTeX/KaTeX
+ChatGPT userscript 通过 jsDelivr 加载 KaTeX 运行时与样式。AI Studio userscript 内置 KaTeX 0.16.44 的 JS、CSS 与公式字体，并按需初始化；MIT 许可保留在产物与 `src/ai-studio/vendor/package/LICENSE` 中。KaTeX 由其项目贡献者维护，其许可证和项目信息请参阅：https://github.com/KaTeX/KaTeX
+
+## Prettier（仅 AI Studio 构建时使用）
+
+AI Studio 源码附带 Prettier 3.10.1 的 standalone、Babel 和 ESTree 插件，用于离线生成与交付版字节一致的格式化脚本；不作为浏览器运行时加载。原项目与完整授权保留在 `src/ai-studio/vendor/prettier/package.json` 和 `LICENSE` 中：https://github.com/prettier/prettier
 
 ## Liquid Glass optics and material layering
 

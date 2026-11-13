@@ -1,0 +1,223 @@
+{
+  "version": "4.0.0",
+  "browser": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/157.0.0.0 Safari/537.36 Edg/157.0.0.0",
+  "checks": [
+    {
+      "name": "窗口角落可同时缩放宽高",
+      "pass": true,
+      "detail": {
+        "before": {
+          "x": 1280,
+          "y": 78,
+          "width": 300,
+          "height": 620
+        },
+        "after": {
+          "x": 1185,
+          "y": 78,
+          "width": 407,
+          "height": 683
+        }
+      }
+    },
+    {
+      "name": "标题栏折叠保留窗口入口",
+      "pass": true
+    },
+    {
+      "name": "折叠窗口仍可拖到屏幕底部",
+      "pass": true
+    },
+    {
+      "name": "展开后自动回到屏幕内",
+      "pass": true
+    },
+    {
+      "name": "窗口最大化",
+      "pass": true
+    },
+    {
+      "name": "窗口恢复原尺寸",
+      "pass": true
+    },
+    {
+      "name": "快捷键恢复全部位置",
+      "pass": true
+    },
+    {
+      "name": "设置快捷键独立打开窗口",
+      "pass": true
+    },
+    {
+      "name": "Escape 关闭最上层窗口",
+      "pass": true
+    },
+    {
+      "name": "绘制模式 gpu 产生实际像素",
+      "pass": true,
+      "detail": "GPU 绘制"
+    },
+    {
+      "name": "绘制模式 compute 产生实际像素",
+      "pass": true,
+      "detail": "GPU 计算 + 绘制"
+    },
+    {
+      "name": "绘制模式 canvas 产生实际像素",
+      "pass": true,
+      "detail": "后台 Canvas"
+    },
+    {
+      "name": "自定义海洋配色改变实际像素通道",
+      "pass": true,
+      "detail": {
+        "red": {
+          "r": 6903463,
+          "b": 402942
+        },
+        "blue": {
+          "r": 253997,
+          "b": 7583818
+        }
+      }
+    },
+    {
+      "name": "节能画质限制有效帧率",
+      "pass": true
+    },
+    {
+      "name": "减少动态效果使用静态帧",
+      "pass": true
+    },
+    {
+      "name": "静态模式没有持续动画帧",
+      "pass": true
+    },
+    {
+      "name": "隐藏事件释放画布和动画线程",
+      "pass": true
+    },
+    {
+      "name": "重新显示后恢复绘制",
+      "pass": true
+    },
+    {
+      "name": "设置窗口完整玻璃折射就绪",
+      "pass": true
+    },
+    {
+      "name": "独立玻璃参数不影响输入框",
+      "pass": true
+    },
+    {
+      "name": "独立切换磨砂渲染",
+      "pass": true
+    },
+    {
+      "name": "工具箱自定义配色作用于玻璃染色",
+      "pass": true
+    },
+    {
+      "name": "设置写入失败明确提示并保留旧存储",
+      "pass": true
+    },
+    {
+      "name": "存储恢复后可以继续保存",
+      "pass": true
+    },
+    {
+      "name": "同一浏览器跨标签页发送互斥",
+      "pass": true
+    },
+    {
+      "name": "无有效回答时超时并保留待确认消息",
+      "pass": true
+    },
+    {
+      "name": "准备期间暂停不会迟发消息",
+      "pass": true
+    },
+    {
+      "name": "暂停后可以正常恢复发送",
+      "pass": true
+    },
+    {
+      "name": "刷新不自动发送并恢复待确认项",
+      "pass": true
+    },
+    {
+      "name": "严格 Trusted Types 下初始化没有异常",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "name": "严格 Trusted Types 下公式修复可用",
+      "pass": true
+    },
+    {
+      "name": "CSP 禁止 Worker 时自动回退",
+      "pass": true
+    },
+    {
+      "name": "CSP 受限时设置入口仍可操作",
+      "pass": true
+    },
+    {
+      "name": "卸载后所有界面与玻璃节点清理",
+      "pass": true
+    }
+  ],
+  "backends": [
+    {
+      "requested": "gpu",
+      "active": true,
+      "worker": true,
+      "backend": "GPU 绘制",
+      "status": "实时模拟",
+      "workerFailure": "",
+      "gpuFailure": "",
+      "replay": null,
+      "coverage": "full",
+      "clips": 1,
+      "frames": 18,
+      "fpsCap": 12,
+      "lastWorkMs": 4.899999998509884,
+      "pixels": 36854
+    },
+    {
+      "requested": "compute",
+      "active": true,
+      "worker": true,
+      "backend": "GPU 计算 + 绘制",
+      "status": "实时模拟",
+      "workerFailure": "",
+      "gpuFailure": "",
+      "replay": null,
+      "coverage": "full",
+      "clips": 1,
+      "frames": 20,
+      "fpsCap": 12,
+      "lastWorkMs": 3215.699999999255,
+      "pixels": 55641
+    },
+    {
+      "requested": "canvas",
+      "active": true,
+      "worker": true,
+      "backend": "后台 Canvas",
+      "status": "实时模拟",
+      "workerFailure": "",
+      "gpuFailure": "",
+      "replay": null,
+      "coverage": "full",
+      "clips": 1,
+      "frames": 24,
+      "fpsCap": 12,
+      "lastWorkMs": 17.59999999962747,
+      "pixels": 42119
+    }
+  ],
+  "errors": [],
+  "passed": true,
+  "sourceSha256": "b51d1af3edb5fd702f2ff3dd6effa2f54f7c313dabafa65f5d53ddc49ffd58c7"
+}

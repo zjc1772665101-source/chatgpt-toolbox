@@ -2,9 +2,16 @@
 
 一个面向 `chatgpt.com` 的 Tampermonkey 用户脚本，将长对话性能优化、双层导航、自适应大纲、提示词库、会话导出、字体排版和滚动修复整合在一个脚本中。
 
-当前版本：**v1.6.81**。修复短回复 Token 总览滞后、完成后的会话缓存刷新与失效恢复，减少无关 DOM 变化引起的重复工作；回答玻璃可独立跟随页面主容器替换。保留视觉引擎和已有偏好，当前共 272 项设置。
+当前版本：**ChatGPT v1.6.87 / Google AI Studio v4.0.0**。ChatGPT 版优化队列更新、公式解析与 Token 缓存；AI Studio 版提供独立设置入口、可拖动和缩放的浮窗、附件队列及内置公式引擎。
 
 [安装脚本](https://raw.githubusercontent.com/zjc1772665101-source/chatgpt-toolbox/main/chatgpt-toolbox.user.js) · [下载 Release](https://github.com/zjc1772665101-source/chatgpt-toolbox/releases/latest) · [查看演示](#演示)
+
+| 目标网站 | 最新脚本 | 说明与验证 |
+|---|---|---|
+| ChatGPT | [安装 v1.6.87](https://raw.githubusercontent.com/zjc1772665101-source/chatgpt-toolbox/main/chatgpt-toolbox.user.js) | [本版改动与检查范围](docs/chatgpt-1.6.87.md) |
+| Google AI Studio / ai.dev | [安装 v4.0.0](https://raw.githubusercontent.com/zjc1772665101-source/chatgpt-toolbox/main/ai-studio-toolbox.user.js) | [操作、功能与 Edge 验证](docs/ai-studio.md) |
+
+两份脚本分别匹配各自网站。AI Studio 版不匹配 Gemini 消费者版网站。下方原有截图和功能介绍针对 ChatGPT 版；最新安装入口以上表和仓库文件为准，历史 Release 可能落后于 `main`。
 
 ## 界面预览
 
@@ -72,7 +79,7 @@
 
 自动队列不通过超时强制放行。如果回复评价控件被其他扩展隐藏，或者页面使用尚未识别的结束标志，队列会继续等待。“立即发送”只对选中的消息跳过自动等待，不会停止正在生成的回答，也不会覆盖输入框草稿；发送后其余自动消息仍等待新回复完成。
 
-本版通过 43 项受控源码方法检查和 JavaScript 语法检查；272 项设置相对 v1.6.80 的默认值、字段、类型与范围保持。测试使用模拟网络、时钟、DOM 和观察器，不代表真实浏览器绘制或 ChatGPT 账号流程验收；没有测得整站 CPU／GPU 或帧率提升。真实页面安装、连续生成、队列和附件流程尚未完成本版验收。详见 [验证范围](VALIDATION.md)。升级时完整替换原同名脚本，不要同时启用两份。
+v1.6.87 已完成 84,234 次公式分词与 200,000 次结束定界符对照，以及 Chromium 受控页面中的 22 项 Token 缓存检查；保留前轮队列和遍历优化。完整脚本检查使用模拟公式渲染器和网络响应，未据此验收真实账号发送、上传、系统输入法或长期 Edge 运行，也没有测得整站 CPU／GPU 或帧率提升。详见 [本版验证](docs/chatgpt-1.6.87.md) 与 [历史验证范围](VALIDATION.md)。升级时完整替换原同名脚本，不要同时启用两份。
 
 玻璃设置位于 **Aa → 液态玻璃 · 各面板独立**。每次打开设置默认折叠全部分类。色散仅在完整模式使用；各面板可以复制输入框当前参数，之后分别保存。工具胶囊玻璃在新预设中默认关闭，可独立开启。
 
@@ -109,9 +116,12 @@
 
 ```text
 chatgpt-toolbox.user.js
+ai-studio-toolbox.user.js
 ```
 
 发布前建议执行 JavaScript 语法检查、原有模块保留检查、导航/提示词/导出静态检查，以及页面运行时冒烟测试。页面结构和本地 Markdown 查看器的实际表现需在对应环境中验证。
+
+AI Studio 的模块化源码位于 [`src/ai-studio`](src/ai-studio/README.md)，离线构建所需的公式与格式化资源一并提供。根目录 `SHA256SUMS.txt` 覆盖两份脚本和 ChatGPT 旧文件名兼容入口。
 
 ## 许可证与致谢
 

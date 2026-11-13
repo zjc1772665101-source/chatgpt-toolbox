@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 工具箱
 // @namespace    local.codex.chatgpt.unified
-// @version      1.6.81
+// @version      1.6.87
 // @description  ChatGPT 长对话工具箱；独立玻璃参数与折叠设置、GPU 海洋与轨迹回放、新版输入框与顶栏适配、272 项界面默认设置。
 // @author       Codex；含 Alex S Hamilton 的 ChatGPT Lazy Chat++（GPL-3.0-or-later）
 // @homepageURL  https://github.com/zjc1772665101-source/chatgpt-toolbox
@@ -51,7 +51,7 @@
   const stampBootstrap = () => {
     const root = document.documentElement;
     if (!root) return;
-    root.setAttribute('data-cgpt-unified-version', '1.6.81');
+    root.setAttribute('data-cgpt-unified-version', '1.6.87');
     root.setAttribute('data-cgpt-unified-surface', isFrame ? (allowedSurface ? 'side-chat' : 'other-frame') : 'tab');
     root.setAttribute('data-cgpt-unified-bootstrap', bootstrapState);
   };
@@ -69,7 +69,7 @@
   const PROMPT_STORAGE_KEY = 'cgpt-unified-prompt-library-v1';
   const runtime = globalThis[RUNTIME_KEY] || (globalThis[RUNTIME_KEY] = {});
 
-  runtime.version = '1.6.81';
+  runtime.version = '1.6.87';
   // Shared scheduling for navigation and floating UI. Cache only during a
   // synchronous read phase; never retain DOM snapshots across frames/awaits.
   runtime.pageWork = (() => {
@@ -169,12 +169,18 @@
       }
     }
     function reobserve(entry) {
-      deliver(entry, entry.observer.takeRecords()); entry.observer.disconnect();
-      if (!entry.clients.size) { roots.delete(entry.root); return; }
+      deliver(entry, entry.observer.takeRecords());
+      if (!entry.clients.size) { entry.observer.disconnect(); roots.delete(entry.root); return; }
       const all = [...entry.clients].map(item => item.options);
       const options = { subtree: true, childList: all.some(o => o.childList), characterData: all.some(o => o.characterData), attributes: all.some(o => o.attributes) };
       const attrs = all.filter(o => o.attributes);
-      if (attrs.length && attrs.every(o => o.attributeFilter)) options.attributeFilter = [...new Set(attrs.flatMap(o => o.attributeFilter))];
+      if (attrs.length && attrs.every(o => o.attributeFilter)) options.attributeFilter = [...new Set(attrs.flatMap(o => o.attributeFilter))].sort();
+      // Adding/removing a client often leaves the native subscription unchanged.
+      // Keep it attached; pending records were delivered to the existing clients.
+      const key = JSON.stringify(options);
+      if (key === entry.optionsKey) return;
+      entry.optionsKey = key;
+      entry.observer.disconnect();
       entry.observer.observe(entry.root, options);
     }
     return {
@@ -1469,8 +1475,18 @@
       const target = record.target?.nodeType === Node.ELEMENT_NODE
         ? record.target
         : record.target?.parentElement;
-      const roleNode = target?.closest?.(dom.message);
-      if (roleNode) this.markMessageStatsDirty(roleNode);
+      let roleNode = target?.closest?.(dom.message);
+      if (roleNode) {
+        // Only top-level messages appear in dom.messages(). Any inserted role
+        // below this target is nested, so it cannot add a new counted message.
+        // Dirty every enclosing role: the nearest new-style markdown node may
+        // itself be nested inside the cached top-level answer.
+        do {
+          this.markMessageStatsDirty(roleNode);
+          roleNode = roleNode.parentElement?.closest(dom.message);
+        } while (roleNode);
+        return;
+      }
       // Restored/virtualized turns may have changed while outside the observer.
       for (const node of record.addedNodes || []) {
         if (!(node instanceof Element)) continue;
@@ -3731,6 +3747,8 @@
       this.draftAttachments = [];
       this.editDraft = null;
       this.isOpen = false;
+      this.queueRows = new Map();
+      this.emptyQueueRow = null;
       this.unsubscribe = null;
       this.observer = null;
       this.resizeObserver = null;
@@ -3761,8 +3779,8 @@
       if (this.started) return;
       this.started = true;
       this.installStyles();
-      this.unsubscribe = this.runtime.messageQueue?.subscribe?.(() => {
-        this.render();
+      this.unsubscribe = this.runtime.messageQueue?.subscribe?.((snapshot) => {
+        this.render(snapshot);
         this.schedulePosition();
       }) || null;
       window.addEventListener('resize', this.onViewportChange, { passive: true });
@@ -3888,6 +3906,8 @@
       if (this.root?.isConnected) return true;
       const existing = document.getElementById('cgpt-unified-queue-dock');
       if (existing) existing.remove();
+      this.queueRows.clear();
+      this.emptyQueueRow = null;
 
       const root = document.createElement('div');
       root.id = 'cgpt-unified-queue-dock';
@@ -4286,33 +4306,58 @@
       this.schedulePosition();
     }
 
-    render() {
+    render(snapshot = this.runtime.messageQueue?.snapshot?.() || { items: [], isPaused: false }) {
       if (!this.ensureRoot()) return;
       const queue = this.runtime.messageQueue;
-      const snapshot = queue?.snapshot?.() || { items: [], isPaused: false };
       const items = snapshot.items || [];
       const count = items.length;
-      this.capsuleLabel.textContent = count ? '队列' : '发送队列';
-      this.capsuleBadge.textContent = String(count);
-      this.capsuleBadge.hidden = count === 0;
-      this.countLabel.textContent = `发送队列 · ${count}`;
-      this.pauseButton.textContent = snapshot.isPaused ? '继续' : '暂停';
-      this.pauseButton.title = snapshot.isPaused ? '继续自动发送' : '暂停自动发送';
-      this.clearButton.disabled = !items.some((item) => item.status !== 'sending');
-      this.clearButton.title = items.some((item) => item.status === 'sending')
+      const setText = (node, value) => { if (node.textContent !== value) node.textContent = value; };
+      const setProperty = (node, key, value) => { if (node[key] !== value) node[key] = value; };
+      setText(this.capsuleLabel, count ? '队列' : '发送队列');
+      setText(this.capsuleBadge, String(count));
+      setProperty(this.capsuleBadge, 'hidden', count === 0);
+      setText(this.countLabel, `发送队列 · ${count}`);
+      setText(this.pauseButton, snapshot.isPaused ? '继续' : '暂停');
+      setProperty(this.pauseButton, 'title', snapshot.isPaused ? '继续自动发送' : '暂停自动发送');
+      setProperty(this.clearButton, 'disabled', !items.some((item) => item.status !== 'sending'));
+      setProperty(this.clearButton, 'title', items.some((item) => item.status === 'sending')
         ? '清空待发送消息（发送中的消息会保留）'
-        : '清空待发送消息';
+        : '清空待发送消息');
       if (!snapshot.editingItemId && this.editDraft) this.editDraft = null;
 
-      const fragment = document.createDocumentFragment();
+      const nextRows = new Map(), children = [];
+      const activeEditor = this.list.contains(document.activeElement) && document.activeElement.matches('.cgpt-queue-edit-text')
+        ? document.activeElement : null;
+      const selection = activeEditor ? [activeEditor.selectionStart, activeEditor.selectionEnd, activeEditor.selectionDirection, activeEditor.scrollTop] : null;
       if (!count) {
-        const empty = document.createElement('div');
-        empty.className = 'cgpt-queue-empty';
-        empty.textContent = snapshot.isPaused ? '队列为空，当前已暂停' : '队列为空';
-        fragment.appendChild(empty);
+        let empty = this.emptyQueueRow;
+        if (!empty) {
+          empty = this.emptyQueueRow = document.createElement('div');
+          empty.className = 'cgpt-queue-empty';
+        }
+        setText(empty, snapshot.isPaused ? '队列为空，当前已暂停' : '队列为空');
+        children.push(empty);
       }
       const labels = { pending: '等待', sending: '发送中', failed: '失败' };
       items.forEach((item, index) => {
+        const isEditing = snapshot.editingItemId === item.id;
+        const waitingForConversation = item.status === 'pending' && queue?.isItemOnCurrentConversation?.(item) === false;
+        const attachments = isEditing && this.editDraft?.id === item.id ? this.editDraft.attachments : item.attachments || [];
+        // Compare only rendered fields, without serializing message/file contents.
+        // Draft text lives in its textarea; unrelated queue updates must not reset
+        // its selection, undo history, or an in-progress IME composition.
+        const view = [index, item.status, item.error, isEditing ? '' : item.content, isEditing,
+          Boolean(snapshot.editingItemId), Boolean(snapshot.isProcessing), waitingForConversation];
+        for (const attachment of attachments) {
+          const file = attachment?.file || attachment;
+          view.push(file, attachment?.name, attachment?.size, attachment?.type);
+        }
+        const cached = this.queueRows.get(item.id);
+        if (cached && view.length === cached.view.length && view.every((value, slot) => Object.is(value, cached.view[slot]))) {
+          nextRows.set(item.id, cached);
+          children.push(cached.row);
+          return;
+        }
         const row = document.createElement('div');
         row.className = 'cgpt-queue-row';
         row.dataset.status = item.status || 'pending';
@@ -4321,7 +4366,6 @@
         idx.textContent = String(index + 1);
         const main = document.createElement('div');
         main.className = 'cgpt-queue-main';
-        const isEditing = snapshot.editingItemId === item.id;
         if (isEditing) {
           if (!this.editDraft || this.editDraft.id !== item.id) {
             this.editDraft = {
@@ -4424,7 +4468,7 @@
         itemStatus.className = 'cgpt-queue-item-status';
         itemStatus.textContent = item.error
           ? `${labels[item.status] || item.status || '失败'} · ${item.error}`
-          : item.status === 'pending' && queue?.isItemOnCurrentConversation?.(item) === false
+          : waitingForConversation
           ? '等待原会话'
           : labels[item.status] || item.status || '等待';
         main.appendChild(itemStatus);
@@ -4465,17 +4509,36 @@
         remove.addEventListener('click', () => queue?.remove?.(item.id));
         actions.appendChild(remove);
         row.append(idx, main, actions);
-        fragment.appendChild(row);
+        nextRows.set(item.id, { row, view });
+        children.push(row);
       });
-      this.list.replaceChildren(fragment);
+      // Remove obsolete rows first so a deletion does not move retained editors.
+      // Only insert genuinely new/reordered nodes; appending all rows to a
+      // fragment would detach even cached nodes and lose focus/composition.
+      const retained = new Set(children);
+      for (const child of [...this.list.childNodes]) if (!retained.has(child)) child.remove();
+      let cursor = this.list.firstChild;
+      for (const child of children) {
+        if (child === cursor) cursor = cursor.nextSibling;
+        else this.list.insertBefore(child, cursor);
+      }
+      this.queueRows = nextRows;
+      if (activeEditor && !activeEditor.isConnected && snapshot.editingItemId) {
+        const editor = nextRows.get(snapshot.editingItemId)?.row.querySelector('.cgpt-queue-edit-text');
+        if (editor) {
+          editor.focus({ preventScroll: true });
+          editor.setSelectionRange(selection[0], selection[1], selection[2]);
+          editor.scrollTop = selection[3];
+        }
+      }
 
       const generating = Boolean(this.runtime.isGenerating?.());
-      this.statusDot.dataset.state = snapshot.editingItemId || snapshot.isPaused ? 'paused' : generating ? 'busy' : 'idle';
-      if (snapshot.editingItemId) this.status.textContent = '正在编辑队列消息，自动发送暂缓';
-      else if (snapshot.isPaused) this.status.textContent = '已暂停自动发送';
-      else if (generating) this.status.textContent = count ? '等待当前回答完成后继续' : '当前正在生成回答';
-      else if (count) this.status.textContent = '等待空闲后自动发送下一条';
-      else this.status.textContent = 'Enter 入队 · Shift+Enter 换行 · 拖入/粘贴附件';
+      const state = snapshot.editingItemId || snapshot.isPaused ? 'paused' : generating ? 'busy' : 'idle';
+      if (this.statusDot.dataset.state !== state) this.statusDot.dataset.state = state;
+      setText(this.status, snapshot.editingItemId ? '正在编辑队列消息，自动发送暂缓'
+        : snapshot.isPaused ? '已暂停自动发送'
+        : generating ? count ? '等待当前回答完成后继续' : '当前正在生成回答'
+        : count ? '等待空闲后自动发送下一条' : 'Enter 入队 · Shift+Enter 换行 · 拖入/粘贴附件');
     }
 
     resolveComposerShell(composer) {
@@ -16176,10 +16239,9 @@
   }
 
   function findResidualClosing(text, start, close, allowNewline) {
-    for (let cursor = start; cursor <= text.length - close.length; cursor += 1) {
-      if (!allowNewline && text[cursor] === '\n') return -1;
-      if (!text.startsWith(close, cursor) || isEscapedDelimiter(text, cursor)) continue;
-      return cursor;
+    const lineEnd = allowNewline ? -1 : text.indexOf('\n', start);
+    for (let cursor = text.indexOf(close, start); cursor >= 0 && (lineEnd < 0 || cursor < lineEnd); cursor = text.indexOf(close, cursor + 1)) {
+      if (!isEscapedDelimiter(text, cursor)) return cursor;
     }
     return -1;
   }
@@ -16208,12 +16270,19 @@
     const tokens = [];
     let plainStart = 0;
     let cursor = 0;
+    // Search literal delimiter candidates in the native regexp engine rather
+    // than running escape/opening checks at every character of ordinary prose.
+    const openings = /\$|\\\(|\\\[/g;
 
     const flushPlain = (end) => {
       if (end > plainStart) tokens.push({ type: 'text', raw: text.slice(plainStart, end) });
     };
 
     while (cursor < text.length) {
+      openings.lastIndex = cursor;
+      const candidate = openings.exec(text);
+      if (!candidate) break;
+      cursor = candidate.index;
       if (isEscapedDelimiter(text, cursor)) {
         cursor += 1;
         continue;
@@ -16309,29 +16378,40 @@
     }
   }
 
-  function residualExcludedElement(element) {
-    if (!(element instanceof Element)) return true;
-    return Boolean(element.closest([
+  const residualExcludedSelector = [
       'pre', 'code', '[data-markdown-copy="inline-code"]', 'textarea', 'input', 'select', 'option', 'script', 'style', 'noscript',
       '[contenteditable="true"]', '.katex', '.MathJax', 'mjx-container', 'math', 'annotation',
       '[data-latex]', '[data-math-source]', `.${RESIDUAL_WRAPPER_CLASS}`, `#${PANEL_ID}`, `#${TOGGLE_ID}`, '[aria-hidden="true"]',
-    ].join(',')));
+    ].join(',');
+
+  function residualExcludedElement(element) {
+    return !(element instanceof Element) || Boolean(element.closest(residualExcludedSelector));
   }
 
-  function repairResidualBold(root) {
-    if (!root.textContent?.includes('**')) return;
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+  function residualTextNodes(root, acceptText = null) {
+    if (residualExcludedElement(root)) return [];
+    // SHOW_TEXT alone cannot prune an excluded element's descendants. Visit
+    // elements too, rejecting code/rendered-math/editor subtrees in one step.
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
-        const proseBlock = node.parentElement?.closest('p, li, h1, h2, h3, h4, h5, h6, td, th, blockquote, figcaption');
-        if (!node.nodeValue?.includes('**') || residualExcludedElement(node.parentElement)
-          || !proseBlock || !root.contains(proseBlock)
-          || node.parentElement?.closest('strong, b, a, button')) return NodeFilter.FILTER_REJECT;
-        return NodeFilter.FILTER_ACCEPT;
+        if (node.nodeType === Node.ELEMENT_NODE) return node.matches(residualExcludedSelector)
+          ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_SKIP;
+        return !acceptText || acceptText(node) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
       },
     });
     const nodes = [];
     let node;
     while ((node = walker.nextNode())) nodes.push(node);
+    return nodes;
+  }
+
+  function repairResidualBold(root) {
+    if (!root.textContent?.includes('**')) return;
+    const nodes = residualTextNodes(root, (node) => {
+        if (!node.nodeValue?.includes('**')) return false;
+        const proseBlock = node.parentElement?.closest('p, li, h1, h2, h3, h4, h5, h6, td, th, blockquote, figcaption');
+        return Boolean(proseBlock && root.contains(proseBlock) && !node.parentElement?.closest('strong, b, a, button'));
+    });
 
     for (const textNode of nodes) {
       const text = textNode.nodeValue || '';
@@ -16552,14 +16632,7 @@
       restoreInvalidResidualMath(root);
       repairFragmentedInlineMath(root);
       repairInlineMathAcrossNodes(root);
-      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-        acceptNode(node) {
-          return residualExcludedElement(node.parentElement) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
-        },
-      });
-      const nodes = [];
-      let node;
-      while ((node = walker.nextNode())) nodes.push(node);
+      const nodes = residualTextNodes(root);
       state = { nodes, index: 0 };
       residualRootWork.set(root, state);
     }
@@ -19656,14 +19729,49 @@
       transition:none!important;
     }
     html[data-cgfc-message-glass-custom-tint] [data-cgfc-liquid-surface="message"] { --cgfc-glass-tint:var(--cgfc-message-glass-custom-rgb); }
+    /* On Edge an iframe and an SVG backdrop on the same answer can cause
+       foreground content to be filtered. Put the same optics behind it. */
+    [data-cgfc-liquid-surface="message"][data-cgfc-message-layer] {
+      position:relative!important; z-index:0!important; background:transparent!important;
+      -webkit-backdrop-filter:none!important; backdrop-filter:none!important;
+    }
+    [data-cgfc-liquid-surface="message"][data-cgfc-message-layer="before"]::before,
+    [data-cgfc-liquid-surface="message"][data-cgfc-message-layer="after"]::after,
+    [data-cgfc-liquid-surface="message"][data-cgfc-message-layer="child"] > [data-cgfc-message-layer-child="before"]::before,
+    [data-cgfc-liquid-surface="message"][data-cgfc-message-layer="child"] > [data-cgfc-message-layer-child="after"]::after {
+      content:""!important; display:block!important; position:absolute!important; inset:0!important; z-index:-1!important;
+      width:auto!important; height:auto!important; margin:0!important; padding:0!important; box-sizing:border-box!important;
+      border:0!important; opacity:1!important; visibility:visible!important; transform:none!important; filter:none!important;
+      translate:none!important; rotate:none!important; scale:none!important; clip-path:none!important; mask:none!important;
+      mix-blend-mode:normal!important; animation:none!important; transition:none!important;
+      border-radius:inherit!important; pointer-events:none!important;
+      background:rgba(var(--cgfc-glass-tint),var(--cgfc-glass-fill))!important;
+      -webkit-backdrop-filter:blur(var(--cgfc-glass-blur-px,6px)) saturate(var(--cgfc-glass-saturation)) brightness(var(--cgfc-glass-luminance)) var(--cgfc-glass-filter,blur(0px))!important;
+      backdrop-filter:blur(var(--cgfc-glass-blur-px,6px)) saturate(var(--cgfc-glass-saturation)) brightness(var(--cgfc-glass-luminance)) var(--cgfc-glass-filter,blur(0px))!important;
+    }
+    [data-cgfc-liquid-surface="message"][data-cgfc-message-layer="child"] > [data-cgfc-message-layer-child="before"]::before,
+    [data-cgfc-liquid-surface="message"][data-cgfc-message-layer="child"] > [data-cgfc-message-layer-child="after"]::after { border-radius:var(--cgfc-message-glass-radius,18px)!important; }
+    [data-cgfc-liquid-surface="message"][data-cgfc-liquid-mode="paused"][data-cgfc-message-layer="before"]::before,
+    [data-cgfc-liquid-surface="message"][data-cgfc-liquid-mode="paused"][data-cgfc-message-layer="after"]::after,
+    [data-cgfc-liquid-surface="message"][data-cgfc-liquid-mode="paused"][data-cgfc-message-layer="child"] > [data-cgfc-message-layer-child="before"]::before,
+    [data-cgfc-liquid-surface="message"][data-cgfc-liquid-mode="paused"][data-cgfc-message-layer="child"] > [data-cgfc-message-layer-child="after"]::after { -webkit-backdrop-filter:none!important; backdrop-filter:none!important; }
+    @media (forced-colors:active) {
+      [data-cgfc-liquid-surface="message"][data-cgfc-message-layer] { background:Canvas!important; }
+      [data-cgfc-liquid-surface="message"][data-cgfc-message-layer="before"]::before,
+      [data-cgfc-liquid-surface="message"][data-cgfc-message-layer="after"]::after,
+      [data-cgfc-liquid-surface="message"][data-cgfc-message-layer="child"] > [data-cgfc-message-layer-child="before"]::before,
+      [data-cgfc-liquid-surface="message"][data-cgfc-message-layer="child"] > [data-cgfc-message-layer-child="after"]::after { display:none!important; }
+    }
   `;
     (document.head || root).appendChild(style);
-    const entries = new Map(), parked = new Map();
+    const entries = new Map(), parked = new Map(), dirtyEmbedded = new Set();
+    const edge = /\bEdg\//.test(navigator.userAgent);
     const PARK_LIMIT = 8, PARK_BYTES = 2 * 1024 * 1024;
-    let enabled = false, main = null, timer = 0, scanFrame = 0, observer = null, routeObserver = null, disposed = false, settingsKey = '', scans = 0, reused = 0, evicted = 0;
+    let enabled = false, main = null, timer = 0, scanFrame = 0, embeddedFrame = 0, observer = null, routeObserver = null, disposed = false, settingsKey = '', scans = 0, reused = 0, evicted = 0;
     const retainedBytes = () => [...parked.values()].reduce((sum, entry) => sum + (entry.controller?.mapUrl?.length || 0) * 2, 0);
     const destroyEntry = (el, entry) => {
-      parked.delete(el); entry.controller?.destroy(); entry.controller = null;
+      parked.delete(el); dirtyEmbedded.delete(entry); entry.controller?.destroy(); entry.controller = null;
+      clearEmbeddedLayer(el, entry);
     };
     const park = (el, entry) => {
       const controller = entry.controller;
@@ -19680,6 +19788,8 @@
     };
     const attach = (el, entry) => {
       if (!enabled || !entry.visible || !el.isConnected || document.hidden) return;
+      if (entry.iframeDirty) refreshEmbedded(entry);
+      if (entry.embedded && !el.hasAttribute('data-cgfc-message-layer')) setEmbeddedLayer(el, entry);
       const Glass = runtime.composerLiquidGlass?.constructor;
       if (!Glass) return;
       if (parked.delete(el)) reused++;
@@ -19695,8 +19805,26 @@
       }
     }, { rootMargin: '80px' });
     const onMutations = records => {
-      const selector = runtime.dom.message + ',' + runtime.dom.content + ', [data-message-content], .whitespace-pre-wrap';
-      if (records.some(r => [...r.addedNodes, ...r.removedNodes].some(n => n instanceof Element && (n.matches(selector) || n.querySelector(selector))))) schedule();
+      const structuralSelector = runtime.dom.message + ',' + runtime.dom.content + ', [data-message-content], .whitespace-pre-wrap';
+      let rescan = false;
+      for (const record of records) {
+        const nodes = [];
+        for (const node of record.addedNodes) if (node instanceof Element) nodes.push(node);
+        for (const node of record.removedNodes) if (node instanceof Element) nodes.push(node);
+        if (!nodes.length) continue;
+        let parent = record.target instanceof Element ? record.target : record.target.parentElement;
+        while (parent && parent !== main && !entries.has(parent)) parent = parent.parentElement;
+        const entry = entries.get(parent);
+        if (entry?.layerChild && entry.layerChild.parentElement !== parent) markEmbeddedDirty(entry);
+        // Descendants of an existing content root cannot be top-level messages;
+        // an unfinished legacy role without a content root still needs a scan.
+        for (const node of nodes) {
+          if (!rescan && !entry?.stableRoot && (node.matches(structuralSelector) || node.querySelector(structuralSelector))) rescan = true;
+          if (edge && entry && (node.matches('iframe') || node.querySelector('iframe'))) markEmbeddedDirty(entry);
+          else if (edge && entry?.embedded && entry.visible && record.target === parent && !parent.hasAttribute('data-cgfc-message-layer')) markEmbeddedDirty(entry);
+        }
+      }
+      if (rescan) schedule();
     };
     function syncRouteWatch() {
       if ((!enabled || disposed) && routeObserver) { routeObserver.disconnect(); routeObserver = null; }
@@ -19709,8 +19837,9 @@
     function onRoute() { schedule(); }
     function clear() {
       observer?.disconnect(); observer = null; io.disconnect();
+      if (embeddedFrame) runtime.pageWork.cancelFrame(embeddedFrame); embeddedFrame = 0;
       for (const [el, entry] of entries) destroyEntry(el, entry);
-      entries.clear(); parked.clear(); main = null;
+      entries.clear(); parked.clear(); dirtyEmbedded.clear(); main = null;
     }
     function scan(reattachAll = false) {
       scanFrame = 0; timer = 0;
@@ -19723,13 +19852,21 @@
       }
       if (!main) return;
       const wanted = new Set(), fresh = [];
-      for (const message of runtime.pageWork.query(main, runtime.dom.assistant)) {
-        if (runtime.dom.isThinkingOverview(message)) continue;
+      // Interactive responses can contain nested assistant-markdown nodes,
+      // including SVG/graphic layers that overlap other text. A second backdrop
+      // on such a descendant would filter foreground text already painted by
+      // its parent. Reuse the top-level message discovery used elsewhere.
+      for (const message of runtime.dom.messages(main)) {
+        if (runtime.dom.role(message) !== 'assistant' || runtime.dom.isThinkingOverview(message)) continue;
         const el = runtime.dom.contentRoot(message) || message;
         wanted.add(el);
-        if (!entries.has(el)) {
-          const entry = { controller: null, visible: false };
+        const existing = entries.get(el);
+        if (!existing) {
+          const entry = { el, controller: null, visible: false, embedded: edge && Boolean(el.querySelector('iframe')), iframeDirty: false, stableRoot: el.matches(runtime.dom.content), layerChild: null, layerObserver: null, layerChanged: false };
           entries.set(el, entry); io.observe(el); fresh.push([el, entry]);
+        } else {
+          existing.stableRoot = el.matches(runtime.dom.content);
+          if (existing.iframeDirty) refreshEmbedded(existing);
         }
       }
       for (const [el, entry] of entries) if (!wanted.has(el) || !el.isConnected) {
@@ -19740,6 +19877,65 @@
         entry.visible = r.width > 0 && r.height > 0 && r.bottom > -80 && r.top < innerHeight + 80;
       }
       for (const [el, entry] of reattachAll === true ? entries : fresh) if (entry.visible) attach(el, entry);
+    }
+    function clearEmbeddedLayer(el, entry) {
+      entry.layerObserver?.disconnect(); entry.layerObserver = null; entry.layerChanged = false;
+      entry.layerChild?.removeAttribute('data-cgfc-message-layer-child');
+      entry.layerChild = null; el.removeAttribute('data-cgfc-message-layer');
+    }
+    function setEmbeddedLayer(el, entry) {
+      // Reuse an unused pseudo-element without changing the site's DOM order.
+      const free = pseudo => ['none', 'normal'].includes(getComputedStyle(el, pseudo).content);
+      const side = free('::before') ? 'before' : free('::after') ? 'after' : '';
+      if (side) { el.setAttribute('data-cgfc-message-layer', side); return; }
+      // Both host pseudos belong to the page. An ordinary, static direct
+      // child can host the absolute pseudo without becoming its containing
+      // block or stacking context; never alter existing pseudo content.
+      const tags = /^(?:DIV|SPAN|P|SECTION|ARTICLE|BLOCKQUOTE|H[1-6]|UL|OL)$/;
+      for (const child of el.children) {
+        if (!tags.test(child.tagName)) continue;
+        const s = getComputedStyle(child);
+        if (s.position !== 'static' || s.zIndex !== 'auto' || s.display === 'none' || s.display === 'contents' || s.opacity !== '1'
+          || s.transform !== 'none' || s.filter !== 'none' || s.backdropFilter !== 'none'
+          || s.perspective !== 'none' || s.isolation !== 'auto' || s.mixBlendMode !== 'normal'
+          || s.overflowX !== 'visible' || s.overflowY !== 'visible' || s.contain !== 'none'
+          || s.contentVisibility !== 'visible' || s.willChange !== 'auto' || s.clipPath !== 'none'
+          || (s.maskImage && s.maskImage !== 'none') || (s.containerType && s.containerType !== 'normal')
+          || (s.translate && s.translate !== 'none') || (s.rotate && s.rotate !== 'none') || (s.scale && s.scale !== 'none')) continue;
+        const childSide = ['none', 'normal'].includes(getComputedStyle(child, '::before').content) ? 'before'
+          : ['none', 'normal'].includes(getComputedStyle(child, '::after').content) ? 'after' : '';
+        if (!childSide) continue;
+        entry.layerChild = child; child.setAttribute('data-cgfc-message-layer-child', childSide);
+        el.setAttribute('data-cgfc-message-layer', 'child');
+        entry.layerObserver = new MutationObserver(() => {
+          if (entry.layerChild !== child) return;
+          entry.layerChanged = true; markEmbeddedDirty(entry);
+        });
+        entry.layerObserver.observe(child, { attributes: true, attributeFilter: ['class', 'style', 'hidden'] });
+        return;
+      }
+    }
+    function markEmbeddedDirty(entry) {
+      entry.iframeDirty = true; dirtyEmbedded.add(entry);
+      if (!embeddedFrame && enabled && !disposed && !document.hidden) embeddedFrame = runtime.pageWork.requestFrame(flushEmbedded);
+    }
+    function refreshEmbedded(entry) {
+      const el = entry.el;
+      dirtyEmbedded.delete(entry); entry.iframeDirty = false;
+      const embedded = edge && Boolean(el.querySelector('iframe'));
+      if (entry.embedded !== embedded || entry.layerChanged || (entry.layerChild && entry.layerChild.parentElement !== el)
+        || (embedded && entry.visible && entry.controller && !el.hasAttribute('data-cgfc-message-layer'))) {
+        clearEmbeddedLayer(el, entry); entry.embedded = embedded;
+        if (embedded && entry.visible && entry.controller) setEmbeddedLayer(el, entry);
+      }
+    }
+    function flushEmbedded() {
+      embeddedFrame = 0;
+      if (disposed || !enabled || document.hidden) return;
+      for (const entry of [...dirtyEmbedded]) {
+        if (entries.get(entry.el) === entry && entry.el.isConnected) refreshEmbedded(entry);
+        else dirtyEmbedded.delete(entry);
+      }
     }
     function schedule() {
       if (enabled && !timer && !scanFrame && !disposed && !document.hidden) timer = window.setTimeout(() => {

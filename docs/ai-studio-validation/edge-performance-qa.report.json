@@ -1,0 +1,58 @@
+{
+  "version": "4.0.0",
+  "browser": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/157.0.0.0 Safari/537.36 Edg/157.0.0.0",
+  "loadedTurns": 480,
+  "configuration": {
+    "ocean": true,
+    "oceanMotion": "live",
+    "oceanRenderer": "canvas",
+    "oceanCoverage": "full",
+    "oceanDensity": 40,
+    "oceanFps": 12,
+    "repairLatex": false,
+    "showTokenStats": false,
+    "composerGlass": false,
+    "toolboxGlass": false,
+    "settingsGlass": false,
+    "queueGlass": false,
+    "sendGlass": false,
+    "messageGlass": false,
+    "scrollGlass": false,
+    "tokenGlass": false,
+    "toggleGlass": false
+  },
+  "measurements": [
+    {
+      "version": "3.0.0",
+      "elapsedMs": 3016.300000000745,
+      "querySelectorAll": 60,
+      "getBoundingClientRect": 60,
+      "frames": null,
+      "active": true,
+      "backend": "后台 Canvas"
+    },
+    {
+      "version": "4.0.0",
+      "elapsedMs": 3003.199999999255,
+      "querySelectorAll": 0,
+      "getBoundingClientRect": 0,
+      "frames": 29,
+      "active": true,
+      "backend": "后台 Canvas"
+    }
+  ],
+  "checks": [
+    {
+      "name": "480 条消息持续绘制时没有逐帧 DOM 查询或布局读取",
+      "pass": true
+    },
+    {
+      "name": "主脚本与公式资源不依赖外部网络",
+      "pass": true,
+      "detail": []
+    }
+  ],
+  "passed": true,
+  "note": "只比较相同设置下三秒内的 DOM API 调用；不将调用数换算成整体性能提升比例。",
+  "sourceSha256": "b51d1af3edb5fd702f2ff3dd6effa2f54f7c313dabafa65f5d53ddc49ffd58c7"
+}

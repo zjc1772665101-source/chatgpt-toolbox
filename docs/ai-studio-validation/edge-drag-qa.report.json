@@ -1,0 +1,181 @@
+{
+  "boot": true,
+  "browser": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/157.0.0.0 Safari/537.36 Edg/157.0.0.0",
+  "checks": [
+    {
+      "name": "nav 改变位置",
+      "pass": true,
+      "detail": {
+        "before": {
+          "x": 1280,
+          "y": 78,
+          "width": 300,
+          "height": 620
+        },
+        "after": {
+          "x": 860,
+          "y": 198,
+          "width": 300,
+          "height": 620
+        }
+      }
+    },
+    {
+      "name": "独立设置按钮可见",
+      "pass": true
+    },
+    {
+      "name": "settings 改变位置",
+      "pass": true,
+      "detail": {
+        "before": {
+          "x": 410,
+          "y": 64,
+          "width": 780,
+          "height": 760
+        },
+        "after": {
+          "x": 230,
+          "y": 134,
+          "width": 780,
+          "height": 760
+        }
+      }
+    },
+    {
+      "name": "queue 改变位置",
+      "pass": true,
+      "detail": {
+        "before": {
+          "x": 1140,
+          "y": 160,
+          "width": 440,
+          "height": 650
+        },
+        "after": {
+          "x": 490,
+          "y": 250,
+          "width": 440,
+          "height": 650
+        }
+      }
+    },
+    {
+      "name": "launcher 改变位置",
+      "pass": true,
+      "detail": {
+        "before": {
+          "x": 1354,
+          "y": 18,
+          "width": 226,
+          "height": 42
+        },
+        "after": {
+          "x": 1024,
+          "y": 118,
+          "width": 226,
+          "height": 42
+        }
+      }
+    },
+    {
+      "name": "拖动后入口仍可点击",
+      "pass": true
+    },
+    {
+      "name": "刷新保留工具箱位置",
+      "pass": true,
+      "detail": {
+        "saved": {
+          "nav": {
+            "left": 860,
+            "top": 198,
+            "width": 300,
+            "height": 620,
+            "viewportWidth": 1600,
+            "viewportHeight": 1000
+          },
+          "settings": {
+            "left": 230,
+            "top": 134,
+            "width": 780,
+            "height": 760,
+            "viewportWidth": 1600,
+            "viewportHeight": 1000
+          },
+          "queue": {
+            "left": 490,
+            "top": 250,
+            "width": 440,
+            "height": 650,
+            "viewportWidth": 1600,
+            "viewportHeight": 1000
+          },
+          "launcher": {
+            "left": 1024,
+            "top": 118,
+            "width": 226,
+            "height": 42,
+            "viewportWidth": 1600,
+            "viewportHeight": 1000
+          }
+        },
+        "after": {
+          "x": 860,
+          "y": 198,
+          "width": 300,
+          "height": 620
+        }
+      }
+    },
+    {
+      "name": "刷新保留入口位置",
+      "pass": true
+    },
+    {
+      "name": "刷新后设置可找回并保留位置",
+      "pass": true
+    },
+    {
+      "name": "窄屏可见窗口回到屏幕内",
+      "pass": true,
+      "detail": [
+        {
+          "id": "launcher",
+          "visible": true,
+          "left": 156,
+          "top": 118,
+          "right": 382,
+          "bottom": 160
+        },
+        {
+          "id": "nav",
+          "visible": true,
+          "left": 82,
+          "top": 198,
+          "right": 382,
+          "bottom": 818
+        },
+        {
+          "id": "settings",
+          "visible": true,
+          "left": 8,
+          "top": 76,
+          "right": 382,
+          "bottom": 836
+        },
+        {
+          "id": "queue",
+          "visible": true,
+          "left": 8,
+          "top": 186,
+          "right": 382,
+          "bottom": 836
+        }
+      ]
+    }
+  ],
+  "errors": [],
+  "passed": true,
+  "sourceSha256": "b51d1af3edb5fd702f2ff3dd6effa2f54f7c313dabafa65f5d53ddc49ffd58c7"
+}

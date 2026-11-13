@@ -1,0 +1,200 @@
+{
+  "version": "4.0.0",
+  "browser": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/157.0.0.0 Safari/537.36 Edg/157.0.0.0",
+  "checks": [
+    {
+      "name": "480 条消息适配",
+      "pass": true
+    },
+    {
+      "name": "内置公式库在需要前保持未加载",
+      "pass": true
+    },
+    {
+      "name": "全部设置具有唯一可操作控件",
+      "pass": true,
+      "detail": {
+        "count": 267,
+        "unique": 267,
+        "missing": 0
+      }
+    },
+    {
+      "name": "全局搜索显示各区域独立设置",
+      "pass": true
+    },
+    {
+      "name": "设置搜索空结果提示",
+      "pass": true
+    },
+    {
+      "name": "修改字号影响原站回答",
+      "pass": true
+    },
+    {
+      "name": "关闭覆盖恢复原站字号",
+      "pass": true
+    },
+    {
+      "name": "单项恢复默认并恢复覆盖",
+      "pass": true
+    },
+    {
+      "name": "背景颜色实际生效",
+      "pass": true
+    },
+    {
+      "name": "常见字体检测和候选列表",
+      "pass": true
+    },
+    {
+      "name": "流式刷新保留目录条目",
+      "pass": true
+    },
+    {
+      "name": "重命名目录条目",
+      "pass": true
+    },
+    {
+      "name": "书签过滤",
+      "pass": true
+    },
+    {
+      "name": "当前回答章节目录",
+      "pass": true
+    },
+    {
+      "name": "搜索与关键词高亮",
+      "pass": true
+    },
+    {
+      "name": "新建提示词含分类",
+      "pass": true
+    },
+    {
+      "name": "提示词变量解析并填入原站",
+      "pass": true
+    },
+    {
+      "name": "提示词追加保留原站草稿",
+      "pass": true
+    },
+    {
+      "name": "提示词置顶",
+      "pass": true
+    },
+    {
+      "name": "提示词编辑保存",
+      "pass": true
+    },
+    {
+      "name": "提示词 JSON 下载",
+      "pass": true
+    },
+    {
+      "name": "提示词重复导入去重",
+      "pass": true
+    },
+    {
+      "name": "队列加入两条消息",
+      "pass": true
+    },
+    {
+      "name": "队列编辑和排序",
+      "pass": true
+    },
+    {
+      "name": "真实 UI 启动后按顺序完成队列",
+      "pass": true
+    },
+    {
+      "name": "附件从队列存储写入原站上传器后发送",
+      "pass": true
+    },
+    {
+      "name": "自动队列保留原站草稿",
+      "pass": true
+    },
+    {
+      "name": "队列清空",
+      "pass": true
+    },
+    {
+      "name": "关闭重开队列保留草稿",
+      "pass": true
+    },
+    {
+      "name": "仅修复回答中的行内与块公式",
+      "pass": true
+    },
+    {
+      "name": "金额不被误识别为公式",
+      "pass": true
+    },
+    {
+      "name": "公式双击复制 LaTeX",
+      "pass": true
+    },
+    {
+      "name": "代码复制保留连续空行",
+      "pass": true,
+      "detail": "a();\r\n\r\n\r\n\r\nb();\r\n```\r\n"
+    },
+    {
+      "name": "对话导出 Markdown",
+      "pass": true
+    },
+    {
+      "name": "对话导出 JSON",
+      "pass": true
+    },
+    {
+      "name": "对话导出 纯文本",
+      "pass": true
+    },
+    {
+      "name": "对话导出 HTML",
+      "pass": true
+    },
+    {
+      "name": "选择单条消息导出",
+      "pass": true
+    },
+    {
+      "name": "完整工具箱备份下载",
+      "pass": true
+    },
+    {
+      "name": "删除提示词",
+      "pass": true
+    },
+    {
+      "name": "完整备份恢复提示词",
+      "pass": true
+    },
+    {
+      "name": "备份恢复后独立设置入口仍可用",
+      "pass": true
+    },
+    {
+      "name": "关闭导航后保留设置入口",
+      "pass": true
+    },
+    {
+      "name": "关闭导航后仍能打开设置",
+      "pass": true
+    }
+  ],
+  "errors": [],
+  "passed": true,
+  "settingsCount": 267,
+  "performance": {
+    "turnScans": 4,
+    "contentScans": 505,
+    "textReads": 499,
+    "layoutPasses": 53,
+    "refreshes": 8,
+    "mutationBatches": 55
+  },
+  "sourceSha256": "b51d1af3edb5fd702f2ff3dd6effa2f54f7c313dabafa65f5d53ddc49ffd58c7"
+}

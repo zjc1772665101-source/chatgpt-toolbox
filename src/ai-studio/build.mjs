@@ -1,0 +1,30 @@
+import {readFile,writeFile} from 'node:fs/promises';
+import {fileURLToPath} from 'node:url';
+import {dirname,join} from 'node:path';
+import {format} from './vendor/prettier/standalone.mjs';
+import babelPlugin from './vendor/prettier/plugins/babel.mjs';
+import estreePlugin from './vendor/prettier/plugins/estree.mjs';
+
+const directory=dirname(fileURLToPath(import.meta.url));
+const read=name=>readFile(join(directory,name),'utf8');
+const core=await read('core.js');
+const extra=await read('settings-extra.js');
+const platform=await read('platform.js');
+const css=await read('ui.css');
+const katex=await read('vendor/package/dist/katex.min.js');
+const katexLicense=await read('vendor/package/LICENSE');
+let katexCss=await read('vendor/package/dist/katex.min.css');
+const faces=[...katexCss.matchAll(/src:url\(fonts\/([^)]*\.woff2)\) format\("woff2"\),url\([^)]*\) format\("woff"\),url\([^)]*\) format\("truetype"\)/g)];
+for(const face of faces){const font=await readFile(join(directory,'vendor/package/dist/fonts',face[1]));katexCss=katexCss.replace(face[0],`src:url(data:font/woff2;base64,${font.toString('base64')}) format("woff2")`);}
+if(/url\(fonts\//.test(katexCss))throw Error('Unbundled KaTeX font asset');
+const mathBundle=`/* KaTeX 0.16.44 — bundled, lazily initialized.\n${katexLicense.replace(/\*\//g,'* /')}*/\nconst KATEX_CSS=${JSON.stringify(katexCss)};\nlet bundledKatexCache=null;\nfunction getBundledKatex(){if(bundledKatexCache)return bundledKatexCache;const module={exports:{}};const exports=module.exports;\n${katex}\nbundledKatexCache=module.exports;return bundledKatexCache;}\n`;
+const files=['views.js','settings-ui.js','queue-ui.js','export-ui.js','ui.js','reading.js','queue-engine.js'];
+let tail=await read('tail.js');
+tail=tail.slice(tail.indexOf('// ═══ Preserve a user'));
+const escapedCSS=css.replace(/`/g,'\\`').replace(/\$\{/g,'\\${');
+const sections=[core.replace('const DEFAULTS={};',extra+'\n\nconst DEFAULTS={};'),mathBundle,platform,'const TOOLBOX_CSS=String.raw`'+escapedCSS+'`;'];
+for(const file of files)sections.push(await read(file));
+sections.push(tail);
+const script=await format(sections.join('\n\n'),{parser:'babel',singleQuote:true,printWidth:100,plugins:[babelPlugin,estreePlugin]});
+await writeFile(join(directory,'ai-studio-toolbox.user.js'),script,'utf8');
+console.log(JSON.stringify({artifact:join(directory,'ai-studio-toolbox.user.js'),bytes:Buffer.byteLength(script),lines:script.split('\n').length}));

@@ -1,0 +1,3 @@
+*.user.js text eol=lf
+# Preserve upstream JS literals; vendored minified files contain intentional whitespace.
+src/ai-studio/vendor/** -whitespace
